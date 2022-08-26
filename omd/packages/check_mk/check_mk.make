@@ -16,6 +16,8 @@ CHECK_MK_LANGUAGES := de ro nl fr it ja pt_PT es
 $(REPO_PATH)/$(CHECK_MK_DIR).tar.gz:
 	$(MAKE) -C $(REPO_PATH) $(CHECK_MK_DIR).tar.gz
 
+test: $(CHECK_MK_BUILD)
+
 # The build step just extracts the archive
 # which was created in the step before
 $(CHECK_MK_BUILD): $(REPO_PATH)/$(CHECK_MK_DIR).tar.gz
@@ -26,7 +28,7 @@ $(CHECK_MK_BUILD): $(REPO_PATH)/$(CHECK_MK_DIR).tar.gz
 	  $(MKDIR) bin ; \
 	  cd bin ; \
 	  $(TAR_GZ) ../bin.tar.gz ; \
-	  $(MAKE)
+	  bazel run :deploy_mkevent ; \
 	cd $(CHECK_MK_BUILD_DIR) ; \
 	  $(MKDIR) active_checks ; \
 	  cd active_checks ; \
