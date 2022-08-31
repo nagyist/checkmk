@@ -256,7 +256,10 @@ def _generate_sync_snapshot(
     return snapshot_settings
 
 
-def _get_expected_paths(user_id: UserId, is_pre_17_site: bool, with_local: bool) -> list[str]:
+def _get_expected_paths(
+    user_id: UserId, with_local: bool, cmk_edition: cmk_version.Edition
+) -> list[str]:
+    # raw, enterprise, managed
     expected_paths = [
         "etc",
         "var",
@@ -284,6 +287,7 @@ def _get_expected_paths(user_id: UserId, is_pre_17_site: bool, with_local: bool)
         "var/check_mk/stored_passwords",
     ]
 
+    # raw, enterprise, managed
     if with_local:
         expected_paths += [
             "local",
@@ -291,6 +295,7 @@ def _get_expected_paths(user_id: UserId, is_pre_17_site: bool, with_local: bool)
         ]
 
     # The new sync directories create all needed files on the central site now
+    # raw, enterprise, managed
     expected_paths += [
         "etc/check_mk/apache.d",
         "etc/check_mk/apache.d/wato",
@@ -307,21 +312,25 @@ def _get_expected_paths(user_id: UserId, is_pre_17_site: bool, with_local: bool)
         "etc/omd/sitespecific.mk",
     ]
 
+    # enterprise, managed
     if is_enterprise_repo():
         expected_paths += [
             "etc/check_mk/dcd.d/wato/sitespecific.mk",
             "etc/check_mk/mknotifyd.d/wato/sitespecific.mk",
         ]
 
-    if not cmk_version.is_raw_edition():
+    # enterprise, managed
+    if cmk_edition is not cmk_version.Edition.CRE:
         expected_paths += ["etc/check_mk/dcd.d/wato/distributed.mk"]
 
-    if not cmk_version.is_managed_edition():
+    # enterprise, raw
+    if cmk_edition is not cmk_version.Edition.CME:
         expected_paths += ["etc/omd/site.conf"]
 
     # TODO: The second condition should not be needed. Seems to be a subtle difference between the
     # CME and CRE/CEE snapshot logic
-    if not cmk_version.is_managed_edition():
+    # enterprise, raw
+    if cmk_edition is not cmk_version.Edition.CME:
         expected_paths += [
             "etc/check_mk/mkeventd.d/mkp",
             "etc/check_mk/mkeventd.d/mkp/rule_packs",
@@ -332,7 +341,8 @@ def _get_expected_paths(user_id: UserId, is_pre_17_site: bool, with_local: bool)
     # cmk_version.edition().short value.
     # TODO: The second condition should not be needed. Seems to be a subtle difference between the
     # CME and CRE/CEE snapshot logic
-    if is_enterprise_repo() and (not is_pre_17_site or not cmk_version.is_managed_edition()):
+    # enterprise, managed
+    if is_enterprise_repo():
         expected_paths += [
             "etc/check_mk/dcd.d",
             "etc/check_mk/dcd.d/wato",
@@ -341,7 +351,8 @@ def _get_expected_paths(user_id: UserId, is_pre_17_site: bool, with_local: bool)
         ]
 
     # TODO: Shouldn't we clean up these subtle differences?
-    if cmk_version.is_managed_edition():
+    # managed
+    if cmk_edition is cmk_version.Edition.CME:
         expected_paths += [
             "etc/check_mk/conf.d/customer.mk",
             "etc/check_mk/conf.d/wato/groups.mk",
@@ -358,7 +369,8 @@ def _get_expected_paths(user_id: UserId, is_pre_17_site: bool, with_local: bool)
 
     # TODO: The second condition should not be needed. Seems to be a subtle difference between the
     # CME and CRE/CEE snapshot logic
-    if not cmk_version.is_raw_edition() and not cmk_version.is_managed_edition():
+    # enterprise
+    if cmk_edition not in (cmk_version.Edition.CRE, cmk_version.Edition.CME):
         expected_paths += [
             "etc/check_mk/liveproxyd.d",
             "etc/check_mk/liveproxyd.d/wato",
@@ -402,8 +414,8 @@ def test_generate_snapshot(
 
     expected_paths = _get_expected_paths(
         user_id=with_user_login,
-        is_pre_17_site=False,
         with_local=active_config.sites[remote_site].get("replicate_mkps", False),
+        cmk_edition=edition,
     )
 
     work_dir = Path(snapshot_settings.work_dir)
