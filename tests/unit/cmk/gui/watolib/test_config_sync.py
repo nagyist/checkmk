@@ -267,7 +267,6 @@ def _get_expected_paths(
         "etc/check_mk/mkeventd.d",
         "etc/check_mk/multisite.d",
         "etc/check_mk/conf.d/wato",
-        "etc/check_mk/conf.d/wato/hosts.mk",
         "etc/check_mk/conf.d/wato/contacts.mk",
         "etc/check_mk/mkeventd.d/wato",
         "etc/check_mk/multisite.d/wato",
@@ -315,20 +314,9 @@ def _get_expected_paths(
             "etc/check_mk/mknotifyd.d/wato",
         ]
 
-    if cmk_edition is not cmk_version.Edition.CRE:
-        expected_paths += ["etc/check_mk/dcd.d/wato/distributed.mk"]
-
     # TODO: Shouldn't we clean up these subtle differences?
-    if cmk_edition is not cmk_version.Edition.CME:
-        expected_paths += [
-            "etc/omd/site.conf",
-            "etc/check_mk/mkeventd.d/mkp",
-            "etc/check_mk/mkeventd.d/mkp/rule_packs",
-            "etc/check_mk/mkeventd.d/wato/rules.mk",
-        ]
-
     if cmk_edition is cmk_version.Edition.CME:
-        expected_paths += [
+        return expected_paths + [
             "etc/check_mk/conf.d/customer.mk",
             "etc/check_mk/conf.d/wato/groups.mk",
             "etc/check_mk/conf.d/wato/passwords.mk",
@@ -338,17 +326,25 @@ def _get_expected_paths(
             "etc/check_mk/multisite.d/wato/customers.mk",
             "etc/check_mk/multisite.d/wato/groups.mk",
             "etc/check_mk/multisite.d/wato/user_connections.mk",
+            "etc/check_mk/dcd.d/wato/distributed.mk",
         ]
 
-        expected_paths.remove("etc/check_mk/conf.d/wato/hosts.mk")
+    expected_paths += [
+        "etc/omd/site.conf",
+        "etc/check_mk/mkeventd.d/mkp",
+        "etc/check_mk/mkeventd.d/mkp/rule_packs",
+        "etc/check_mk/mkeventd.d/wato/rules.mk",
+        "etc/check_mk/conf.d/wato/hosts.mk",
+    ]
 
-    if cmk_edition not in (cmk_version.Edition.CRE, cmk_version.Edition.CME):
-        expected_paths += [
-            "etc/check_mk/liveproxyd.d",
-            "etc/check_mk/liveproxyd.d/wato",
-        ]
+    if cmk_edition is cmk_version.Edition.CRE:
+        return expected_paths
 
-    return expected_paths
+    return expected_paths + [
+        "etc/check_mk/liveproxyd.d",
+        "etc/check_mk/liveproxyd.d/wato",
+        "etc/check_mk/dcd.d/wato/distributed.mk",
+    ]
 
 
 @pytest.mark.usefixtures("request_context")
