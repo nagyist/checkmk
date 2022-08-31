@@ -259,7 +259,6 @@ def _generate_sync_snapshot(
 def _get_expected_paths(
     user_id: UserId, with_local: bool, cmk_edition: cmk_version.Edition
 ) -> list[str]:
-    # raw, enterprise, managed
     expected_paths = [
         "etc",
         "var",
@@ -285,18 +284,6 @@ def _get_expected_paths(
         "var/check_mk/web/%s/num_failed_logins.mk" % user_id,
         "var/check_mk/web/%s/serial.mk" % user_id,
         "var/check_mk/stored_passwords",
-    ]
-
-    # raw, enterprise, managed
-    if with_local:
-        expected_paths += [
-            "local",
-            "var/check_mk/packages",
-        ]
-
-    # The new sync directories create all needed files on the central site now
-    # raw, enterprise, managed
-    expected_paths += [
         "etc/check_mk/apache.d",
         "etc/check_mk/apache.d/wato",
         "etc/check_mk/apache.d/wato/sitespecific.mk",
@@ -312,46 +299,34 @@ def _get_expected_paths(
         "etc/omd/sitespecific.mk",
     ]
 
-    # enterprise, managed
+    if with_local:
+        expected_paths += [
+            "local",
+            "var/check_mk/packages",
+        ]
+
     if is_enterprise_repo():
         expected_paths += [
             "etc/check_mk/dcd.d/wato/sitespecific.mk",
             "etc/check_mk/mknotifyd.d/wato/sitespecific.mk",
-        ]
-
-    # enterprise, managed
-    if cmk_edition is not cmk_version.Edition.CRE:
-        expected_paths += ["etc/check_mk/dcd.d/wato/distributed.mk"]
-
-    # enterprise, raw
-    if cmk_edition is not cmk_version.Edition.CME:
-        expected_paths += ["etc/omd/site.conf"]
-
-    # TODO: The second condition should not be needed. Seems to be a subtle difference between the
-    # CME and CRE/CEE snapshot logic
-    # enterprise, raw
-    if cmk_edition is not cmk_version.Edition.CME:
-        expected_paths += [
-            "etc/check_mk/mkeventd.d/mkp",
-            "etc/check_mk/mkeventd.d/mkp/rule_packs",
-            "etc/check_mk/mkeventd.d/wato/rules.mk",
-        ]
-
-    # The paths are registered once the enterprise plugins are available, independent of the
-    # cmk_version.edition().short value.
-    # TODO: The second condition should not be needed. Seems to be a subtle difference between the
-    # CME and CRE/CEE snapshot logic
-    # enterprise, managed
-    if is_enterprise_repo():
-        expected_paths += [
             "etc/check_mk/dcd.d",
             "etc/check_mk/dcd.d/wato",
             "etc/check_mk/mknotifyd.d",
             "etc/check_mk/mknotifyd.d/wato",
         ]
 
+    if cmk_edition is not cmk_version.Edition.CRE:
+        expected_paths += ["etc/check_mk/dcd.d/wato/distributed.mk"]
+
     # TODO: Shouldn't we clean up these subtle differences?
-    # managed
+    if cmk_edition is not cmk_version.Edition.CME:
+        expected_paths += [
+            "etc/omd/site.conf",
+            "etc/check_mk/mkeventd.d/mkp",
+            "etc/check_mk/mkeventd.d/mkp/rule_packs",
+            "etc/check_mk/mkeventd.d/wato/rules.mk",
+        ]
+
     if cmk_edition is cmk_version.Edition.CME:
         expected_paths += [
             "etc/check_mk/conf.d/customer.mk",
@@ -367,9 +342,6 @@ def _get_expected_paths(
 
         expected_paths.remove("etc/check_mk/conf.d/wato/hosts.mk")
 
-    # TODO: The second condition should not be needed. Seems to be a subtle difference between the
-    # CME and CRE/CEE snapshot logic
-    # enterprise
     if cmk_edition not in (cmk_version.Edition.CRE, cmk_version.Edition.CME):
         expected_paths += [
             "etc/check_mk/liveproxyd.d",
