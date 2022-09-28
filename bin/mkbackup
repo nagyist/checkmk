@@ -27,7 +27,7 @@ from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 from hashlib import md5
 from pathlib import Path
-from typing import Any, IO, NamedTuple, NewType, NoReturn, TypedDict
+from typing import Any, IO, Literal, NamedTuple, NewType, NoReturn, TypedDict
 
 from Cryptodome.Cipher import AES, PKCS1_OAEP
 from Cryptodome.Cipher._mode_cbc import CbcMode
@@ -67,9 +67,29 @@ def dump_privatekey_pem(pkey: crypto.PKey) -> bytes:
 TargetId = NewType("TargetId", str)
 
 
+class TargetConfigDetails(TypedDict):
+    path: str
+    is_mountpoint: bool
+
+
+class TargetConfig(TypedDict):
+    title: str
+    remote: tuple[Literal["local"], TargetConfigDetails]
+
+
 class Config(TypedDict):
-    targets: dict[str, Any]
+    targets: dict[TargetId, TargetConfig]
     jobs: dict[str, Any]
+
+
+def get_target_config(config: Config, target_id: TargetId) -> TargetConfig:
+    try:
+        return config["targets"][target_id]
+    except KeyError:
+        available_targets = ", ".join(config["targets"].keys())
+        raise MKGeneralException(
+            f"The backup target {target_id} does not exist. Choose one of {available_targets}"
+        )
 
 
 class ScheduleConfig(TypedDict):
@@ -92,16 +112,16 @@ class Job:
     config: JobConfig
     local_id: str | None
     id: str | None
+    target: TargetConfig
 
 
 @dataclass(frozen=True)
 class BackupTarget:
-    config: Config
     job: Job
 
     @property
     def base_path(self) -> str:
-        return job_backup_path_during_backup(self.config, self.job)
+        return job_backup_path_during_backup(self.job)
 
     @property
     def target_id(self) -> str:
@@ -112,11 +132,16 @@ class BackupTarget:
 class RestoreTarget:
     target_id: TargetId
     backup_id: str
-    config: Config
+    config: TargetConfig
+
+    @classmethod
+    def from_config(cls, target_id: TargetId, backup_id: str, config: Config) -> "RestoreTarget":
+        target_config = get_target_config(config, target_id)
+        return cls(target_id, backup_id, target_config)
 
     @property
     def base_path(self) -> str:
-        return f"{target_path(self.target_id, self.config)}/{self.backup_id}"
+        return f"{target_path(self.config)}/{self.backup_id}"
 
 
 Target = BackupTarget | RestoreTarget
@@ -437,8 +462,8 @@ def save_backup_info(info: Mapping[str, Any], target: Target) -> None:
         json.dump(info, f, sort_keys=True, indent=4, separators=(",", ": "))
 
 
-def create_backup_info(config: Config, job: Job) -> Mapping[str, Any]:
-    files = get_files_for_backup_info(config, job)
+def create_backup_info(job: Job) -> Mapping[str, Any]:
+    files = get_files_for_backup_info(job)
 
     info = {
         "type": "Check_MK",
@@ -459,8 +484,8 @@ def add_site_info_to_backup_info(info: dict[str, Any]) -> None:
     info["site_version"] = site_version(info["site_id"])
 
 
-def get_files_for_backup_info(config: Config, job: Job) -> list[tuple[str, int, str]]:
-    backup_path = job_backup_path_during_backup(config, job)
+def get_files_for_backup_info(job: Job) -> list[tuple[str, int, str]]:
+    backup_path = job_backup_path_during_backup(job)
     dir_entries: list[str] = os.listdir(backup_path)
     files = []
     for f in sorted(dir_entries):
@@ -595,7 +620,7 @@ modes = {
 
 def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None:
     job = load_job(local_job_id, config)
-    target = BackupTarget(config, job)
+    target = BackupTarget(job)
     state = State(backup_state_path(job))
 
     with ExitStack() as stack:
@@ -605,7 +630,7 @@ def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None
         ]:
             stack.enter_context(cm)
         target_ident = job.config["target"]
-        verify_target_is_ready(target_ident, config)
+        verify_target_is_ready(job.target)
 
         init_new_run(state)
         save_next_run(job, state)
@@ -619,7 +644,7 @@ def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None
 
         success = False
         try:
-            cleanup_previous_incomplete_backup(config, job)
+            cleanup_previous_incomplete_backup(job)
 
             state.save(
                 {
@@ -627,7 +652,7 @@ def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None
                 },
             )
 
-            do_backup(opts, config, job, target, state)
+            do_backup(opts, job, target, state)
             success = True
 
         except MKGeneralException as e:
@@ -654,17 +679,15 @@ def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None
 
 def do_backup(
     opts: Mapping[str, str],
-    config: Config,
     job: Job,
     target: BackupTarget,
     state: State,
 ) -> None:
-    do_site_backup(config, job.config, target, state)
-    complete_backup(config, job, target, state)
+    do_site_backup(job.config, target, state)
+    complete_backup(job, target, state)
 
 
 def do_site_backup(
-    config: Config,
     job_config: JobConfig,
     target: BackupTarget,
     state: State,
@@ -1006,16 +1029,16 @@ def site_backup_archive_path(site_id: str, target: Target, job_config: JobConfig
     return f"{target.base_path}/site-{site_id}{archive_suffix(job_config)}"
 
 
-def job_backup_path_during_backup(config: Config, job: Job) -> str:
-    return "%s-incomplete" % job_backup_path(config, job)
+def job_backup_path_during_backup(job: Job) -> str:
+    return "%s-incomplete" % job_backup_path(job)
 
 
-def job_backup_path_complete(config: Config, job: Job) -> str:
-    return "%s-complete" % job_backup_path(config, job)
+def job_backup_path_complete(job: Job) -> str:
+    return "%s-complete" % job_backup_path(job)
 
 
-def job_backup_path(config: Config, job: Job) -> str:
-    return "{}/{}".format(target_path(job.config["target"], config), job.id)
+def job_backup_path(job: Job) -> str:
+    return "{}/{}".format(target_path(job.target), job.id)
 
 
 def archive_suffix(config: JobConfig) -> str:
@@ -1035,12 +1058,7 @@ def needed_backup_archive_files(info: Mapping[str, Any], job_config: JobConfig) 
     return [f + archive_suffix(job_config) for f in needed_files]
 
 
-def target_cfg(target_ident: str, config: Config) -> Mapping[str, Any]:
-    return config["targets"][target_ident]
-
-
-def target_path(target_ident: str, config: Config) -> str:
-    cfg = target_cfg(target_ident, config)
+def target_path(cfg: TargetConfig) -> str:
     if cfg["remote"][0] != "local":
         raise NotImplementedError()
 
@@ -1048,12 +1066,7 @@ def target_path(target_ident: str, config: Config) -> str:
 
 
 # TODO: Duplicate code with htdocs/backup.py
-def verify_target_is_ready(target_ident: str, config: Config) -> None:
-    try:
-        cfg = target_cfg(target_ident, config)
-    except KeyError:
-        raise MKGeneralException('The backup target "%s" does not exist.' % target_ident)
-
+def verify_target_is_ready(cfg: TargetConfig) -> None:
     if cfg["remote"][0] != "local":
         raise NotImplementedError()
 
@@ -1109,8 +1122,8 @@ def verify_backup_files(
             )
 
 
-def complete_backup(config: Config, job: Job, target: BackupTarget, state: State) -> None:
-    info = create_backup_info(config, job)
+def complete_backup(job: Job, target: BackupTarget, state: State) -> None:
+    info = create_backup_info(job)
     save_backup_info(info, target)
 
     state.save(
@@ -1124,13 +1137,13 @@ def complete_backup(config: Config, job: Job, target: BackupTarget, state: State
     # Now we can be sure this new backup is a good one. Remove eventual old
     # backup and move from "incomplete" to "complete".
 
-    if os.path.exists(job_backup_path_complete(config, job)):
+    if os.path.exists(job_backup_path_complete(job)):
         log("Cleaning up previously completed backup")
-        shutil.rmtree(job_backup_path_complete(config, job))
+        shutil.rmtree(job_backup_path_complete(job))
 
     os.rename(
-        job_backup_path_during_backup(config, job),
-        job_backup_path_complete(config, job),
+        job_backup_path_during_backup(job),
+        job_backup_path_complete(job),
     )
 
     state_content = state.load()
@@ -1146,11 +1159,11 @@ def complete_backup(config: Config, job: Job, target: BackupTarget, state: State
     )
 
 
-def cleanup_previous_incomplete_backup(config: Config, job: Job) -> None:
-    if os.path.exists(job_backup_path_during_backup(config, job)):
+def cleanup_previous_incomplete_backup(job: Job) -> None:
+    if os.path.exists(job_backup_path_during_backup(job)):
         log("Found previous incomplete backup. Cleaning up those files.")
         try:
-            shutil.rmtree(job_backup_path_during_backup(config, job))
+            shutil.rmtree(job_backup_path_during_backup(job))
         except OSError as e:
             if e.errno == errno.EACCES:
                 raise MKGeneralException("Failed to write the backup directory: %s" % e)
@@ -1162,8 +1175,13 @@ def load_job(local_job_id: str, config: Config) -> Job:
 
     if local_job_id not in config["jobs"]:
         raise MKGeneralException("This backup job does not exist.")
-
-    job = Job(config=config["jobs"][local_job_id], local_id=local_job_id, id=g_job_id)
+    job_config: JobConfig = config["jobs"][local_job_id]
+    job = Job(
+        config=job_config,
+        local_id=local_job_id,
+        id=g_job_id,
+        target=get_target_config(config, job_config["target"]),
+    )
     return job
 
 
@@ -1225,7 +1243,7 @@ def add_output(s: str, state: State) -> None:
 
 
 def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: Config) -> None:
-    target = RestoreTarget(TargetId(target_id), backup_id, config)
+    target = RestoreTarget.from_config(TargetId(target_id), backup_id, config)
     info = load_backup_info(backup_info_path(target))
     job_config: JobConfig = info["config"]
     state = State(restore_state_path())
@@ -1237,7 +1255,7 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
         ]:
             stack.enter_context(cm)
 
-        verify_target_is_ready(target_id, config)
+        verify_target_is_ready(target.config)
         verify_backup_exists(target)
 
         if "no-verify" not in opts:
@@ -1261,7 +1279,7 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
                 },
             )
 
-            do_restore(opts, info, config, job_config, target, state)
+            do_restore(opts, info, job_config, target, state)
             success = True
 
         except MKGeneralException as e:
@@ -1289,18 +1307,16 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
 def do_restore(
     opts: Mapping[str, str],
     info: Mapping[str, Any],
-    config: Config,
     job_config: JobConfig,
     target: RestoreTarget,
     state: State,
 ) -> None:
-    do_site_restore(info, config, job_config, target, state)
+    do_site_restore(info, job_config, target, state)
     complete_restore(state)
 
 
 def do_site_restore(
     info: Mapping[str, str],
-    config: Config,
     job_config: JobConfig,
     target: RestoreTarget,
     state: State,
@@ -1368,19 +1384,15 @@ def complete_restore(state: State) -> None:
 
 
 def mode_list(target_id: str, opts: dict[str, str], config: Config) -> None:
-    if target_id not in config["targets"]:
-        raise MKGeneralException(
-            "This backup target does not exist. Choose one of: %s"
-            % ", ".join(config["targets"].keys())
-        )
+    target: TargetConfig = get_target_config(config, TargetId(target_id))
 
-    verify_target_is_ready(target_id, config)
+    verify_target_is_ready(target)
 
     fmt = "%-9s %-20s %-16s %52s\n"
     fmt_detail = (" " * 30) + " %-20s %48s\n"
     sys.stdout.write(fmt % ("Type", "Job", "Details", ""))
     sys.stdout.write("%s\n" % ("-" * 100))
-    for path in sorted(glob.glob("%s/*/mkbackup.info" % target_path(target_id, config))):
+    for path in sorted(glob.glob("%s/*/mkbackup.info" % target_path(target))):
         info = load_backup_info(path)
         from_info = info["hostname"]
         if "site_id" in info:
