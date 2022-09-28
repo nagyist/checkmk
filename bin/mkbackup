@@ -127,8 +127,8 @@ g_state: dict[str, Any] | None = None
 # The state file is in JSON format because it is 1:1 transfered
 # to the Checkmk server through the Checkmk agent.
 class State:
-    def __init__(self, job: Job) -> None:
-        self.path = _state_path(job)
+    def __init__(self, path: Path) -> None:
+        self.path = path
 
     def save(self, new_attrs: Mapping[str, Any], update: bool = True) -> None:
         if update:
@@ -150,29 +150,24 @@ class State:
         return _load_state(self.path)
 
 
+def backup_state_path(job: Job) -> Path:
+    path = "%s/var/check_mk/backup" % os.environ["OMD_ROOT"]
+    name = job.local_id
+    return Path(path, f"{name}.state")
+
+
+def restore_state_path() -> Path:
+    path = "/tmp"
+    name = f"restore-{current_site_id}"
+    return Path(path, f"{name}.state")
+
+
 def _load_state(path: Path) -> dict[str, Any]:
     global g_state
     if g_state is None:
         g_state = json.loads(path.read_text())
 
     return g_state
-
-
-def _state_path(job: Job) -> Path:
-    if job.id:
-        # backup as site user
-        path = "%s/var/check_mk/backup" % os.environ["OMD_ROOT"]
-    else:
-        # restore as site user
-        path = "/tmp"
-
-    if job.id:
-        # backup
-        name = job.local_id
-    else:
-        name = "restore-%s" % current_site_id()
-
-    return Path(path, f"{name}.state")
 
 
 # Is used to duplicate output from stdout/stderr to a the job log. This
@@ -601,7 +596,7 @@ modes = {
 def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None:
     job = load_job(local_job_id, config)
     target = BackupTarget(config, job)
-    state = State(job)
+    state = State(backup_state_path(job))
 
     with ExitStack() as stack:
         for cm in [
@@ -664,23 +659,23 @@ def do_backup(
     target: BackupTarget,
     state: State,
 ) -> None:
-    do_site_backup(config, job, target, state)
+    do_site_backup(config, job.config, target, state)
     complete_backup(config, job, target, state)
 
 
 def do_site_backup(
     config: Config,
-    job: Job,
+    job_config: JobConfig,
     target: BackupTarget,
     state: State,
     try_stop: bool = True,
 ) -> None:  # pylint: disable=too-many-branches
     cmd = ["omd", "backup"]
 
-    if not job.config["compress"]:
+    if not job_config["compress"]:
         cmd.append("--no-compression")
 
-    if job.config.get("no_history", False):
+    if job_config.get("no_history", False):
         cmd.append("--no-past")
 
     # When executed as site user, "omd backup" is executed without the site
@@ -691,7 +686,7 @@ def do_site_backup(
 
     cmd.append("-")
 
-    backup_path = site_backup_archive_path(site, target, job.config)
+    backup_path = site_backup_archive_path(site, target, job_config)
 
     # Create missing directories. Ensure group permissions and mode.
     makedirs(os.path.dirname(backup_path), group="omd", mode=0o775)
@@ -711,7 +706,7 @@ def do_site_backup(
             s = BackupStream(
                 stream=p.stdout,
                 is_alive=lambda: p.poll() is None,
-                key_ident=job.config["encrypt"],
+                key_ident=job_config["encrypt"],
                 state=state,
             )
             for chunk in s.process():
@@ -1232,13 +1227,13 @@ def add_output(s: str, state: State) -> None:
 def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: Config) -> None:
     target = RestoreTarget(TargetId(target_id), backup_id, config)
     info = load_backup_info(backup_info_path(target))
-    job = Job(config=info["config"], local_id=info["job_id"], id=None)
-    state = State(job)
+    job_config: JobConfig = info["config"]
+    state = State(restore_state_path())
 
     with ExitStack() as stack:
         for cm in [
             acquire_single_lock(lock_file_path)
-            for lock_file_path in get_needed_lock_files(opts, job.config)
+            for lock_file_path in get_needed_lock_files(opts, job_config)
         ]:
             stack.enter_context(cm)
 
@@ -1246,7 +1241,7 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
         verify_backup_exists(target)
 
         if "no-verify" not in opts:
-            verify_backup_consistency(info, job.config, target)
+            verify_backup_consistency(info, job_config, target)
 
         init_new_run(state)
 
@@ -1266,7 +1261,7 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
                 },
             )
 
-            do_restore(opts, info, config, job, target, state)
+            do_restore(opts, info, config, job_config, target, state)
             success = True
 
         except MKGeneralException as e:
@@ -1295,18 +1290,18 @@ def do_restore(
     opts: Mapping[str, str],
     info: Mapping[str, Any],
     config: Config,
-    job: Job,
+    job_config: JobConfig,
     target: RestoreTarget,
     state: State,
 ) -> None:
-    do_site_restore(info, config, job, target, state)
+    do_site_restore(info, config, job_config, target, state)
     complete_restore(state)
 
 
 def do_site_restore(
     info: Mapping[str, str],
     config: Config,
-    job: Job,
+    job_config: JobConfig,
     target: RestoreTarget,
     state: State,
     site: str | None = None,
@@ -1322,7 +1317,7 @@ def do_site_restore(
 
     cmd.append("-")
 
-    backup_path = site_backup_archive_path(site, target, job.config)
+    backup_path = site_backup_archive_path(site, target, job_config)
 
     with subprocess.Popen(cmd, close_fds=True, stderr=subprocess.PIPE, stdin=subprocess.PIPE) as p:
         assert p.stdin is not None
@@ -1332,7 +1327,7 @@ def do_site_restore(
             s = RestoreStream(
                 stream=backup_file,
                 is_alive=lambda: False,
-                key_ident=job.config["encrypt"],
+                key_ident=job_config["encrypt"],
                 state=state,
             )
             try:
