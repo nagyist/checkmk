@@ -409,9 +409,8 @@ def makedir(
 # - Site-Konfiguration laden
 
 
-def get_needed_lock_files(opts: Mapping[str, str], job_config: JobConfig) -> Sequence[Path]:
+def get_needed_lock_files() -> Sequence[Path]:
     site_id = current_site_id()
-    assert site_id
     return [local_lock_file_path(site_id)]
 
 
@@ -625,8 +624,7 @@ def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None
 
     with ExitStack() as stack:
         for cm in [
-            acquire_single_lock(lock_file_path)
-            for lock_file_path in get_needed_lock_files(opts, job.config)
+            acquire_single_lock(lock_file_path) for lock_file_path in get_needed_lock_files()
         ]:
             stack.enter_context(cm)
         target_ident = job.config["target"]
@@ -652,7 +650,7 @@ def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None
                 },
             )
 
-            do_backup(opts, job, target, state)
+            do_backup(job, target, state)
             success = True
 
         except MKGeneralException as e:
@@ -678,7 +676,6 @@ def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None
 
 
 def do_backup(
-    opts: Mapping[str, str],
     job: Job,
     target: BackupTarget,
     state: State,
@@ -1250,8 +1247,7 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
 
     with ExitStack() as stack:
         for cm in [
-            acquire_single_lock(lock_file_path)
-            for lock_file_path in get_needed_lock_files(opts, job_config)
+            acquire_single_lock(lock_file_path) for lock_file_path in get_needed_lock_files()
         ]:
             stack.enter_context(cm)
 
@@ -1279,7 +1275,7 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
                 },
             )
 
-            do_restore(opts, info, job_config, target, state)
+            do_restore(info, job_config, target, state)
             success = True
 
         except MKGeneralException as e:
@@ -1305,7 +1301,6 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
 
 
 def do_restore(
-    opts: Mapping[str, str],
     info: Mapping[str, Any],
     job_config: JobConfig,
     target: RestoreTarget,
