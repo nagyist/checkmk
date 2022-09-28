@@ -110,8 +110,8 @@ class JobConfig(TypedDict):
 @dataclass
 class Job:
     config: JobConfig
-    local_id: str | None
-    id: str | None
+    local_id: str
+    id: str
     target: TargetConfig
 
 
@@ -145,6 +145,20 @@ class RestoreTarget:
 
 
 Target = BackupTarget | RestoreTarget
+
+
+class BackupInfo(TypedDict):
+    config: JobConfig
+    files: Sequence[tuple[str, int, str]]
+    finished: float
+    hostname: str
+    job_id: str
+    site_id: str
+    site_version: str
+    size: int
+    type: str
+    backup_id: str | None
+
 
 g_state: dict[str, Any] | None = None
 
@@ -438,9 +452,9 @@ def load_config() -> Config:
 
 
 # TODO: Duplicate code with htdocs/backup.py
-def load_backup_info(path: str) -> Mapping[str, Any]:
+def load_backup_info(path: str) -> BackupInfo:
     with open(path) as f:
-        info = json.load(f)
+        info: BackupInfo = json.load(f)
 
     # Load the backup_id from the second right path component. This is the
     # base directory of the mkbackup.info file. The user might have moved
@@ -452,19 +466,19 @@ def load_backup_info(path: str) -> Mapping[str, Any]:
     return info
 
 
-def get_site_ids_of_backup(info: Mapping[str, Any]) -> list[str]:
+def get_site_ids_of_backup(info: BackupInfo) -> list[str]:
     return [f[0].split(".", 1)[0][5:] for f in info["files"] if f[0].startswith("site-")]
 
 
-def save_backup_info(info: Mapping[str, Any], target: Target) -> None:
+def save_backup_info(info: BackupInfo, target: BackupTarget) -> None:
     with open(backup_info_path(target), "w") as f:
         json.dump(info, f, sort_keys=True, indent=4, separators=(",", ": "))
 
 
-def create_backup_info(job: Job) -> Mapping[str, Any]:
+def create_backup_info(job: Job) -> BackupInfo:
     files = get_files_for_backup_info(job)
 
-    info = {
+    info: BackupInfo = {
         "type": "Check_MK",
         "job_id": job.local_id,
         "config": job.config,
@@ -472,18 +486,15 @@ def create_backup_info(job: Job) -> Mapping[str, Any]:
         "files": files,
         "finished": time.time(),
         "size": sum(f[1] for f in files),
+        "site_id": current_site_id(),
+        "site_version": site_version(current_site_id()),
+        "backup_id": None,
     }
 
-    add_site_info_to_backup_info(info)
     return info
 
 
-def add_site_info_to_backup_info(info: dict[str, Any]) -> None:
-    info["site_id"] = current_site_id()
-    info["site_version"] = site_version(info["site_id"])
-
-
-def get_files_for_backup_info(job: Job) -> list[tuple[str, int, str]]:
+def get_files_for_backup_info(job: Job) -> Sequence[tuple[str, int, str]]:
     backup_path = job_backup_path_during_backup(job)
     dir_entries: list[str] = os.listdir(backup_path)
     files = []
@@ -1047,12 +1058,11 @@ def archive_suffix(config: JobConfig) -> str:
     return suffix
 
 
-def needed_backup_archive_files(info: Mapping[str, Any], job_config: JobConfig) -> Sequence[str]:
+def needed_backup_archive_files(info: BackupInfo) -> Sequence[str]:
     # Care about restore from a backup made in a site with another site_id
     site = info.get("site_id", current_site_id())
     needed_files = ["site-%s" % site]
-
-    return [f + archive_suffix(job_config) for f in needed_files]
+    return [f + archive_suffix(info["config"]) for f in needed_files]
 
 
 def target_path(cfg: TargetConfig) -> str:
@@ -1073,7 +1083,7 @@ def verify_target_is_ready(cfg: TargetConfig) -> None:
         )
 
 
-def verify_backup_exists(target: Target) -> None:
+def verify_backup_exists(target: RestoreTarget) -> None:
     if not os.path.exists(target.base_path) or not os.path.exists(backup_info_path(target)):
         raise MKGeneralException(
             f'This backup does not exist (Use "mkbackup list {target.target_id}" to '
@@ -1081,19 +1091,17 @@ def verify_backup_exists(target: Target) -> None:
         )
 
 
-def verify_backup_consistency(
-    info: Mapping[str, Any], job_config: JobConfig, target: Target
-) -> None:
+def verify_backup_consistency(backup_info: BackupInfo, target: Target) -> None:
     log("Verifying backup consistency")
-    needed_files = needed_backup_archive_files(info, job_config)
-    optional_files = [entry[0] for entry in info["files"] if entry[0] not in needed_files]
+    needed_files = needed_backup_archive_files(backup_info)
+    optional_files = [entry[0] for entry in backup_info["files"] if entry[0] not in needed_files]
 
-    verify_backup_files(info, needed_files, needed=True, target=target)
-    verify_backup_files(info, optional_files, needed=False, target=target)
+    verify_backup_files(backup_info, needed_files, needed=True, target=target)
+    verify_backup_files(backup_info, optional_files, needed=False, target=target)
 
 
 def verify_backup_files(
-    info: Mapping[str, Any], files: Sequence[str], needed: bool, target: Target
+    info: BackupInfo, files: Sequence[str], needed: bool, target: Target
 ) -> None:
     for archive_file in files:
         size, checksum = None, None
@@ -1129,7 +1137,7 @@ def complete_backup(job: Job, target: BackupTarget, state: State) -> None:
         },
     )
 
-    verify_backup_consistency(info, job.config, target=target)
+    verify_backup_consistency(info, target=target)
 
     # Now we can be sure this new backup is a good one. Remove eventual old
     # backup and move from "incomplete" to "complete".
@@ -1241,8 +1249,7 @@ def add_output(s: str, state: State) -> None:
 
 def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: Config) -> None:
     target = RestoreTarget.from_config(TargetId(target_id), backup_id, config)
-    info = load_backup_info(backup_info_path(target))
-    job_config: JobConfig = info["config"]
+    backup_info = load_backup_info(backup_info_path(target))
     state = State(restore_state_path())
 
     with ExitStack() as stack:
@@ -1255,7 +1262,7 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
         verify_backup_exists(target)
 
         if "no-verify" not in opts:
-            verify_backup_consistency(info, job_config, target)
+            verify_backup_consistency(backup_info, target)
 
         init_new_run(state)
 
@@ -1275,7 +1282,7 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
                 },
             )
 
-            do_restore(info, job_config, target, state)
+            do_restore(backup_info, target, state)
             success = True
 
         except MKGeneralException as e:
@@ -1301,18 +1308,16 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
 
 
 def do_restore(
-    info: Mapping[str, Any],
-    job_config: JobConfig,
+    backup_info: BackupInfo,
     target: RestoreTarget,
     state: State,
 ) -> None:
-    do_site_restore(info, job_config, target, state)
+    do_site_restore(backup_info, target, state)
     complete_restore(state)
 
 
 def do_site_restore(
-    info: Mapping[str, str],
-    job_config: JobConfig,
+    backup_info: BackupInfo,
     target: RestoreTarget,
     state: State,
     site: str | None = None,
@@ -1322,13 +1327,13 @@ def do_site_restore(
     # When executed as site user, "omd restore" is executed without the site
     # name and always performing restore for the current site. Care about
     # restore from a backup made in a site with another site_id
-    site = info.get("site_id", current_site_id())
+    site = backup_info.get("site_id", current_site_id())
     if site is None:
         raise MKGeneralException("Running outsite of site context and no site_id configured")
 
     cmd.append("-")
 
-    backup_path = site_backup_archive_path(site, target, job_config)
+    backup_path = site_backup_archive_path(site, target, backup_info["config"])
 
     with subprocess.Popen(cmd, close_fds=True, stderr=subprocess.PIPE, stdin=subprocess.PIPE) as p:
         assert p.stdin is not None
@@ -1338,7 +1343,7 @@ def do_site_restore(
             s = RestoreStream(
                 stream=backup_file,
                 is_alive=lambda: False,
-                key_ident=job_config["encrypt"],
+                key_ident=backup_info["config"]["encrypt"],
                 state=state,
             )
             try:
