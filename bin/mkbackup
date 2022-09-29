@@ -111,7 +111,7 @@ class BackupInfo(TypedDict):
     site_version: str
     size: int
     type: str
-    backup_id: str | None
+    backup_id: str
 
 
 def local_lock_file_path(site_name: str) -> Path:
@@ -188,14 +188,21 @@ class Backup:
 
     def verify(self) -> None:
         log("Verifying backup consistency")
-        for filename, _, checksum in self.info["files"]:
-            path = self.target.path / filename
-            if (this_checksum := file_checksum(str(path))) != checksum:
-                raise MKGeneralException(
-                    "The backup seems to be damaged and can not be restored. "
-                    "The checksum of the archive %s is wrong (got %s but "
-                    "expected %s)." % (path, this_checksum, checksum)
-                )
+        if len(self.info["files"]) > 1:
+            raise MKGeneralException("We only expect one file in the backup.")
+        filename, _, checksum = self.info["files"][0]
+        path = self.target.path / filename
+        if (this_checksum := file_checksum(str(path))) != checksum:
+            raise MKGeneralException(
+                "The backup seems to be damaged and can not be restored. "
+                "The checksum of the archive %s is wrong (got %s but "
+                "expected %s)." % (path, this_checksum, checksum)
+            )
+
+    @property
+    def path(self) -> Path:
+        filename = self.info["files"][0][0]
+        return self.target.path / self.info["backup_id"] / filename
 
 
 @dataclass
@@ -217,23 +224,7 @@ class BackupTarget:
         return job_backup_path_during_backup(self.job)
 
 
-@dataclass(frozen=True)
-class RestoreTarget:
-    target_id: TargetId
-    backup_id: str
-    config: TargetConfig
-
-    @classmethod
-    def from_config(cls, target_id: TargetId, backup_id: str, config: Config) -> "RestoreTarget":
-        target_config = get_target_config(config, target_id)
-        return cls(target_id, backup_id, target_config)
-
-    @property
-    def base_path(self) -> str:
-        return f"{target_path(self.config)}/{self.backup_id}"
-
-
-TargetOld = BackupTarget | RestoreTarget
+TargetOld = BackupTarget
 
 
 g_state: dict[str, Any] | None = None
@@ -555,7 +546,7 @@ def create_backup_info(job: Job) -> BackupInfo:
         "size": sum(f[1] for f in files),
         "site_id": current_site_id(),
         "site_version": site_version(current_site_id()),
-        "backup_id": None,
+        "backup_id": "FIXME",
     }
 
     return info
@@ -1246,8 +1237,6 @@ def add_output(s: str, state: State) -> None:
 
 
 def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: Config) -> None:
-    restore_target = RestoreTarget.from_config(TargetId(target_id), backup_id, config)
-    # only load for side effect to validate target exists for now
     target = load_target(config, TargetId(target_id))
     backup = Backup.load(target, backup_id)
     state = State(restore_state_path())
@@ -1279,7 +1268,7 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
                 },
             )
 
-            do_site_restore(backup.info, restore_target, state)
+            do_site_restore(backup, state)
             complete_restore(state)
             success = True
 
@@ -1306,32 +1295,21 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
 
 
 def do_site_restore(
-    backup_info: BackupInfo,
-    target: RestoreTarget,
+    backup: Backup,
     state: State,
 ) -> None:
     cmd = ["omd", "restore", "--kill"]
-
-    # When executed as site user, "omd restore" is executed without the site
-    # name and always performing restore for the current site. Care about
-    # restore from a backup made in a site with another site_id
-    site = backup_info.get("site_id", current_site_id())
-    if site is None:
-        raise MKGeneralException("Running outsite of site context and no site_id configured")
-
     cmd.append("-")
-
-    backup_path = site_backup_archive_path(site, target, backup_info["config"])
 
     with subprocess.Popen(cmd, close_fds=True, stderr=subprocess.PIPE, stdin=subprocess.PIPE) as p:
         assert p.stdin is not None
         assert p.stderr is not None
 
-        with open(backup_path, "rb") as backup_file:
+        with open(backup.path, "rb") as backup_file:
             s = RestoreStream(
                 stream=backup_file,
                 is_alive=lambda: False,
-                key_ident=backup_info["config"]["encrypt"],
+                key_ident=backup.info["config"]["encrypt"],
                 state=state,
             )
             try:
@@ -1351,16 +1329,17 @@ def do_site_restore(
 
 
 def complete_restore(state: State) -> None:
-    cleanup_backup_job_states()
     state_content = state.load()
     duration = time.time() - state_content["started"]
     log(
         "--- Restore completed (Duration: %s, IO: %s/s) ---"
         % (render.timespan(duration), render.fmt_bytes(state_content["bytes_per_second"]))
     )
+    cleanup_backup_job_states()
 
 
 def cleanup_backup_job_states() -> None:
+    # TODO: use state variable to clean up here
     path = "%s/var/check_mk/backup" % os.environ["OMD_ROOT"]
 
     for f in glob.glob("%s/*.state" % path):
