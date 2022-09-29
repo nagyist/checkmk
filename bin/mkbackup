@@ -294,6 +294,11 @@ class State:
     def load(self) -> dict[str, Any]:
         return _load_state(self.path)
 
+    def add_output(self, s: str) -> None:
+        content = self.load()
+        content["output"] += s
+        self.save(content, update=False)
+
 
 def backup_state_path(job: Job) -> Path:
     path = "%s/var/check_mk/backup" % os.environ["OMD_ROOT"]
@@ -339,7 +344,7 @@ class Log:
     def write(self, data: str) -> None:
         self.orig.write(data)
         try:
-            add_output(self.color_replace.sub("", data), self.state)
+            self.state.add_output(self.color_replace.sub("", data))
         except Exception as e:
             self.orig.write("Failed to add output: %s\n" % e)
 
@@ -546,21 +551,6 @@ def load_config() -> Config:
         pass
 
     return config
-
-
-# TODO: Duplicate code with htdocs/backup.py
-def load_backup_info(path: Path) -> BackupInfo:
-    with open(path) as f:
-        info: BackupInfo = json.load(f)
-
-    # Load the backup_id from the second right path component. This is the
-    # base directory of the mkbackup.info file. The user might have moved
-    # the directory, e.g. for having multiple backups. Allow that.
-    # Maybe we need to changed this later when we allow multiple generations
-    # of backups.
-    info["backup_id"] = os.path.basename(os.path.dirname(path))
-
-    return info
 
 
 def save_backup_info(backup: Backup) -> None:
@@ -1168,12 +1158,6 @@ def save_next_run(job: Job, state: State) -> None:
     state.save({"next_schedule": next_schedule})
 
 
-def add_output(s: str, state: State) -> None:
-    state_content = state.load()
-    state_content["output"] += s
-    state.save(state_content, update=False)
-
-
 def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: Config) -> None:
     target = load_target(config, TargetId(target_id))
     backup = Backup.load(target, backup_id)
@@ -1286,6 +1270,20 @@ def cleanup_backup_job_states() -> None:
             "restore-"
         ):
             os.unlink(f)
+
+
+def load_backup_info(path: Path) -> BackupInfo:
+    with open(path) as f:
+        info: BackupInfo = json.load(f)
+
+    # Load the backup_id from the second right path component. This is the
+    # base directory of the mkbackup.info file. The user might have moved
+    # the directory, e.g. for having multiple backups. Allow that.
+    # Maybe we need to changed this later when we allow multiple generations
+    # of backups.
+    info["backup_id"] = os.path.basename(os.path.dirname(path))
+
+    return info
 
 
 def mode_list(target_id: str, opts: dict[str, str], config: Config) -> None:
