@@ -170,8 +170,8 @@ def load_target(config: Config, target_id: TargetId) -> LocalTarget:
 
 @dataclass
 class Backup:
-    info: BackupInfo
-    target: LocalTarget
+    _info: BackupInfo
+    _target: LocalTarget
 
     @classmethod
     def load(cls, target: LocalTarget, backup_id: str) -> "Backup":
@@ -188,10 +188,10 @@ class Backup:
 
     def verify(self) -> None:
         log("Verifying backup consistency")
-        if len(self.info["files"]) > 1:
+        if len(self._info["files"]) > 1:
             raise MKGeneralException("We only expect one file in the backup.")
-        filename, _, checksum = self.info["files"][0]
-        path = self.target.path / filename
+        filename, _, checksum = self._info["files"][0]
+        path = self._target.path / filename
         if (this_checksum := file_checksum(str(path))) != checksum:
             raise MKGeneralException(
                 "The backup seems to be damaged and can not be restored. "
@@ -201,8 +201,12 @@ class Backup:
 
     @property
     def path(self) -> Path:
-        filename = self.info["files"][0][0]
-        return self.target.path / self.info["backup_id"] / filename
+        filename = self._info["files"][0][0]
+        return self._target.path / self._info["backup_id"] / filename
+
+    @property
+    def encrypt(self) -> str | None:
+        return self._info["config"]["encrypt"]
 
 
 @dataclass
@@ -1309,7 +1313,7 @@ def do_site_restore(
             s = RestoreStream(
                 stream=backup_file,
                 is_alive=lambda: False,
-                key_ident=backup.info["config"]["encrypt"],
+                key_ident=backup.encrypt,
                 state=state,
             )
             try:
