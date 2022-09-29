@@ -1231,16 +1231,6 @@ def save_next_run(job: Job, state: State) -> None:
     state.save({"next_schedule": next_schedule})
 
 
-def cleanup_backup_job_states() -> None:
-    path = "%s/var/check_mk/backup" % os.environ["OMD_ROOT"]
-
-    for f in glob.glob("%s/*.state" % path):
-        if os.path.basename(f) != "restore.state" and not os.path.basename(f).startswith(
-            "restore-"
-        ):
-            os.unlink(f)
-
-
 def add_output(s: str, state: State) -> None:
     state_content = state.load()
     state_content["output"] += s
@@ -1282,7 +1272,8 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
                 },
             )
 
-            do_restore(backup_info, target, state)
+            do_site_restore(backup_info, target, state)
+            complete_restore(state)
             success = True
 
         except MKGeneralException as e:
@@ -1307,20 +1298,10 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
             )
 
 
-def do_restore(
-    backup_info: BackupInfo,
-    target: RestoreTarget,
-    state: State,
-) -> None:
-    do_site_restore(backup_info, target, state)
-    complete_restore(state)
-
-
 def do_site_restore(
     backup_info: BackupInfo,
     target: RestoreTarget,
     state: State,
-    site: str | None = None,
 ) -> None:
     cmd = ["omd", "restore", "--kill"]
 
@@ -1362,17 +1343,6 @@ def do_site_restore(
         raise MKGeneralException("Failed to start the site after restore")
 
 
-def cleanup_directory_contents(base_path: str, excludes: Sequence[str] | None = None) -> None:
-    for name in os.listdir(base_path):
-        path = base_path + "/" + name
-        if not excludes or path not in excludes:
-            log("Cleaning up %s" % path)
-            if not os.path.islink(path) and os.path.isdir(path):
-                shutil.rmtree(path)
-            else:
-                os.remove(path)
-
-
 def complete_restore(state: State) -> None:
     cleanup_backup_job_states()
     state_content = state.load()
@@ -1381,6 +1351,16 @@ def complete_restore(state: State) -> None:
         "--- Restore completed (Duration: %s, IO: %s/s) ---"
         % (render.timespan(duration), render.fmt_bytes(state_content["bytes_per_second"]))
     )
+
+
+def cleanup_backup_job_states() -> None:
+    path = "%s/var/check_mk/backup" % os.environ["OMD_ROOT"]
+
+    for f in glob.glob("%s/*.state" % path):
+        if os.path.basename(f) != "restore.state" and not os.path.basename(f).startswith(
+            "restore-"
+        ):
+            os.unlink(f)
 
 
 def mode_list(target_id: str, opts: dict[str, str], config: Config) -> None:
