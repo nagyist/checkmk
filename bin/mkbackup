@@ -169,6 +169,36 @@ def load_target(config: Config, target_id: TargetId) -> LocalTarget:
 
 
 @dataclass
+class Backup:
+    info: BackupInfo
+    target: LocalTarget
+
+    @classmethod
+    def load(cls, target: LocalTarget, backup_id: str) -> "Backup":
+        backup_path = target.path / backup_id
+        if not os.path.exists(backup_path) or not os.path.exists(backup_path / "mkbackup.info"):
+            raise MKGeneralException(
+                f'This backup does not exist (Use "mkbackup list {target.id}" to '
+                "show a list of available backups)."
+            )
+        with open(backup_path / "mkbackup.info") as f:
+            info: BackupInfo = json.load(f)
+        info["backup_id"] = backup_id
+        return cls(info, target)
+
+    def verify(self) -> None:
+        log("Verifying backup consistency")
+        for filename, _, checksum in self.info["files"]:
+            path = self.target.path / filename
+            if (this_checksum := file_checksum(str(path))) != checksum:
+                raise MKGeneralException(
+                    "The backup seems to be damaged and can not be restored. "
+                    "The checksum of the archive %s is wrong (got %s but "
+                    "expected %s)." % (path, this_checksum, checksum)
+                )
+
+
+@dataclass
 class Job:
     config: JobConfig
     local_id: str
@@ -179,6 +209,8 @@ class Job:
 @dataclass(frozen=True)
 class BackupTarget:
     job: Job
+    config: TargetConfigDetails
+    id: TargetId
 
     @property
     def base_path(self) -> str:
@@ -487,7 +519,7 @@ def load_config() -> Config:
 
 
 # TODO: Duplicate code with htdocs/backup.py
-def load_backup_info(path: str) -> BackupInfo:
+def load_backup_info(path: Path) -> BackupInfo:
     with open(path) as f:
         info: BackupInfo = json.load(f)
 
@@ -665,8 +697,10 @@ modes = {
 
 def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None:
     job = load_job(local_job_id, config)
-    backup_target = BackupTarget(job)
     target = load_target(config, job.config["target"])
+    backup_target = BackupTarget(
+        job, config["targets"][job.config["target"]]["remote"][1], id=job.config["target"]
+    )
     state = State(backup_state_path(job))
 
     with ExitStack() as stack:
@@ -1092,62 +1126,11 @@ def archive_suffix(config: JobConfig) -> str:
     return suffix
 
 
-def needed_backup_archive_files(info: BackupInfo) -> Sequence[str]:
-    # Care about restore from a backup made in a site with another site_id
-    site = info.get("site_id", current_site_id())
-    needed_files = ["site-%s" % site]
-    return [f + archive_suffix(info["config"]) for f in needed_files]
-
-
 def target_path(cfg: TargetConfig) -> str:
     if cfg["remote"][0] != "local":
         raise NotImplementedError()
 
     return cfg["remote"][1]["path"]
-
-
-def verify_backup_exists(target: RestoreTarget) -> None:
-    if not os.path.exists(target.base_path) or not os.path.exists(backup_info_path(target)):
-        raise MKGeneralException(
-            f'This backup does not exist (Use "mkbackup list {target.target_id}" to '
-            "show a list of available backups)."
-        )
-
-
-def verify_backup_consistency(backup_info: BackupInfo, target: TargetOld) -> None:
-    log("Verifying backup consistency")
-    needed_files = needed_backup_archive_files(backup_info)
-    optional_files = [entry[0] for entry in backup_info["files"] if entry[0] not in needed_files]
-
-    verify_backup_files(backup_info, needed_files, needed=True, target=target)
-    verify_backup_files(backup_info, optional_files, needed=False, target=target)
-
-
-def verify_backup_files(
-    info: BackupInfo, files: Sequence[str], needed: bool, target: TargetOld
-) -> None:
-    for archive_file in files:
-        size, checksum = None, None
-        for entry in info["files"]:
-            if entry[0] == archive_file:
-                size, checksum = entry[1:]
-                break
-
-        if size is None:
-            if needed:
-                raise MKGeneralException(
-                    "The backup is missing the needed archive %s." % archive_file
-                )
-            continue  # missing optional files are OK
-
-        archive_path = f"{target.base_path}/{archive_file}"
-        this_checksum = file_checksum(archive_path)
-        if this_checksum != checksum:
-            raise MKGeneralException(
-                "The backup seems to be damaged and can not be restored. "
-                "The checksum of the archive %s is wrong (got %s but "
-                "expected %s)." % (archive_path, this_checksum, checksum)
-            )
 
 
 def complete_backup(job: Job, target: BackupTarget, state: State) -> None:
@@ -1159,8 +1142,10 @@ def complete_backup(job: Job, target: BackupTarget, state: State) -> None:
             "size": info["size"],
         },
     )
-
-    verify_backup_consistency(info, target=target)
+    local_target = LocalTarget(target.config, target.id)
+    backup_id = f"{job.id}-incomplete"
+    backup = Backup.load(local_target, backup_id)
+    backup.verify()
 
     # Now we can be sure this new backup is a good one. Remove eventual old
     # backup and move from "incomplete" to "complete".
@@ -1263,8 +1248,8 @@ def add_output(s: str, state: State) -> None:
 def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: Config) -> None:
     restore_target = RestoreTarget.from_config(TargetId(target_id), backup_id, config)
     # only load for side effect to validate target exists for now
-    load_target(config, TargetId(target_id))
-    backup_info = load_backup_info(backup_info_path(restore_target))
+    target = load_target(config, TargetId(target_id))
+    backup = Backup.load(target, backup_id)
     state = State(restore_state_path())
 
     with ExitStack() as stack:
@@ -1273,10 +1258,8 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
         ]:
             stack.enter_context(cm)
 
-        verify_backup_exists(restore_target)
-
         if "no-verify" not in opts:
-            verify_backup_consistency(backup_info, restore_target)
+            backup.verify()
 
         init_new_run(state)
 
@@ -1296,7 +1279,7 @@ def mode_restore(target_id: str, backup_id: str, opts: dict[str, str], config: C
                 },
             )
 
-            do_site_restore(backup_info, restore_target, state)
+            do_site_restore(backup.info, restore_target, state)
             complete_restore(state)
             success = True
 
@@ -1395,7 +1378,7 @@ def mode_list(target_id: str, opts: dict[str, str], config: Config) -> None:
     sys.stdout.write(fmt % ("Type", "Job", "Details", ""))
     sys.stdout.write("%s\n" % ("-" * 100))
     for path in sorted(glob.glob(f"{target.path}/*/mkbackup.info")):
-        info = load_backup_info(path)
+        info = load_backup_info(Path(path))
         from_info = info["hostname"]
         if "site_id" in info:
             from_info += " (Site: %s)" % info["site_id"]
