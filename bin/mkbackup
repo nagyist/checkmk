@@ -237,7 +237,7 @@ class Job:
 
     @property
     def no_history(self) -> bool:
-        return self.config["no_history"]
+        return self.config.get("no_history", False)
 
     @property
     def backup_path(self) -> Path:
@@ -523,13 +523,6 @@ def makedir(
     set_permissions(path=path, uid=uid, gid=gid, mode=mode)
 
 
-# Wenn als root ausgeführt:
-# - System-Konfiguration laden
-# Wenn als Site-User ausgeführt:
-# - TargetIds aus System-Konfiguration laden
-# - Site-Konfiguration laden
-
-
 def load_config() -> Config:
     def load_file(path: str) -> Any:
         with Path(path).open("r", encoding="utf-8") as f:
@@ -539,12 +532,10 @@ def load_config() -> Config:
 
     try:
         system_targets = load_file(system_config_path())["targets"]
-
         # only load non conflicting targets
         for target_ident, target_config in system_targets.items():
             if target_ident not in config["targets"]:
                 config["targets"][target_ident] = target_config
-
     except OSError:
         # Not existing system wide config is OK. In this case there
         # are only backup targets from site config available.
