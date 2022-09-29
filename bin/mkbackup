@@ -248,8 +248,17 @@ class Job:
         return f"{self.id}-incomplete"
 
     @property
+    def archive_suffix(self) -> str:
+        suffix = ".tar"
+        if self.compress:
+            suffix += ".gz"
+        if self.encrypt:
+            suffix += ".enc"
+        return suffix
+
+    @property
     def backup_file(self) -> Path:
-        return self.backup_path / f"site-{current_site_id()}{archive_suffix(self.config)}"
+        return self.backup_path / f"site-{current_site_id()}{self.archive_suffix}"
 
     def finalize_backup(self) -> Backup:
         info = create_backup_info(self)
@@ -1057,15 +1066,6 @@ class RestoreStream(MKBackupStream):
             )
         cipher_rsa = PKCS1_OAEP.new(private_key)
         return cipher_rsa.decrypt(encrypted_secret_key)
-
-
-def archive_suffix(config: JobConfig) -> str:
-    suffix = ".tar"
-    if config["compress"]:
-        suffix += ".gz"
-    if config["encrypt"]:
-        suffix += ".enc"
-    return suffix
 
 
 def complete_backup(job: Job, state: State) -> None:
