@@ -123,10 +123,6 @@ class BackupTarget:
     def base_path(self) -> str:
         return job_backup_path_during_backup(self.job)
 
-    @property
-    def target_id(self) -> str:
-        return self.job.config["target"]
-
 
 @dataclass(frozen=True)
 class RestoreTarget:
