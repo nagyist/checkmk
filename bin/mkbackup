@@ -192,7 +192,7 @@ class Backup:
         if len(self._info["files"]) > 1:
             raise MKGeneralException("We only expect one file in the backup.")
         filename, _, checksum = self._info["files"][0]
-        path = self._target.path / filename
+        path = self.backup_path / filename
         if (this_checksum := file_checksum(path)) != checksum:
             raise MKGeneralException(
                 "The backup seems to be damaged and can not be restored. "
@@ -1030,7 +1030,7 @@ def do_site_backup(
 
     cmd.append("-")
     # Create missing directories. Ensure group permissions and mode.
-    makedirs(os.path.dirname(job.backup_path), group="omd", mode=0o775)
+    makedirs(str(job.backup_path), group="omd", mode=0o775)
     verbose("Command: %s" % " ".join(cmd))
     with subprocess.Popen(
         cmd,
