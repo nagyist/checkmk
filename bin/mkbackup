@@ -605,191 +605,6 @@ def file_checksum(path: Path) -> str:
     return hash_md5.hexdigest()
 
 
-class Arg(NamedTuple):
-    id: str
-    description: str
-
-
-class Opt(NamedTuple):
-    description: str
-
-
-class Mode(NamedTuple):
-    description: str
-    args: list[Arg]
-    opts: dict[str, Opt]
-    runner: Callable[[Sequence[str], dict[str, str], Config], None]
-
-
-modes = {
-    "backup": Mode(
-        description=(
-            "Starts creating a new backup. When executed as Check_MK site user, a backup of the "
-            "current site is executed to the target of the given backup job. When executed as "
-            "root user on the Check_MK Appliance, a backup of the whole system is created."
-        ),
-        args=[
-            Arg(
-                id="Job-ID",
-                description="The ID of the backup job to work with",
-            ),
-        ],
-        opts={
-            "background": Opt(description="Fork and execute the program in the background."),
-        },
-        runner=lambda args, opts, config: mode_backup(args[0], opts=opts, config=config),
-    ),
-    "restore": Mode(
-        description=(
-            "Starts the restore of a backup. In case you want to restore an encrypted backup, "
-            "you have to provide the passphrase of the used backup key via the environment "
-            "variable 'MKBACKUP_PASSPHRASE'. For example: MKBACKUP_PASSPHRASE='secret' mkbackup "
-            "restore ARGS."
-        ),
-        args=[
-            Arg(
-                id="Target-ID",
-                description="The ID of the backup target to work with",
-            ),
-            Arg(
-                id="Backup-ID",
-                description="The ID of the backup to restore",
-            ),
-        ],
-        opts={
-            "background": Opt(description="Fork and execute the program in the background."),
-            "no-verify": Opt(
-                description="Disable verification of the backup files to restore from."
-            ),
-            "no-reboot": Opt(description="Don't trigger a system reboot after succeeded restore."),
-        },
-        runner=lambda args, opts, config: mode_restore(args[0], args[1], opts=opts, config=config),
-    ),
-    "jobs": Mode(
-        description="Lists all configured backup jobs of the current user context.",
-        args=[],
-        opts={},
-        runner=lambda args, opts, config: mode_jobs(opts=opts, config=config),
-    ),
-    "targets": Mode(
-        description="Lists all configured backup targets of the current user context.",
-        args=[],
-        opts={},
-        runner=lambda args, opts, config: mode_targets(opts=opts, config=config),
-    ),
-    "list": Mode(
-        description="Output the list of all backups found on the given backup target",
-        args=[
-            Arg(
-                id="Target-ID",
-                description="The ID of the backup target to work with",
-            ),
-        ],
-        opts={},
-        runner=lambda args, opts, config: mode_list(args[0], opts=opts, config=config),
-    ),
-}
-
-
-def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None:
-    job = load_job(local_job_id, config)
-    target = load_target(config, job.config["target"])
-    state = State(backup_state_path(job))
-
-    with ExitStack() as stack:
-        for cm in [
-            acquire_single_lock(lock_file_path) for lock_file_path in get_needed_lock_files()
-        ]:
-            stack.enter_context(cm)
-
-        init_new_run(state)
-        save_next_run(job, state)
-
-        if "background" in opts:
-            daemon.daemonize()
-            state.save({"pid": os.getpid()})
-
-        start_logging(state)
-        log(f"--- Starting backup ({job.id} to {target.id}) ---")
-
-        success = False
-        try:
-            cleanup_previous_incomplete_backup(job)
-
-            state.save(
-                {
-                    "state": "running",
-                },
-            )
-
-            do_site_backup(job, state)
-            complete_backup(job, state)
-            success = True
-
-        except MKGeneralException as e:
-            sys.stderr.write("%s\n" % e)
-            if opt_debug:
-                raise
-
-        except Exception:
-            if opt_debug:
-                raise
-            sys.stderr.write("An exception occured:\n")
-            sys.stderr.write(traceback.format_exc())
-
-        finally:
-            stop_logging()
-            state.save(
-                {
-                    "state": "finished",
-                    "finished": time.time(),
-                    "success": success,
-                },
-            )
-
-
-def do_site_backup(
-    job: Job,
-    state: State,
-) -> None:  # pylint: disable=too-many-branches
-    cmd = ["omd", "backup"]
-
-    if not job.compress:
-        cmd.append("--no-compression")
-
-    if job.no_history:
-        cmd.append("--no-past")
-
-    cmd.append("-")
-    # Create missing directories. Ensure group permissions and mode.
-    makedirs(os.path.dirname(job.backup_path), group="omd", mode=0o775)
-    verbose("Command: %s" % " ".join(cmd))
-    with subprocess.Popen(
-        cmd,
-        close_fds=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
-    ) as p:
-        assert p.stdout is not None
-        assert p.stderr is not None
-
-        with open(job.backup_file, "wb") as backup_file:
-            s = BackupStream(
-                stream=p.stdout,
-                is_alive=lambda: p.poll() is None,
-                key_ident=job.encrypt,
-                state=state,
-            )
-            for chunk in s.process():
-                backup_file.write(chunk)
-
-        err = p.stderr.read().decode()
-
-    if p.returncode != 0:
-        raise MKGeneralException("Site backup failed: %s" % err)
-
-
 # Using RSA directly to encrypt the whole backup is a bad idea. So we use the RSA
 # public key to generate and encrypt a shared secret which is then used to encrypt
 # the backup with AES.
@@ -1066,6 +881,191 @@ class RestoreStream(MKBackupStream):
             )
         cipher_rsa = PKCS1_OAEP.new(private_key)
         return cipher_rsa.decrypt(encrypted_secret_key)
+
+
+class Arg(NamedTuple):
+    id: str
+    description: str
+
+
+class Opt(NamedTuple):
+    description: str
+
+
+class Mode(NamedTuple):
+    description: str
+    args: list[Arg]
+    opts: dict[str, Opt]
+    runner: Callable[[Sequence[str], dict[str, str], Config], None]
+
+
+modes = {
+    "backup": Mode(
+        description=(
+            "Starts creating a new backup. When executed as Check_MK site user, a backup of the "
+            "current site is executed to the target of the given backup job. When executed as "
+            "root user on the Check_MK Appliance, a backup of the whole system is created."
+        ),
+        args=[
+            Arg(
+                id="Job-ID",
+                description="The ID of the backup job to work with",
+            ),
+        ],
+        opts={
+            "background": Opt(description="Fork and execute the program in the background."),
+        },
+        runner=lambda args, opts, config: mode_backup(args[0], opts=opts, config=config),
+    ),
+    "restore": Mode(
+        description=(
+            "Starts the restore of a backup. In case you want to restore an encrypted backup, "
+            "you have to provide the passphrase of the used backup key via the environment "
+            "variable 'MKBACKUP_PASSPHRASE'. For example: MKBACKUP_PASSPHRASE='secret' mkbackup "
+            "restore ARGS."
+        ),
+        args=[
+            Arg(
+                id="Target-ID",
+                description="The ID of the backup target to work with",
+            ),
+            Arg(
+                id="Backup-ID",
+                description="The ID of the backup to restore",
+            ),
+        ],
+        opts={
+            "background": Opt(description="Fork and execute the program in the background."),
+            "no-verify": Opt(
+                description="Disable verification of the backup files to restore from."
+            ),
+            "no-reboot": Opt(description="Don't trigger a system reboot after succeeded restore."),
+        },
+        runner=lambda args, opts, config: mode_restore(args[0], args[1], opts=opts, config=config),
+    ),
+    "jobs": Mode(
+        description="Lists all configured backup jobs of the current user context.",
+        args=[],
+        opts={},
+        runner=lambda args, opts, config: mode_jobs(opts=opts, config=config),
+    ),
+    "targets": Mode(
+        description="Lists all configured backup targets of the current user context.",
+        args=[],
+        opts={},
+        runner=lambda args, opts, config: mode_targets(opts=opts, config=config),
+    ),
+    "list": Mode(
+        description="Output the list of all backups found on the given backup target",
+        args=[
+            Arg(
+                id="Target-ID",
+                description="The ID of the backup target to work with",
+            ),
+        ],
+        opts={},
+        runner=lambda args, opts, config: mode_list(args[0], opts=opts, config=config),
+    ),
+}
+
+
+def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None:
+    job = load_job(local_job_id, config)
+    target = load_target(config, job.config["target"])
+    state = State(backup_state_path(job))
+
+    with ExitStack() as stack:
+        for cm in [
+            acquire_single_lock(lock_file_path) for lock_file_path in get_needed_lock_files()
+        ]:
+            stack.enter_context(cm)
+
+        init_new_run(state)
+        save_next_run(job, state)
+
+        if "background" in opts:
+            daemon.daemonize()
+            state.save({"pid": os.getpid()})
+
+        start_logging(state)
+        log(f"--- Starting backup ({job.id} to {target.id}) ---")
+
+        success = False
+        try:
+            cleanup_previous_incomplete_backup(job)
+
+            state.save(
+                {
+                    "state": "running",
+                },
+            )
+
+            do_site_backup(job, state)
+            complete_backup(job, state)
+            success = True
+
+        except MKGeneralException as e:
+            sys.stderr.write("%s\n" % e)
+            if opt_debug:
+                raise
+
+        except Exception:
+            if opt_debug:
+                raise
+            sys.stderr.write("An exception occured:\n")
+            sys.stderr.write(traceback.format_exc())
+
+        finally:
+            stop_logging()
+            state.save(
+                {
+                    "state": "finished",
+                    "finished": time.time(),
+                    "success": success,
+                },
+            )
+
+
+def do_site_backup(
+    job: Job,
+    state: State,
+) -> None:  # pylint: disable=too-many-branches
+    cmd = ["omd", "backup"]
+
+    if not job.compress:
+        cmd.append("--no-compression")
+
+    if job.no_history:
+        cmd.append("--no-past")
+
+    cmd.append("-")
+    # Create missing directories. Ensure group permissions and mode.
+    makedirs(os.path.dirname(job.backup_path), group="omd", mode=0o775)
+    verbose("Command: %s" % " ".join(cmd))
+    with subprocess.Popen(
+        cmd,
+        close_fds=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+    ) as p:
+        assert p.stdout is not None
+        assert p.stderr is not None
+
+        with open(job.backup_file, "wb") as backup_file:
+            s = BackupStream(
+                stream=p.stdout,
+                is_alive=lambda: p.poll() is None,
+                key_ident=job.encrypt,
+                state=state,
+            )
+            for chunk in s.process():
+                backup_file.write(chunk)
+
+        err = p.stderr.read().decode()
+
+    if p.returncode != 0:
+        raise MKGeneralException("Site backup failed: %s" % err)
 
 
 def complete_backup(job: Job, state: State) -> None:
