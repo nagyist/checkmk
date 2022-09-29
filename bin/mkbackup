@@ -172,6 +172,7 @@ def load_target(config: Config, target_id: TargetId) -> LocalTarget:
 class Backup:
     _info: BackupInfo
     _target: LocalTarget
+    backup_id: str
 
     @classmethod
     def load(cls, target: LocalTarget, backup_id: str) -> "Backup":
@@ -184,7 +185,7 @@ class Backup:
         with open(backup_path / "mkbackup.info") as f:
             info: BackupInfo = json.load(f)
         info["backup_id"] = backup_id
-        return cls(info, target)
+        return cls(info, target, backup_id)
 
     def verify(self) -> None:
         log("Verifying backup consistency")
@@ -192,17 +193,26 @@ class Backup:
             raise MKGeneralException("We only expect one file in the backup.")
         filename, _, checksum = self._info["files"][0]
         path = self._target.path / filename
-        if (this_checksum := file_checksum(str(path))) != checksum:
+        if (this_checksum := file_checksum(path)) != checksum:
             raise MKGeneralException(
                 "The backup seems to be damaged and can not be restored. "
                 "The checksum of the archive %s is wrong (got %s but "
                 "expected %s)." % (path, this_checksum, checksum)
             )
 
+    # TODO rename to backup_file
     @property
     def path(self) -> Path:
         filename = self._info["files"][0][0]
-        return self._target.path / self._info["backup_id"] / filename
+        return self.backup_path / filename
+
+    @property
+    def backup_path(self) -> Path:
+        return self._target.path / self.backup_id
+
+    @property
+    def backup_info_path(self) -> Path:
+        return self.backup_path / "mkbackup.info"
 
     @property
     def encrypt(self) -> str | None:
@@ -214,21 +224,37 @@ class Job:
     config: JobConfig
     local_id: str
     id: str
-    target: TargetConfig
-
-
-@dataclass(frozen=True)
-class BackupTarget:
-    job: Job
-    config: TargetConfigDetails
-    id: TargetId
+    _target: TargetConfig
+    target: LocalTarget
 
     @property
-    def base_path(self) -> str:
-        return job_backup_path_during_backup(self.job)
+    def compress(self) -> bool:
+        return self.config["compress"]
 
+    @property
+    def encrypt(self) -> str | None:
+        return self.config["encrypt"]
 
-TargetOld = BackupTarget
+    @property
+    def no_history(self) -> bool:
+        return self.config["no_history"]
+
+    @property
+    def backup_path(self) -> Path:
+        return self.target.path / self.backup_id
+
+    @property
+    def backup_id(self) -> str:
+        return f"{self.id}-incomplete"
+
+    @property
+    def backup_file(self) -> Path:
+        return self.backup_path / f"site-{current_site_id()}{archive_suffix(self.config)}"
+
+    def finalize_backup(self) -> Backup:
+        info = create_backup_info(self)
+        # FIXME can this already store info object?
+        return Backup(info, self.target, backup_id=self.backup_id)
 
 
 g_state: dict[str, Any] | None = None
@@ -528,9 +554,9 @@ def load_backup_info(path: Path) -> BackupInfo:
     return info
 
 
-def save_backup_info(info: BackupInfo, target: BackupTarget) -> None:
-    with open(backup_info_path(target), "w") as f:
-        json.dump(info, f, sort_keys=True, indent=4, separators=(",", ": "))
+def save_backup_info(backup: Backup) -> None:
+    with open(backup.backup_info_path, "w") as f:
+        json.dump(backup._info, f, sort_keys=True, indent=4, separators=(",", ": "))
 
 
 def create_backup_info(job: Job) -> BackupInfo:
@@ -553,17 +579,16 @@ def create_backup_info(job: Job) -> BackupInfo:
 
 
 def get_files_for_backup_info(job: Job) -> Sequence[tuple[str, int, str]]:
-    backup_path = job_backup_path_during_backup(job)
+    backup_path = job.backup_path
     dir_entries: list[str] = os.listdir(backup_path)
     files = []
     for f in sorted(dir_entries):
-        files.append(
-            (f, os.path.getsize(backup_path + "/" + f), file_checksum(backup_path + "/" + f))
-        )
+        filepath = backup_path / f
+        files.append((f, os.path.getsize(filepath), file_checksum(filepath)))
     return files
 
 
-def file_checksum(path: str) -> str:
+def file_checksum(path: Path) -> str:
     hash_md5 = md5(usedforsecurity=False)  # pylint: disable=unexpected-keyword-arg
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(4096), b""):
@@ -660,9 +685,6 @@ modes = {
 def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None:
     job = load_job(local_job_id, config)
     target = load_target(config, job.config["target"])
-    backup_target = BackupTarget(
-        job, config["targets"][job.config["target"]]["remote"][1], id=job.config["target"]
-    )
     state = State(backup_state_path(job))
 
     with ExitStack() as stack:
@@ -691,7 +713,8 @@ def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None
                 },
             )
 
-            do_backup(job, backup_target, state)
+            do_site_backup(job, state)
+            complete_backup(job, state)
             success = True
 
         except MKGeneralException as e:
@@ -716,42 +739,21 @@ def mode_backup(local_job_id: str, opts: dict[str, str], config: Config) -> None
             )
 
 
-def do_backup(
-    job: Job,
-    target: BackupTarget,
-    state: State,
-) -> None:
-    do_site_backup(job.config, target, state)
-    complete_backup(job, target, state)
-
-
 def do_site_backup(
-    job_config: JobConfig,
-    target: BackupTarget,
+    job: Job,
     state: State,
-    try_stop: bool = True,
 ) -> None:  # pylint: disable=too-many-branches
     cmd = ["omd", "backup"]
 
-    if not job_config["compress"]:
+    if not job.compress:
         cmd.append("--no-compression")
 
-    if job_config.get("no_history", False):
+    if job.no_history:
         cmd.append("--no-past")
 
-    # When executed as site user, "omd backup" is executed without the site
-    # name and always performing backup for the current site.
-    site = current_site_id()
-    if site is None:
-        raise MKGeneralException("Running outsite of site context")
-
     cmd.append("-")
-
-    backup_path = site_backup_archive_path(site, target, job_config)
-
     # Create missing directories. Ensure group permissions and mode.
-    makedirs(os.path.dirname(backup_path), group="omd", mode=0o775)
-
+    makedirs(os.path.dirname(job.backup_path), group="omd", mode=0o775)
     verbose("Command: %s" % " ".join(cmd))
     with subprocess.Popen(
         cmd,
@@ -763,11 +765,11 @@ def do_site_backup(
         assert p.stdout is not None
         assert p.stderr is not None
 
-        with open(backup_path, "wb") as backup_file:
+        with open(job.backup_file, "wb") as backup_file:
             s = BackupStream(
                 stream=p.stdout,
                 is_alive=lambda: p.poll() is None,
-                key_ident=job_config["encrypt"],
+                key_ident=job.encrypt,
                 state=state,
             )
             for chunk in s.process():
@@ -1057,28 +1059,6 @@ class RestoreStream(MKBackupStream):
         return cipher_rsa.decrypt(encrypted_secret_key)
 
 
-# Returns the base path for the backup to work with. In backup mode, this is
-# the directory of the target+job. In restore mode it is the target+backup path.
-def backup_info_path(target: TargetOld) -> str:
-    return f"{target.base_path}/mkbackup.info"
-
-
-def site_backup_archive_path(site_id: str, target: TargetOld, job_config: JobConfig) -> str:
-    return f"{target.base_path}/site-{site_id}{archive_suffix(job_config)}"
-
-
-def job_backup_path_during_backup(job: Job) -> str:
-    return "%s-incomplete" % job_backup_path(job)
-
-
-def job_backup_path_complete(job: Job) -> str:
-    return "%s-complete" % job_backup_path(job)
-
-
-def job_backup_path(job: Job) -> str:
-    return "{}/{}".format(target_path(job.target), job.id)
-
-
 def archive_suffix(config: JobConfig) -> str:
     suffix = ".tar"
     if config["compress"]:
@@ -1088,57 +1068,42 @@ def archive_suffix(config: JobConfig) -> str:
     return suffix
 
 
-def target_path(cfg: TargetConfig) -> str:
-    if cfg["remote"][0] != "local":
-        raise NotImplementedError()
-
-    return cfg["remote"][1]["path"]
-
-
-def complete_backup(job: Job, target: BackupTarget, state: State) -> None:
-    info = create_backup_info(job)
-    save_backup_info(info, target)
-
+def complete_backup(job: Job, state: State) -> None:
+    backup = job.finalize_backup()
     state.save(
         {
-            "size": info["size"],
+            "size": backup._info["size"],
         },
     )
-    local_target = LocalTarget(target.config, target.id)
-    backup_id = f"{job.id}-incomplete"
-    backup = Backup.load(local_target, backup_id)
+    save_backup_info(backup)
     backup.verify()
-
-    # Now we can be sure this new backup is a good one. Remove eventual old
-    # backup and move from "incomplete" to "complete".
-
-    if os.path.exists(job_backup_path_complete(job)):
-        log("Cleaning up previously completed backup")
-        shutil.rmtree(job_backup_path_complete(job))
-
-    os.rename(
-        job_backup_path_during_backup(job),
-        job_backup_path_complete(job),
-    )
-
+    backup = move_backup(backup, f"{job.id}-complete")
     state_content = state.load()
     duration = time.time() - state_content["started"]
-
     log(
         "--- Backup completed (Duration: %s, Size: %s, IO: %s/s) ---"
         % (
             render.timespan(duration),
-            render.fmt_bytes(info["size"]),
+            render.fmt_bytes(state_content["size"]),
             render.fmt_bytes(state_content["bytes_per_second"]),
         )
     )
 
 
+def move_backup(backup: Backup, new_backup_id: str) -> Backup:
+    source = backup.backup_path
+    abs_destination = backup._target.path / new_backup_id
+    if os.path.exists(abs_destination):
+        shutil.rmtree(abs_destination)
+    os.rename(source, abs_destination)
+    return backup.load(backup._target, new_backup_id)
+
+
 def cleanup_previous_incomplete_backup(job: Job) -> None:
-    if os.path.exists(job_backup_path_during_backup(job)):
+    if os.path.exists(job.backup_path):
         log("Found previous incomplete backup. Cleaning up those files.")
         try:
-            shutil.rmtree(job_backup_path_during_backup(job))
+            shutil.rmtree(job.backup_path)
         except OSError as e:
             if e.errno == errno.EACCES:
                 raise MKGeneralException("Failed to write the backup directory: %s" % e)
@@ -1151,11 +1116,13 @@ def load_job(local_job_id: str, config: Config) -> Job:
     if local_job_id not in config["jobs"]:
         raise MKGeneralException("This backup job does not exist.")
     job_config: JobConfig = config["jobs"][local_job_id]
+    target = load_target(config, job_config["target"])
     job = Job(
         config=job_config,
         local_id=local_job_id,
         id=g_job_id,
-        target=get_target_config(config, job_config["target"]),
+        _target=get_target_config(config, job_config["target"]),
+        target=target,
     )
     return job
 
@@ -1310,6 +1277,7 @@ def complete_restore(state: State) -> None:
 
 
 def cleanup_backup_job_states() -> None:
+    # clean up states files restored from the backup.
     # TODO: use state variable to clean up here
     path = "%s/var/check_mk/backup" % os.environ["OMD_ROOT"]
 
