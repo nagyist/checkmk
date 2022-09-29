@@ -528,10 +528,6 @@ def load_backup_info(path: Path) -> BackupInfo:
     return info
 
 
-def get_site_ids_of_backup(info: BackupInfo) -> list[str]:
-    return [f[0].split(".", 1)[0][5:] for f in info["files"] if f[0].startswith("site-")]
-
-
 def save_backup_info(info: BackupInfo, target: BackupTarget) -> None:
     with open(backup_info_path(target), "w") as f:
         json.dump(info, f, sort_keys=True, indent=4, separators=(",", ": "))
@@ -573,35 +569,6 @@ def file_checksum(path: str) -> str:
         for chunk in iter(lambda: f.read(4096), b""):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
-
-
-#   List: Alle Backups auflisten
-#       Als Site-Nutzer sieht man nur die Site-Backups (auch die, die
-#       durch die Systembackups erstellt wurden)
-#   - Job-ID
-#
-#   Beispielbefehle:
-#     # listet alle Backups auf die man sehen darf
-#     mkbackup list nfs
-#
-#     # listet alle Backups auf die man sehen darf die zu diesem Job gehören
-#     mkbackup list nfs --job=xxx
-#
-#   Restore:
-#   - Job-ID
-#   - Backup-ID
-#     - Als Site-Nutzer muss man die Backup-ID eines Site-Backups angeben
-#
-#   Beispielbefehle:
-#     # listet alle Backups auf die man sehen darf
-#     mkbackup restore nfs backup-id-20
-#
-#   Show: Zeigt Metainfos zu einem Backup an
-#   - Job-ID
-#   - Backup-ID
-#
-#   Beispielbefehle:
-#     mkbackup show nfs backup-id-20
 
 
 class Arg(NamedTuple):
