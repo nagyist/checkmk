@@ -1,0 +1,3 @@
+pkgs_by_bzl/patch/bin/patch
+pkgs_by_bzl/patch/share/man/man1/patch.1
+pkgs_by_bzl/patch/patch
