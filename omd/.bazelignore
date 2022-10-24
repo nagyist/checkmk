@@ -1,3 +1,10 @@
-pkgs_by_bzl/patch/bin/patch
-pkgs_by_bzl/patch/share/man/man1/patch.1
-pkgs_by_bzl/patch/patch
+build/by_bazel/redis/bin/redis-benchmark
+build/by_bazel/redis/bin/redis-check-aof
+build/by_bazel/redis/bin/redis-check-rdb
+build/by_bazel/redis/bin/redis-cli
+build/by_bazel/redis/bin/redis-sentinel
+build/by_bazel/redis/bin/redis-server
+build/by_bazel/patch/bin/patch
+build/by_bazel/patch/share/man/man1/patch.1
+build/by_bazel/patch/patch
+

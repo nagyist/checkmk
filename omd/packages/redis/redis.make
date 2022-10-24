@@ -1,39 +1,19 @@
 REDIS := redis
 REDIS_VERS := 6.2.6
 REDIS_DIR := $(REDIS)-$(REDIS_VERS)
-# Increase this to enforce a recreation of the build cache
-REDIS_BUILD_ID := 1
 
-REDIS_UNPACK := $(BUILD_HELPER_DIR)/$(REDIS_DIR)-unpack
 REDIS_BUILD := $(BUILD_HELPER_DIR)/$(REDIS_DIR)-build
-REDIS_INTERMEDIATE_INSTALL := $(BUILD_HELPER_DIR)/$(REDIS_DIR)-install-intermediate
-REDIS_CACHE_PKG_PROCESS := $(BUILD_HELPER_DIR)/$(REDIS_DIR)-cache-pkg-process
 REDIS_INSTALL := $(BUILD_HELPER_DIR)/$(REDIS_DIR)-install
 
-REDIS_INSTALL_DIR := $(INTERMEDIATE_INSTALL_BASE)/$(REDIS_DIR)
-REDIS_BUILD_DIR := $(PACKAGE_BUILD_DIR)/$(REDIS_DIR)
-#REDIS_WORK_DIR := $(PACKAGE_WORK_DIR)/$(REDIS_DIR)
-
-$(REDIS_BUILD): $(REDIS_UNPACK)
-	$(MAKE) -C $(REDIS_BUILD_DIR)
+$(REDIS_BUILD):
+	bazel build @redis//:build
 	$(TOUCH) $@
 
-REDIS_CACHE_PKG_PATH := $(call cache_pkg_path,$(REDIS_DIR),$(REDIS_BUILD_ID))
-
-$(REDIS_CACHE_PKG_PATH):
-	$(call pack_pkg_archive,$@,$(REDIS_DIR),$(REDIS_BUILD_ID),$(REDIS_INTERMEDIATE_INSTALL))
-
-$(REDIS_CACHE_PKG_PROCESS): $(REDIS_CACHE_PKG_PATH)
-	$(call unpack_pkg_archive,$(REDIS_CACHE_PKG_PATH),$(REDIS_DIR))
-	$(call upload_pkg_archive,$(REDIS_CACHE_PKG_PATH),$(REDIS_DIR),$(REDIS_BUILD_ID))
-	$(TOUCH) $@
-
-$(REDIS_INTERMEDIATE_INSTALL): $(REDIS_BUILD)
-	$(MAKE) -C $(REDIS_BUILD_DIR) PREFIX=$(REDIS_INSTALL_DIR) install
-	$(MKDIR) $(REDIS_INSTALL_DIR)/skel/var/redis
+$(REDIS_INSTALL): $(REDIS_BUILD)
+	bazel run @redis//:deploy
+	$(RSYNC) --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r build/by_bazel/redis/ $(DESTDIR)$(OMD_ROOT)/
 	$(TOUCH) $@
 
 
-$(REDIS_INSTALL): $(REDIS_CACHE_PKG_PROCESS)
-	$(RSYNC) $(REDIS_INSTALL_DIR)/ $(DESTDIR)$(OMD_ROOT)/
-	$(TOUCH) $@
+# Is the following line needed? What does it do? Do we need the intermediate install?
+#	$(MKDIR) $(REDIS_INSTALL_DIR)/skel/var/redis
