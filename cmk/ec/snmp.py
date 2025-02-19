@@ -4,26 +4,27 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 import traceback
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from logging import Logger
 from pathlib import Path
 from typing import Any
 
 import pyasn1.error
-import pysnmp.debug  # type: ignore[import]
-import pysnmp.entity.config  # type: ignore[import]
-import pysnmp.entity.engine  # type: ignore[import]
-import pysnmp.entity.rfc3413.ntfrcv  # type: ignore[import]
-import pysnmp.proto.api  # type: ignore[import]
-import pysnmp.proto.errind  # type: ignore[import]
-import pysnmp.proto.rfc1155  # type: ignore[import]
-import pysnmp.proto.rfc1902  # type: ignore[import]
-import pysnmp.smi.builder  # type: ignore[import]
-import pysnmp.smi.error  # type: ignore[import]
-import pysnmp.smi.rfc1902  # type: ignore[import]
-import pysnmp.smi.view  # type: ignore[import]
+import pysnmp.debug
+import pysnmp.entity.config
+import pysnmp.entity.engine
+import pysnmp.entity.rfc3413.ntfrcv
+import pysnmp.proto.api
+import pysnmp.proto.errind
+import pysnmp.proto.rfc1155
+import pysnmp.proto.rfc1902
+import pysnmp.smi.builder
+import pysnmp.smi.error
+import pysnmp.smi.rfc1902
+import pysnmp.smi.view
 from pyasn1.type.base import SimpleAsn1Type
 
+import cmk.utils.paths
 from cmk.utils.log import VERBOSE
 from cmk.utils.render import Age
 
@@ -34,34 +35,35 @@ VarBind = tuple[pysnmp.proto.rfc1902.ObjectName, SimpleAsn1Type]
 VarBinds = Iterable[VarBind]
 
 
-class SNMPTrapEngine:
+class SNMPTrapParser:
     # Disable receiving of SNMPv3 INFORM messages. We do not support them (yet)
-    class ECNotificationReceiver(pysnmp.entity.rfc3413.ntfrcv.NotificationReceiver):
-        pduTypes = (pysnmp.proto.api.v1.TrapPDU.tagSet, pysnmp.proto.api.v2c.SNMPv2TrapPDU.tagSet)
+    class _ECNotificationReceiver(pysnmp.entity.rfc3413.ntfrcv.NotificationReceiver):
+        pduTypes = (pysnmp.proto.api.v1.TrapPDU.tagSet, pysnmp.proto.api.v2c.SNMPv2TrapPDU.tagSet)  # type: ignore[assignment]
 
-    def __init__(
-        self,
-        settings: Settings,
-        config: Config,
-        logger: Logger,
-        callback: Callable[[Iterable[tuple[str, str]], str], None],
-    ) -> None:
-        super().__init__()
+    def __init__(self, settings: Settings, config: Config, logger: Logger) -> None:
         self._logger = logger
         if settings.options.snmptrap_udp is None:
             return
         self.snmp_engine = pysnmp.entity.engine.SnmpEngine()
         self._initialize_snmp_credentials(config)
-        self._snmp_receiver = SNMPTrapEngine.ECNotificationReceiver(
-            self.snmp_engine, self._handle_snmptrap
+        # NOTE: pysnmp has a really strange notification receiver API: The constructor call below
+        # effectively registers the callback (2nd argument) at the SNMP engine. The resulting
+        # receiver instance is kept alive by the registration itself, so there is no need to store
+        # it anywhere here. The callback stores the parsed trap in _varbinds_and_ipaddress when
+        # parse() is called.
+        SNMPTrapParser._ECNotificationReceiver(  # type: ignore[no-untyped-call]
+            self.snmp_engine,
+            self._handle_snmptrap,
         )
+        self._varbinds_and_ipaddress: tuple[Iterable[tuple[str, str]], str] | None = None
         self._snmp_trap_translator = SNMPTrapTranslator(settings, config, logger)
-        self._callback = callback
 
         # Hand over our logger to PySNMP
-        pysnmp.debug.setLogger(pysnmp.debug.Debug("all", printer=logger.debug))
+        pysnmp.debug.setLogger(  # type: ignore[no-untyped-call]
+            pysnmp.debug.Debug("all", printer=logger.debug)  # type: ignore[no-untyped-call]
+        )
 
-        self.snmp_engine.observer.registerObserver(
+        self.snmp_engine.observer.registerObserver(  # type: ignore[no-untyped-call]
             self._handle_unauthenticated_snmptrap,
             "rfc2576.prepareDataElements:sm-failure",
             "rfc3412.prepareDataElements:sm-failure",
@@ -144,7 +146,7 @@ class SNMPTrapEngine:
                     ".".join(str(i) for i in priv_proto),
                     engine_id,
                 )
-                pysnmp.entity.config.addV3User(
+                pysnmp.entity.config.addV3User(  # type: ignore[no-untyped-call]
                     self.snmp_engine,
                     user_id,
                     auth_proto,
@@ -154,19 +156,24 @@ class SNMPTrapEngine:
                     securityEngineId=pysnmp.proto.api.v2c.OctetString(hexValue=engine_id),
                 )
 
-    def process_snmptrap(self, message: bytes, sender_address: tuple[str, int]) -> None:
-        """Receives an incoming SNMP trap from the socket and hands it over to PySNMP for parsing
-        and processing. PySNMP is calling the registered call back (self._handle_snmptrap) back."""
+    def parse(
+        self, data: bytes, sender_address: tuple[str, int]
+    ) -> tuple[Iterable[tuple[str, str]], str] | None:
+        """Let PySNMP parse the given trap data. The _handle_snmptrap() callback below collects the result."""
         self._logger.log(
             VERBOSE, "Trap received from %s:%d. Checking for acceptance now.", sender_address
         )
-        self.snmp_engine.setUserContext(sender_address=sender_address)
-        self.snmp_engine.msgAndPduDsp.receiveMessage(
+        self._varbinds_and_ipaddress = None
+        self.snmp_engine.setUserContext(  # type: ignore[no-untyped-call]
+            sender_address=sender_address
+        )
+        self.snmp_engine.msgAndPduDsp.receiveMessage(  # type: ignore[no-untyped-call]
             snmpEngine=self.snmp_engine,
             transportDomain=(),
             transportAddress=sender_address,
-            wholeMsg=message,
+            wholeMsg=data,
         )
+        return self._varbinds_and_ipaddress
 
     def _handle_snmptrap(
         self,
@@ -178,10 +185,11 @@ class SNMPTrapEngine:
         cb_ctx: None,
     ) -> None:
         # sender_address contains a (host: str, port: int) tuple
-        ipaddress: str = self.snmp_engine.getUserContext("sender_address")[0]
+        ipaddress: str = self.snmp_engine.getUserContext("sender_address")[0]  # type: ignore[index]
         self._log_snmptrap_details(context_engine_id, context_name, var_binds, ipaddress)
         trap = self._snmp_trap_translator.translate(ipaddress, var_binds)
-        self._callback(trap, ipaddress)
+        # NOTE: There can be only one trap per PDU, so we don't run into the risk of overwriting previous info.
+        self._varbinds_and_ipaddress = trap, ipaddress
 
     def _log_snmptrap_details(
         self,
@@ -193,9 +201,9 @@ class SNMPTrapEngine:
         if self._logger.isEnabledFor(VERBOSE):
             self._logger.log(
                 VERBOSE,
-                'Trap accepted from %s (ContextEngineId "%s", SNMPContextName "%s")',
+                'Trap accepted from %s (ContextEngineId "%s", SNMPContext "%s")',
                 ipaddress,
-                context_engine_id.prettyPrint(),
+                context_engine_id.prettyPrint(),  # type: ignore[no-untyped-call]
                 context_name.prettyPrint(),
             )
 
@@ -210,7 +218,7 @@ class SNMPTrapEngine:
         cb_ctx: None,
     ) -> None:
         if (
-            variables["securityLevel"] in [1, 2]
+            variables["securityLevel"] in {1, 2}
             and variables["statusInformation"]["errorIndication"]
             == pysnmp.proto.errind.unknownCommunityName
         ):
@@ -235,51 +243,55 @@ class SNMPTrapEngine:
 
 class SNMPTrapTranslator:
     def __init__(self, settings: Settings, config: Config, logger: Logger) -> None:
-        super().__init__()
         self._logger = logger
-        translation_config = config["translate_snmptraps"]
-        if translation_config is False:
-            self.translate = self._translate_simple
-        elif translation_config == (True, {}):
-            self._mib_resolver = self._construct_resolver(
-                logger, settings.paths.compiled_mibs_dir.value, False
-            )
-            self.translate = self._translate_via_mibs
-        elif translation_config == (True, {"add_description": True}):
-            self._mib_resolver = self._construct_resolver(
-                logger, settings.paths.compiled_mibs_dir.value, True
-            )
-            self.translate = self._translate_via_mibs
-        else:
-            raise Exception("invalid SNMP trap translation")
+        match config["translate_snmptraps"]:
+            case False:
+                self._mib_resolver: pysnmp.smi.view.MibViewController | None = None
+                self.translate = self._translate_simple
+            case (True, {**extra}) if not extra:  # matches empty dict
+                self._mib_resolver = self._construct_resolver(
+                    self._logger, settings.paths.compiled_mibs_dir.value, load_texts=False
+                )
+                self.translate = self._translate_via_mibs
+            case (True, {"add_description": True}):
+                self._mib_resolver = self._construct_resolver(
+                    self._logger, settings.paths.compiled_mibs_dir.value, load_texts=True
+                )
+                self.translate = self._translate_via_mibs
+            case _:
+                raise Exception("invalid SNMP trap translation")
 
     @staticmethod
     def _construct_resolver(
-        logger: Logger, mibs_dir: Path, load_texts: bool
+        logger: Logger, mibs_dir: Path, *, load_texts: bool
     ) -> pysnmp.smi.view.MibViewController | None:
         try:
-            builder = pysnmp.smi.builder.MibBuilder()  # manages python MIB modules
+            # manages python MIB modules
+            builder = pysnmp.smi.builder.MibBuilder()  # type: ignore[no-untyped-call]
 
-            # load MIBs from our compiled MIB
-            builder.addMibSources(*[pysnmp.smi.builder.DirMibSource(str(mibs_dir))])
-
-            # explicit System MIBs
-            builder.addMibSources(
-                *[pysnmp.smi.builder.DirMibSource(str(Path("/usr/share/snmp/mibs")))]
-            )
+            # we need compiled Mib Dir and explicit system Mib Dir
+            for source in [
+                cmk.utils.paths.local_mib_dir,
+                cmk.utils.paths.mib_dir,
+                "/usr/share/snmp/mibs",
+                str(mibs_dir),
+            ]:
+                builder.addMibSources(  # type: ignore[no-untyped-call]
+                    *[pysnmp.smi.builder.DirMibSource(source)]  # type: ignore[no-untyped-call]
+                )
 
             # Indicate if we wish to load DESCRIPTION and other texts from MIBs
             builder.loadTexts = load_texts
 
             # This loads all or specified pysnmp MIBs into memory
-            builder.loadModules()
+            builder.loadModules()  # type: ignore[no-untyped-call]
 
             loaded_mib_module_names = list(builder.mibSymbols.keys())
             logger.info("Loaded %d SNMP MIB modules", len(loaded_mib_module_names))
             logger.log(VERBOSE, "Found modules: %s", ", ".join(loaded_mib_module_names))
 
             # This object maintains various indices built from MIBs data
-            return pysnmp.smi.view.MibViewController(builder)
+            return pysnmp.smi.view.MibViewController(builder)  # type: ignore[no-untyped-call]
         except pysnmp.smi.error.SmiError:
             logger.info(
                 "Exception while loading MIB modules. Proceeding without modules!", exc_info=True
@@ -289,13 +301,11 @@ class SNMPTrapTranslator:
     def _translate_simple(self, ipaddress: str, var_bind_list: VarBinds) -> list[tuple[str, str]]:
         return [self._translate_binding_simple(oid, value) for oid, value in var_bind_list]
 
+    @staticmethod
     def _translate_binding_simple(
-        self, oid: pysnmp.proto.rfc1902.ObjectName, value: SimpleAsn1Type
+        oid: pysnmp.proto.rfc1902.ObjectName, value: SimpleAsn1Type
     ) -> tuple[str, str]:
-        if oid.asTuple() == (1, 3, 6, 1, 2, 1, 1, 3, 0):
-            key = "Uptime"
-        else:
-            key = str(oid)
+        key = "Uptime" if oid.asTuple() == (1, 3, 6, 1, 2, 1, 1, 3, 0) else str(oid)  # type: ignore[no-untyped-call]
         # We could use Asn1Type.isSuperTypeOf() instead of isinstance() below.
         if isinstance(value, (pysnmp.proto.rfc1155.TimeTicks, pysnmp.proto.rfc1902.TimeTicks)):
             val = str(Age(float(value) / 100))
@@ -320,7 +330,7 @@ class SNMPTrapTranslator:
                 )
                 self._logger.debug(
                     "Failed trap var binds:\n%s",
-                    "\n".join([f"{i}: {repr(i)}" for i in var_bind_list]),
+                    "\n".join(f"{i}: {repr(i)}" for i in var_bind_list),
                 )
                 self._logger.debug(traceback.format_exc())
                 translated_oid = str(oid)
@@ -333,13 +343,14 @@ class SNMPTrapTranslator:
     ) -> tuple[str, str]:
         # Disable mib_var[0] type detection
         mib_var = pysnmp.smi.rfc1902.ObjectType(
-            pysnmp.smi.rfc1902.ObjectIdentity(oid), value
+            pysnmp.smi.rfc1902.ObjectIdentity(oid),  # type: ignore[no-untyped-call]
+            value,
         ).resolveWithMib(self._mib_resolver)
         node = mib_var[0].getMibNode()
         translated_oid = mib_var[0].prettyPrint().replace('"', "")
         translated_value = mib_var[1].prettyPrint()
-        if units := getattr(node, "getUnits", lambda: "")():
+        if units := getattr(node, "getUnits", str)():
             translated_value += f" {units}"
-        if description := getattr(node, "getDescription", lambda: "")():
+        if description := getattr(node, "getDescription", str)():
             translated_value += f"({description})"
         return translated_oid, translated_value

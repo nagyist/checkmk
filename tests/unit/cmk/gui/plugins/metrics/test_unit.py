@@ -4,25 +4,25 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 from collections.abc import Callable
-from typing import ContextManager
+from typing import ContextManager, Literal
 
 import pytest
 
-from tests.testlib.users import create_and_destroy_user
+from tests.unit.cmk.gui.users import create_and_destroy_user
 
-from cmk.utils.type_defs import UserId
+from cmk.utils.user import UserId
 
 from cmk.gui.config import active_config
-from cmk.gui.plugins.metrics.utils import unit_info
+from cmk.gui.graphing._legacy import unit_info
 
 
-def test_temperature_unit_default() -> None:
-    assert unit_info["c"]["title"] == "Degree Celsius"
+def test_temperature_unit_default(request_context: None) -> None:
+    assert unit_info["c"].title == "Degree Celsius"
 
 
-def test_temperature_unit_global_setting() -> None:
+def test_temperature_unit_global_setting(request_context: None) -> None:
     active_config.default_temperature_unit = "fahrenheit"
-    assert unit_info["c"]["title"] == "Degree Fahrenheit"
+    assert unit_info["c"].title == "Degree Fahrenheit"
 
 
 @pytest.mark.parametrize(
@@ -42,11 +42,15 @@ def test_temperature_unit_global_setting() -> None:
 )
 def test_temperature_unit_user_celsius(
     run_as_user: Callable[[UserId], ContextManager[None]],
-    user_setting_temperature_unit: str,
+    user_setting_temperature_unit: Literal["celsius", "fahrenheit"],
     expected_temperature_unit_title: str,
+    request_context: None,
 ) -> None:
-    with create_and_destroy_user(
-        username="harald",
-        custom_attrs={"temperature_unit": user_setting_temperature_unit},
-    ), run_as_user(UserId("harald")):
-        assert unit_info["c"]["title"] == expected_temperature_unit_title
+    with (
+        create_and_destroy_user(
+            username="harald",
+            custom_attrs={"temperature_unit": user_setting_temperature_unit},
+        ),
+        run_as_user(UserId("harald")),
+    ):
+        assert unit_info["c"].title == expected_temperature_unit_title

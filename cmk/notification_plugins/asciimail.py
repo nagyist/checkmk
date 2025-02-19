@@ -10,7 +10,7 @@ import sys
 from email.mime.text import MIMEText
 from typing import NoReturn
 
-from cmk.utils.mail import default_from_address, send_mail_sendmail, set_mail_headers
+from cmk.utils.mail import default_from_address, MailString, send_mail_sendmail, set_mail_headers
 
 from cmk.notification_plugins import utils
 
@@ -43,7 +43,7 @@ Handler output: $ALERTHANDLEROUTPUT$
 tmpl_alerthandler_service_body = "Service:  $SERVICEDESC$\n" + tmpl_alerthandler_host_body
 
 
-def construct_content(context: dict[str, str]) -> str:  # pylint: disable=too-many-branches
+def construct_content(context: dict[str, str]) -> str:
     # Create a notification summary in a new context variable
     # Note: This code could maybe move to cmk --notify in order to
     # make it available every in all notification scripts
@@ -163,10 +163,14 @@ def main() -> NoReturn:
         context.get("PARAMETER_REPLY_TO_ADDRESS", ""),
     )
     m = set_mail_headers(
-        mailto, subject, from_address, reply_to, MIMEText(content_txt, "plain", _charset="utf-8")
+        MailString(mailto),
+        MailString(subject),
+        MailString(from_address),
+        MailString(reply_to),
+        MIMEText(content_txt, "plain", _charset="utf-8"),
     )
     try:
-        send_mail_sendmail(m, mailto, from_address)
+        send_mail_sendmail(m, MailString(mailto), MailString(from_address))
         sys.stdout.write("Spooled mail to local mail transmission agent\n")
         sys.exit(0)
     except Exception as e:

@@ -10,10 +10,8 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "livestatus/Interface.h"
-#include "livestatus/StringUtils.h"
 
 inline double badness(ServiceState state) {
     // unknown is effectively between warning and critical
@@ -64,20 +62,57 @@ enum class LogEntryKind {
     acknowledge_alert_service
 };
 
+enum class LogEntryParam {
+    HostName,
+    ServiceDescription,
+    CommandName,
+    CommandNameWithWorkaround,
+    ContactName,
+    HostState,
+    ServiceState,
+    ExitCode,
+    State,
+    StateType,
+    Attempt,
+    Comment,
+    PluginOutput,
+    LongPluginOutput,
+    Ignore
+};
+
 class LogEntry {
 public:
     // NOTE: We have to keep this enum in sync with the table in
-    // cmk.gui.plugins.visuals.filters.FilterLogClass on the Python side.
+    // cmk.gui.query_filters.log_class_options() on the Python side.
     enum class Class {
-        info = 0,             // all messages not in any other class
-        alert = 1,            // alerts: the change service/host state
-        program = 2,          // important program events (restart, ...)
-        hs_notification = 3,  // host/service notifications
-        passivecheck = 4,     // passive checks
-        ext_command = 5,      // external commands
-        state = 6,            // initial or current states
-        // text = 7,          // specific text passages, seems to be unused
-        alert_handlers = 8,  // Started and stopped alert handlers
+        // all messages not in any other class
+        info = 0,
+
+        // {HOST,SERVICE}{, DOWNTIME, ACKNOWLEDGE, FLAPPING} ALERT
+        alert = 1,
+
+        // LOG VERSION: 2.0*, logging in{,t}itial states*,
+        // *starting...*, *active mode...*,
+        // *shutting down...*, *Bailing out*, *standby mode...*
+        program = 2,
+
+        // {HOST,SERVICE} NOTIFICATION{, RESULT, PROGRESS}
+        hs_notification = 3,
+
+        // PASSIVE {HOST,SERVICE} CHECK
+        passivecheck = 4,
+
+        // EXTERNAL COMMAND
+        ext_command = 5,
+
+        // {INITIAL,CURRENT} {HOST,SERVICE} STATE, TIMEPERIOD TRANSITION
+        state = 6,
+
+        // specific text passages, seems to be unused
+        // text = 7
+
+        // {HOST,SERVICE} ALERT HANDLER {STARTED,STOPPED}
+        alert_handlers = 8,
     };
 
     /// Constructed by Logfile::processLogLine(). All instances owned by
@@ -119,9 +154,9 @@ public:
     [[nodiscard]] std::string plugin_output() const {
         return std::string{plugin_output_};
     }
-    [[nodiscard]] std::string long_plugin_output() const {
-        return mk::to_multi_line(std::string{long_plugin_output_});
-    }
+    [[nodiscard]] std::string long_plugin_output() const;
+    // See also `cmc::MonitoringLog::decode()`
+    static std::string encode(const std::string &str);
 
 private:
     size_t lineno_;
@@ -143,35 +178,7 @@ private:
     std::string_view plugin_output_;
     std::string_view long_plugin_output_;
 
-    enum class Param {
-        HostName,
-        ServiceDescription,
-        CommandName,
-        CommandNameWithWorkaround,
-        ContactName,
-        HostState,
-        ServiceState,
-        ExitCode,
-        State,
-        StateType,
-        Attempt,
-        Comment,
-        PluginOutput,
-        LongPluginOutput,
-        Ignore
-    };
-
-    struct LogDef {
-        std::string prefix;
-        Class log_class;
-        LogEntryKind log_type;
-        std::vector<Param> params;
-    };
-
-    // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-    static std::vector<LogDef> log_definitions;
-
-    void assign(Param par, std::string_view field);
+    void assign(LogEntryParam par, std::string_view field);
     void classifyLogMessage();
     [[nodiscard]] bool textStartsWith(const std::string &what) const;
     [[nodiscard]] bool textContains(const std::string &what) const;

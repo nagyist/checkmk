@@ -4,17 +4,14 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 from cmk.gui.i18n import _
-from cmk.gui.plugins.wato.utils import (
-    Levels,
-    register_check_parameters,
-    RulespecGroupCheckParametersNetworking,
-)
+from cmk.gui.plugins.wato.utils import Levels, RulespecGroupCheckParametersNetworking
 from cmk.gui.valuespec import Dictionary, MonitoringState, TextInput
+from cmk.gui.wato import register_check_parameters
 
 register_check_parameters(
     RulespecGroupCheckParametersNetworking,
     "checkpoint_packets",
-    _("Checkpoint Firewall Packet Rates"),
+    _("Check Point Firewall Packet Rates"),
     Dictionary(
         elements=[
             (
@@ -80,7 +77,7 @@ register_check_parameters(
 register_check_parameters(
     RulespecGroupCheckParametersNetworking,
     "checkpoint_tunnels",
-    _("Checkpoint Tunnel Status"),
+    _("Check Point Tunnel Status"),
     Dictionary(
         elements=[
             (

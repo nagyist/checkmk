@@ -1,0 +1,10 @@
+title: GCP HTTP(S) Load Balancer: Summary
+agents: gcp
+catalog: cloud/gcp
+license: GPLv2
+distribution: check_mk
+description:
+ This check counts number of load balancers.
+
+discovery:
+ One service is created for all load balancers in this project.

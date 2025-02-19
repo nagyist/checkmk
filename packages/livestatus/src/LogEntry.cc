@@ -13,15 +13,217 @@
 #include <stdexcept>
 #include <system_error>
 #include <utility>
+#include <vector>
+
+#include "livestatus/StringUtils.h"
 
 using namespace std::string_view_literals;
 
+namespace {
+struct LogDef {
+    std::string prefix;
+    LogEntry::Class log_class;
+    LogEntryKind log_type;
+    std::vector<LogEntryParam> params;
+};
+
+// NOLINTNEXTLINE(cert-err58-cpp)
+const std::vector<LogDef> log_definitions{
+    LogDef{.prefix = "INITIAL HOST STATE",
+           .log_class = LogEntry::Class::state,
+           .log_type = LogEntryKind::state_host_initial,
+           .params = {LogEntryParam::HostName, LogEntryParam::HostState,
+                      LogEntryParam::StateType, LogEntryParam::Attempt,
+                      LogEntryParam::PluginOutput,
+                      LogEntryParam::LongPluginOutput}},
+    LogDef{.prefix = "CURRENT HOST STATE",
+           .log_class = LogEntry::Class::state,
+           .log_type = LogEntryKind::state_host,
+           .params = {LogEntryParam::HostName, LogEntryParam::HostState,
+                      LogEntryParam::StateType, LogEntryParam::Attempt,
+                      LogEntryParam::PluginOutput,
+                      LogEntryParam::LongPluginOutput}},
+    LogDef{.prefix = "HOST ALERT",
+           .log_class = LogEntry::Class::alert,
+           .log_type = LogEntryKind::alert_host,
+           .params = {LogEntryParam::HostName, LogEntryParam::HostState,
+                      LogEntryParam::StateType, LogEntryParam::Attempt,
+                      LogEntryParam::PluginOutput,
+                      LogEntryParam::LongPluginOutput}},
+    LogDef{.prefix = "HOST DOWNTIME ALERT",
+           .log_class = LogEntry::Class::alert,
+           .log_type = LogEntryKind::downtime_alert_host,
+           .params = {LogEntryParam::HostName, LogEntryParam::StateType,
+                      LogEntryParam::Comment}},
+    LogDef{.prefix = "HOST ACKNOWLEDGE ALERT",
+           .log_class = LogEntry::Class::alert,
+           .log_type = LogEntryKind::acknowledge_alert_host,
+           .params = {LogEntryParam::HostName, LogEntryParam::StateType,
+                      LogEntryParam::ContactName, LogEntryParam::Comment}},
+    LogDef{.prefix = "HOST FLAPPING ALERT",
+           .log_class = LogEntry::Class::alert,
+           .log_type = LogEntryKind::flapping_host,
+           .params = {LogEntryParam::HostName, LogEntryParam::StateType,
+                      LogEntryParam::Comment}},
+    LogDef{
+        .prefix = "INITIAL SERVICE STATE",
+        .log_class = LogEntry::Class::state,
+        .log_type = LogEntryKind::state_service_initial,
+        .params = {LogEntryParam::HostName, LogEntryParam::ServiceDescription,
+                   LogEntryParam::ServiceState, LogEntryParam::StateType,
+                   LogEntryParam::Attempt, LogEntryParam::PluginOutput,
+                   LogEntryParam::LongPluginOutput}},
+    LogDef{
+        .prefix = "CURRENT SERVICE STATE",
+        .log_class = LogEntry::Class::state,
+        .log_type = LogEntryKind::state_service,
+        .params = {LogEntryParam::HostName, LogEntryParam::ServiceDescription,
+                   LogEntryParam::ServiceState, LogEntryParam::StateType,
+                   LogEntryParam::Attempt, LogEntryParam::PluginOutput,
+                   LogEntryParam::LongPluginOutput}},
+    LogDef{
+        .prefix = "SERVICE ALERT",
+        .log_class = LogEntry::Class::alert,
+        .log_type = LogEntryKind::alert_service,
+        .params = {LogEntryParam::HostName, LogEntryParam::ServiceDescription,
+                   LogEntryParam::ServiceState, LogEntryParam::StateType,
+                   LogEntryParam::Attempt, LogEntryParam::PluginOutput,
+                   LogEntryParam::LongPluginOutput}},
+    LogDef{
+        .prefix = "SERVICE DOWNTIME ALERT",
+        .log_class = LogEntry::Class::alert,
+        .log_type = LogEntryKind::downtime_alert_service,
+        .params = {LogEntryParam::HostName, LogEntryParam::ServiceDescription,
+                   LogEntryParam::StateType, LogEntryParam::Comment}},
+    LogDef{
+        .prefix = "SERVICE ACKNOWLEDGE ALERT",
+        .log_class = LogEntry::Class::alert,
+        .log_type = LogEntryKind::acknowledge_alert_service,
+        .params = {LogEntryParam::HostName, LogEntryParam::ServiceDescription,
+                   LogEntryParam::StateType, LogEntryParam::ContactName,
+                   LogEntryParam::Comment}},
+    LogDef{
+        .prefix = "SERVICE FLAPPING ALERT",
+        .log_class = LogEntry::Class::alert,
+        .log_type = LogEntryKind::flapping_service,
+        .params = {LogEntryParam::HostName, LogEntryParam::ServiceDescription,
+                   LogEntryParam::StateType, LogEntryParam::Comment}},
+    LogDef{.prefix = "TIMEPERIOD TRANSITION",
+           .log_class = LogEntry::Class::state,
+           .log_type = LogEntryKind::timeperiod_transition,
+           .params =
+               {
+                   LogEntryParam::Ignore,  // name
+                   LogEntryParam::Ignore,  // from
+                   LogEntryParam::Ignore   // to
+               }},
+    // NOTE: Generated by CMC & mknotifyd, see cmk.utils.notification_message
+    LogDef{.prefix = "HOST NOTIFICATION",
+           .log_class = LogEntry::Class::hs_notification,
+           .log_type = LogEntryKind::none,
+           .params = {LogEntryParam::ContactName, LogEntryParam::HostName,
+                      LogEntryParam::StateType,
+                      LogEntryParam::CommandNameWithWorkaround,
+                      LogEntryParam::PluginOutput,
+                      LogEntryParam::Ignore,  // author
+                      LogEntryParam::Comment, LogEntryParam::LongPluginOutput}},
+    // NOTE: Generated by CMC & mknotifyd, see cmk.utils.notification_message
+    LogDef{
+        .prefix = "SERVICE NOTIFICATION",
+        .log_class = LogEntry::Class::hs_notification,
+        .log_type = LogEntryKind::none,
+        .params = {LogEntryParam::ContactName, LogEntryParam::HostName,
+                   LogEntryParam::ServiceDescription, LogEntryParam::StateType,
+                   LogEntryParam::CommandNameWithWorkaround,
+                   LogEntryParam::PluginOutput,
+                   LogEntryParam::Ignore,  // author
+                   LogEntryParam::Comment, LogEntryParam::LongPluginOutput}},
+    // NOTE: Generated by mknotifyd & notification helper, see
+    // cmk.utils.notification_result_message
+    LogDef{.prefix = "HOST NOTIFICATION RESULT",
+           .log_class = LogEntry::Class::hs_notification,
+           .log_type = LogEntryKind::none,
+           .params = {LogEntryParam::ContactName, LogEntryParam::HostName,
+                      LogEntryParam::StateType,
+                      LogEntryParam::CommandNameWithWorkaround,
+                      LogEntryParam::PluginOutput, LogEntryParam::Comment}},
+    // NOTE: Generated by mknotifyd & notification helper, see
+    // cmk.utils.notification_result_message
+    LogDef{
+        .prefix = "SERVICE NOTIFICATION RESULT",
+        .log_class = LogEntry::Class::hs_notification,
+        .log_type = LogEntryKind::none,
+        .params = {LogEntryParam::ContactName, LogEntryParam::HostName,
+                   LogEntryParam::ServiceDescription, LogEntryParam::StateType,
+                   LogEntryParam::CommandNameWithWorkaround,
+                   LogEntryParam::PluginOutput, LogEntryParam::Comment}},
+    LogDef{.prefix = "HOST NOTIFICATION PROGRESS",
+           .log_class = LogEntry::Class::hs_notification,
+           .log_type = LogEntryKind::none,
+           .params = {LogEntryParam::ContactName, LogEntryParam::HostName,
+                      LogEntryParam::StateType,
+                      LogEntryParam::CommandNameWithWorkaround,
+                      LogEntryParam::PluginOutput}},
+    // NOTE: Generated by mknotifyd, see cmk.utils.notification_progress_message
+    LogDef{
+        .prefix = "SERVICE NOTIFICATION PROGRESS",
+        .log_class = LogEntry::Class::hs_notification,
+        .log_type = LogEntryKind::none,
+        .params = {LogEntryParam::ContactName, LogEntryParam::HostName,
+                   LogEntryParam::ServiceDescription, LogEntryParam::StateType,
+                   LogEntryParam::CommandNameWithWorkaround,
+                   LogEntryParam::PluginOutput}},
+    // NOTE: Generated by mknotifyd, see cmk.utils.notification_progress_message
+    LogDef{.prefix = "HOST ALERT HANDLER STARTED",
+           .log_class = LogEntry::Class::alert_handlers,
+           .log_type = LogEntryKind::none,
+           .params = {LogEntryParam::HostName, LogEntryParam::CommandName}},
+    LogDef{
+        .prefix = "SERVICE ALERT HANDLER STARTED",
+        .log_class = LogEntry::Class::alert_handlers,
+        .log_type = LogEntryKind::none,
+        .params = {LogEntryParam::HostName, LogEntryParam::ServiceDescription,
+                   LogEntryParam::CommandName}},
+    LogDef{.prefix = "HOST ALERT HANDLER STOPPED",
+           .log_class = LogEntry::Class::alert_handlers,
+           .log_type = LogEntryKind::none,
+           .params = {LogEntryParam::HostName, LogEntryParam::CommandName,
+                      LogEntryParam::ExitCode, LogEntryParam::PluginOutput}},
+    LogDef{
+        .prefix = "SERVICE ALERT HANDLER STOPPED",
+        .log_class = LogEntry::Class::alert_handlers,
+        .log_type = LogEntryKind::none,
+        .params = {LogEntryParam::HostName, LogEntryParam::ServiceDescription,
+                   LogEntryParam::CommandName, LogEntryParam::ExitCode,
+                   LogEntryParam::PluginOutput}},
+    // NOTE: Generated by Nagios only
+    LogDef{
+        .prefix = "PASSIVE SERVICE CHECK",
+        .log_class = LogEntry::Class::passivecheck,
+        .log_type = LogEntryKind::none,
+        .params = {LogEntryParam::HostName, LogEntryParam::ServiceDescription,
+                   LogEntryParam::State, LogEntryParam::PluginOutput}},
+    // NOTE: Generated by Nagios only
+    LogDef{.prefix = "PASSIVE HOST CHECK",
+           .log_class = LogEntry::Class::passivecheck,
+           .log_type = LogEntryKind::none,
+           .params = {LogEntryParam::HostName, LogEntryParam::State,
+                      LogEntryParam::PluginOutput}},
+    LogDef{.prefix = "EXTERNAL COMMAND",
+           .log_class = LogEntry::Class::ext_command,
+           .log_type = LogEntryKind::none,
+           .params = {
+               LogEntryParam::Ignore  // command
+           }}};
+
+}  // namespace
 // 0123456789012345678901234567890
 // [1234567890] FOO BAR: blah blah
 static constexpr size_t timestamp_prefix_length = 13;
 
 // TODO(sp) Fix classifyLogMessage() below to always set all fields and remove
 // this set-me-to-zero-to-be-sure-block.
+// NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
 LogEntry::LogEntry(size_t lineno, std::string line)
     : lineno_(lineno), message_(std::move(line)), state_(0), attempt_(0) {
     size_t pos = message_.find(':');
@@ -45,18 +247,26 @@ LogEntry::LogEntry(size_t lineno, std::string line)
     classifyLogMessage();
 }
 
-void LogEntry::assign(Param par, std::string_view field) {
+std::string LogEntry::long_plugin_output() const {
+    return LogEntry::encode(std::string{long_plugin_output_});
+}
+
+std::string LogEntry::encode(const std::string &str) {
+    return mk::replace_all(str, R"(\n)", "\n");
+}
+
+void LogEntry::assign(LogEntryParam par, std::string_view field) {
     switch (par) {
-        case Param::HostName:
+        case LogEntryParam::HostName:
             host_name_ = field;
             return;
-        case Param::ServiceDescription:
+        case LogEntryParam::ServiceDescription:
             service_description_ = field;
             return;
-        case Param::CommandName:
+        case LogEntryParam::CommandName:
             command_name_ = field;
             return;
-        case Param::CommandNameWithWorkaround:
+        case LogEntryParam::CommandNameWithWorkaround:
             command_name_ = field;
             // The NotifyHelper class has a long, tragic history: Through a long
             // series of commits, it suffered from spelling mistakes like
@@ -80,194 +290,41 @@ void LogEntry::assign(Param par, std::string_view field) {
                          ? static_cast<int>(parseHostState(state_type_))
                          : static_cast<int>(parseServiceState(state_type_));
             return;
-        case Param::ContactName:
+        case LogEntryParam::ContactName:
             contact_name_ = field;
             return;
-        case Param::HostState:
+        case LogEntryParam::HostState:
             state_ = static_cast<int>(parseHostState(field));
             return;
-        case Param::ServiceState:
-        case Param::ExitCode:  // HACK: Encoded as a service state! :-P
+        case LogEntryParam::ServiceState:
+        case LogEntryParam::ExitCode:  // HACK: Encoded as a service state! :-P
             state_ = static_cast<int>(parseServiceState(field));
             return;
-        case Param::State:
+        case LogEntryParam::State:
             state_ = 0;
             std::from_chars(field.data(), field.data() + field.size(), state_);
             return;
-        case Param::StateType:
+        case LogEntryParam::StateType:
             state_type_ = field;
             return;
-        case Param::Attempt:
+        case LogEntryParam::Attempt:
             attempt_ = 0;
             std::from_chars(field.data(), field.data() + field.size(),
                             attempt_);
             return;
-        case Param::Comment:
+        case LogEntryParam::Comment:
             comment_ = field;
             return;
-        case Param::PluginOutput:
+        case LogEntryParam::PluginOutput:
             plugin_output_ = field;
             return;
-        case Param::LongPluginOutput:
+        case LogEntryParam::LongPluginOutput:
             long_plugin_output_ = field;
             return;
-        case Param::Ignore:
+        case LogEntryParam::Ignore:
             return;
     }
 };
-
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-std::vector<LogEntry::LogDef> LogEntry::log_definitions{
-    LogDef{"INITIAL HOST STATE",
-           Class::state,
-           LogEntryKind::state_host_initial,
-           {Param::HostName, Param::HostState, Param::StateType, Param::Attempt,
-            Param::PluginOutput, Param::LongPluginOutput}},
-    LogDef{"CURRENT HOST STATE",
-           Class::state,
-           LogEntryKind::state_host,
-           {Param::HostName, Param::HostState, Param::StateType, Param::Attempt,
-            Param::PluginOutput, Param::LongPluginOutput}},
-    LogDef{"HOST ALERT",
-           Class::alert,
-           LogEntryKind::alert_host,
-           {Param::HostName, Param::HostState, Param::StateType, Param::Attempt,
-            Param::PluginOutput, Param::LongPluginOutput}},
-    LogDef{"HOST DOWNTIME ALERT",
-           Class::alert,
-           LogEntryKind::downtime_alert_host,
-           {Param::HostName, Param::StateType, Param::Comment}},
-    LogDef{"HOST ACKNOWLEDGE ALERT",
-           Class::alert,
-           LogEntryKind::acknowledge_alert_host,
-           {Param::HostName, Param::StateType, Param::ContactName,
-            Param::Comment}},
-    LogDef{"HOST FLAPPING ALERT",
-           Class::alert,
-           LogEntryKind::flapping_host,
-           {Param::HostName, Param::StateType, Param::Comment}},
-    LogDef{"INITIAL SERVICE STATE",
-           Class::state,
-           LogEntryKind::state_service_initial,
-           {Param::HostName, Param::ServiceDescription, Param::ServiceState,
-            Param::StateType, Param::Attempt, Param::PluginOutput,
-            Param::LongPluginOutput}},
-    LogDef{"CURRENT SERVICE STATE",
-           Class::state,
-           LogEntryKind::state_service,
-           {Param::HostName, Param::ServiceDescription, Param::ServiceState,
-            Param::StateType, Param::Attempt, Param::PluginOutput,
-            Param::LongPluginOutput}},
-    LogDef{"SERVICE ALERT",
-           Class::alert,
-           LogEntryKind::alert_service,
-           {Param::HostName, Param::ServiceDescription, Param::ServiceState,
-            Param::StateType, Param::Attempt, Param::PluginOutput,
-            Param::LongPluginOutput}},
-    LogDef{"SERVICE DOWNTIME ALERT",
-           Class::alert,
-           LogEntryKind::downtime_alert_service,
-           {Param::HostName, Param::ServiceDescription, Param::StateType,
-            Param::Comment}},
-    LogDef{"SERVICE ACKNOWLEDGE ALERT",
-           Class::alert,
-           LogEntryKind::acknowledge_alert_service,
-           {Param::HostName, Param::ServiceDescription, Param::StateType,
-            Param::ContactName, Param::Comment}},
-    LogDef{"SERVICE FLAPPING ALERT",
-           Class::alert,
-           LogEntryKind::flapping_service,
-           {Param::HostName, Param::ServiceDescription, Param::StateType,
-            Param::Comment}},
-    LogDef{"TIMEPERIOD TRANSITION",
-           Class::state,
-           LogEntryKind::timeperiod_transition,
-           {
-               Param::Ignore,  // name
-               Param::Ignore,  // from
-               Param::Ignore   // to
-           }},
-    // NOTE: Generated by CMC & mknotifyd, see cmk.utils.notification_message
-    LogDef{"HOST NOTIFICATION",
-           Class::hs_notification,
-           LogEntryKind::none,
-           {Param::ContactName, Param::HostName, Param::StateType,
-            Param::CommandNameWithWorkaround, Param::PluginOutput,
-            Param::Ignore,  // author
-            Param::Comment, Param::LongPluginOutput}},
-    // NOTE: Generated by CMC & mknotifyd, see cmk.utils.notification_message
-    LogDef{"SERVICE NOTIFICATION",
-           Class::hs_notification,
-           LogEntryKind::none,
-           {Param::ContactName, Param::HostName, Param::ServiceDescription,
-            Param::StateType, Param::CommandNameWithWorkaround,
-            Param::PluginOutput,
-            Param::Ignore,  // author
-            Param::Comment, Param::LongPluginOutput}},
-    // NOTE: Generated by mknotifyd & notification helper, see
-    // cmk.utils.notification_result_message
-    LogDef{"HOST NOTIFICATION RESULT",
-           Class::hs_notification,
-           LogEntryKind::none,
-           {Param::ContactName, Param::HostName, Param::StateType,
-            Param::CommandNameWithWorkaround, Param::PluginOutput,
-            Param::Comment}},
-    // NOTE: Generated by mknotifyd & notification helper, see
-    // cmk.utils.notification_result_message
-    LogDef{"SERVICE NOTIFICATION RESULT",
-           Class::hs_notification,
-           LogEntryKind::none,
-           {Param::ContactName, Param::HostName, Param::ServiceDescription,
-            Param::StateType, Param::CommandNameWithWorkaround,
-            Param::PluginOutput, Param::Comment}},
-    LogDef{"HOST NOTIFICATION PROGRESS",
-           Class::hs_notification,
-           LogEntryKind::none,
-           {Param::ContactName, Param::HostName, Param::StateType,
-            Param::CommandNameWithWorkaround, Param::PluginOutput}},
-    // NOTE: Generated by mknotifyd, see cmk.utils.notification_progress_message
-    LogDef{"SERVICE NOTIFICATION PROGRESS",
-           Class::hs_notification,
-           LogEntryKind::none,
-           {Param::ContactName, Param::HostName, Param::ServiceDescription,
-            Param::StateType, Param::CommandNameWithWorkaround,
-            Param::PluginOutput}},
-    // NOTE: Generated by mknotifyd, see cmk.utils.notification_progress_message
-    LogDef{"HOST ALERT HANDLER STARTED",
-           Class::alert_handlers,
-           LogEntryKind::none,
-           {Param::HostName, Param::CommandName}},
-    LogDef{"SERVICE ALERT HANDLER STARTED",
-           Class::alert_handlers,
-           LogEntryKind::none,
-           {Param::HostName, Param::ServiceDescription, Param::CommandName}},
-    LogDef{"HOST ALERT HANDLER STOPPED",
-           Class::alert_handlers,
-           LogEntryKind::none,
-           {Param::HostName, Param::CommandName, Param::ExitCode,
-            Param::PluginOutput}},
-    LogDef{"SERVICE ALERT HANDLER STOPPED",
-           Class::alert_handlers,
-           LogEntryKind::none,
-           {Param::HostName, Param::ServiceDescription, Param::CommandName,
-            Param::ExitCode, Param::PluginOutput}},
-    // NOTE: Generated by Nagios only
-    LogDef{"PASSIVE SERVICE CHECK",
-           Class::passivecheck,
-           LogEntryKind::none,
-           {Param::HostName, Param::ServiceDescription, Param::State,
-            Param::PluginOutput}},
-    // NOTE: Generated by Nagios only
-    LogDef{"PASSIVE HOST CHECK",
-           Class::passivecheck,
-           LogEntryKind::none,
-           {Param::HostName, Param::State, Param::PluginOutput}},
-    LogDef{"EXTERNAL COMMAND",
-           Class::ext_command,
-           LogEntryKind::none,
-           {
-               Param::Ignore  // command
-           }}};
 
 // A bit verbose, but we avoid unnecessary string copies below.
 void LogEntry::classifyLogMessage() {
@@ -281,7 +338,7 @@ void LogEntry::classifyLogMessage() {
             kind_ = def.log_type;
             // TODO(sp) Use boost::tokenizer instead of this index fiddling
             size_t pos = timestamp_prefix_length + def.prefix.size() + 2;
-            for (Param const par : def.params) {
+            for (LogEntryParam const par : def.params) {
                 const size_t sep_pos = message_.find(';', pos);
                 const size_t end_pos =
                     sep_pos == std::string::npos ? message_.size() : sep_pos;
@@ -294,28 +351,28 @@ void LogEntry::classifyLogMessage() {
     }
     type_ = message_sv.substr(timestamp_prefix_length);
     if (textStartsWith("LOG VERSION: 2.0")) {
-        class_ = Class::program;
+        class_ = LogEntry::Class::program;
         kind_ = LogEntryKind::log_version;
         return;
     }
     if (textStartsWith("logging initial states") ||
         textStartsWith("logging intitial states")) {
-        class_ = Class::program;
+        class_ = LogEntry::Class::program;
         kind_ = LogEntryKind::log_initial_states;
         return;
     }
     if (textContains("starting...") || textContains("active mode...")) {
-        class_ = Class::program;
+        class_ = LogEntry::Class::program;
         kind_ = LogEntryKind::core_starting;
         return;
     }
     if (textContains("shutting down...") || textContains("Bailing out") ||
         textContains("standby mode...")) {
-        class_ = Class::program;
+        class_ = LogEntry::Class::program;
         kind_ = LogEntryKind::core_stopping;
         return;
     }
-    class_ = Class::info;
+    class_ = LogEntry::Class::info;
     kind_ = LogEntryKind::none;
 }
 
@@ -329,13 +386,13 @@ bool LogEntry::textContains(const std::string &what) const {
 
 namespace {
 // TODO(sp) copy-n-paste from FetcherHelperChannel!
-template <class T, size_t N>
+template <typename T, size_t N>
 using one_of = std::array<std::pair<std::string_view, T>, N>;
 
 // As complicated and inefficient as it looks, the function below is completely
 // unfolded in code: It basically results in very fast if-then-else cascades,
 // guarded by the lengths, see: https://www.youtube.com/watch?v=INn3xa4pMfg
-template <class T, size_t N>
+template <typename T, size_t N>
 T parseState(std::string_view str, const one_of<T, N> &table, T default_value) {
     // Ugly: Depending on where we're called, the actual state type can be in
     // parentheses at the end, e.g. "ALERTHANDLER (OK)".
@@ -432,6 +489,7 @@ std::string to_exit_code(int state) {
 }
 }  // namespace
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 std::string LogEntry::state_info() const {
     switch (kind_) {
         case LogEntryKind::state_host_initial:
@@ -459,7 +517,7 @@ std::string LogEntry::state_info() const {
                     state_type_ == "UNREACHABLE"sv) {
                     return parens("NOTIFY"sv, state_type_);
                 }
-                if (mk::starts_with(state_type_, "ALERTHANDLER (")) {
+                if (state_type_.starts_with("ALERTHANDLER (")) {
                     return parens("EXIT_CODE"sv, to_exit_code(state_));
                 }
                 return std::string{state_type_};
@@ -471,7 +529,7 @@ std::string LogEntry::state_info() const {
                     state_type_ == "UNKNOWN"sv) {
                     return parens("NOTIFY"sv, state_type_);
                 }
-                if (mk::starts_with(state_type_, "ALERTHANDLER ("sv)) {
+                if (state_type_.starts_with("ALERTHANDLER ("sv)) {
                     return parens("EXIT_CODE"sv, to_exit_code(state_));
                 }
                 return std::string{state_type_};

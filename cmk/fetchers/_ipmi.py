@@ -5,33 +5,102 @@
 
 from __future__ import annotations
 
-import copy
+import errno
 import logging
-from collections.abc import Mapping
-from typing import Any, Final, TYPE_CHECKING, TypedDict
+import os
+from collections.abc import Iterable
+from dataclasses import astuple, dataclass
+from typing import Final, Self, TYPE_CHECKING, TypedDict
 
-import pyghmi.constants as ipmi_const  # type: ignore[import]
-from pyghmi.exceptions import IpmiException  # type: ignore[import]
+import pyghmi.constants as ipmi_const
+from pyghmi.exceptions import IpmiException
 
 if TYPE_CHECKING:
     # The remaining pyghmi imports are expensive (60 ms for all of them together).
-    import pyghmi.ipmi.command as ipmi_cmd  # type: ignore[import]
-    import pyghmi.ipmi.sdr as ipmi_sdr  # type: ignore[import]
+    import pyghmi.ipmi.command as ipmi_cmd
+    import pyghmi.ipmi.sdr as ipmi_sdr
 
-from six import ensure_binary
+from cmk.ccc.exceptions import MKFetcherError, MKTimeout
 
-from cmk.utils.exceptions import MKFetcherError
+from cmk.utils.agentdatatype import AgentRawData
+from cmk.utils.hostaddress import HostAddress
 from cmk.utils.log import VERBOSE
-from cmk.utils.type_defs import AgentRawData, HostAddress
 
-from cmk.fetchers import Fetcher, Mode
+from ._abstract import Fetcher, Mode
 
 __all__ = ["IPMICredentials", "IPMIFetcher"]
 
 
+# Keep in sync with cmk.gui.watolib.host_attributes.IPMICredentials
 class IPMICredentials(TypedDict, total=False):
     username: str
     password: str
+
+
+@dataclass(frozen=True)
+class IPMISensor:
+    id: bytes
+    name: bytes
+    type: bytes
+    value: bytes
+    unit: bytes
+    health: bytes
+
+    @classmethod
+    def from_reading(cls, number: int, reading: ipmi_sdr.SensorReading) -> Self:
+        # {'states': [], 'health': 0, 'name': 'CPU1 Temp', 'imprecision': 0.5,
+        #  'units': '\xc2\xb0C', 'state_ids': [], 'type': 'Temperature',
+        #  'value': 25.0, 'unavailable': 0}]]
+        return cls(
+            id=b"%d" % number,
+            name=reading.name.encode("utf-8"),
+            type=reading.type.encode("utf-8"),
+            value=(b"%0.2f" % reading.value) if reading.value else b"N/A",
+            unit=(reading.units.encode("utf-8") if reading.units != b"\xc2\xb0C" else b"C"),
+            health=cls._parse_health_txt(reading),
+        )
+
+    @classmethod
+    def _parse_health_txt(cls, reading: ipmi_sdr.SensorReading) -> bytes:
+        if reading.health >= ipmi_const.Health.Failed:
+            return b"FAILED"
+        if reading.health >= ipmi_const.Health.Critical:
+            return b"CRITICAL"
+        if reading.health >= ipmi_const.Health.Warning:
+            # workaround for pyghmi bug: https://bugs.launchpad.net/pyghmi/+bug/1790120
+            return cls._handle_false_positive_warnings(reading)
+        if reading.health == ipmi_const.Health.Ok:
+            return b"OK"
+        return b"N/A"
+
+    @staticmethod
+    def _handle_false_positive_warnings(reading: ipmi_sdr.SensorReading) -> bytes:
+        """This is a workaround for a pyghmi bug
+        (bug report: https://bugs.launchpad.net/pyghmi/+bug/1790120)
+
+        For some sensors undefined states are looked up, which results in readings of the form
+        {'states': ['Present',
+                    'Unknown state 8 for reading type 111/sensor type 8',
+                    'Unknown state 9 for reading type 111/sensor type 8',
+                    'Unknown state 10 for reading type 111/sensor type 8',
+                    'Unknown state 11 for reading type 111/sensor type 8',
+                    'Unknown state 12 for reading type 111/sensor type 8', ...],
+        'health': 1, 'name': 'PS Status', 'imprecision': None, 'units': '',
+        'state_ids': [552704, 552712, 552713, 552714, 552715, 552716, 552717, 552718],
+        'type': 'Power Supply', 'value': None, 'unavailable': 0}
+
+        The health warning is set, but only due to the lookup errors. We remove the lookup
+        errors, and see whether the remaining states are meaningful.
+        """
+        # just keep all the available info. It should be dealt with in
+        # ipmi_sensors.include (freeipmi_status_txt_mapping),
+        # where it will default to 2(CRIT)
+        return (
+            b", ".join(
+                s.encode("utf-8") for s in reading.states if not s.startswith("Unknown state ")
+            )
+            or b"no state reported"
+        )
 
 
 class IPMIFetcher(Fetcher[AgentRawData]):
@@ -52,10 +121,11 @@ class IPMIFetcher(Fetcher[AgentRawData]):
         username: str | None,
         password: str | None,
     ) -> None:
-        super().__init__(logger=logging.getLogger("cmk.helper.ipmi"))
+        super().__init__()
         self.address: Final = address
         self.username: Final = username
         self.password: Final = password
+        self._logger: Final = logging.getLogger("cmk.helper.ipmi")
         self._command: ipmi_cmd.Command | None = None
 
     def __repr__(self) -> str:
@@ -71,20 +141,19 @@ class IPMIFetcher(Fetcher[AgentRawData]):
             + ")"
         )
 
-    @classmethod
-    def _from_json(cls, serialized: Mapping[str, Any]) -> IPMIFetcher:
-        return cls(**copy.deepcopy(dict(serialized)))
-
-    def to_json(self) -> Mapping[str, Any]:
-        return {
-            "address": self.address,
-            "username": self.username,
-            "password": self.password,
-        }
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, IPMIFetcher):
+            return False
+        return (
+            self.address == other.address
+            and self.username == other.username
+            and self.password == other.password
+        )
 
     def _fetch_from_io(self, mode: Mode) -> AgentRawData:
+        self._logger.log(VERBOSE, "Get IPMI data")
         if self._command is None:
-            raise MKFetcherError("Not connected")
+            raise OSError(errno.ENOTCONN, os.strerror(errno.ENOTCONN))
 
         return AgentRawData(b"" + self._sensors_section() + self._firmware_section())
 
@@ -122,7 +191,7 @@ class IPMIFetcher(Fetcher[AgentRawData]):
         # initialize a new session every cycle.
         # We also don't want to reuse sockets or other things from previous calls.
 
-        import pyghmi.ipmi.private.session as ipmi_session  # type: ignore[import]
+        import pyghmi.ipmi.private.session as ipmi_session
 
         ipmi_session.iothread.join()
         ipmi_session.iothread = None
@@ -146,7 +215,7 @@ class IPMIFetcher(Fetcher[AgentRawData]):
 
     def _sensors_section(self) -> AgentRawData:
         if self._command is None:
-            raise MKFetcherError("Not connected")
+            raise OSError(errno.ENOTCONN, os.strerror(errno.ENOTCONN))
 
         self._logger.debug("Fetching sensor data via UDP from %s:623", self._command.bmc)
 
@@ -170,40 +239,46 @@ class IPMIFetcher(Fetcher[AgentRawData]):
             if "error" in rsp:
                 continue
 
-            reading = sensor.decode_sensor_reading(rsp["data"])
+            reading = sensor.decode_sensor_reading(self._command, rsp["data"])
             if reading is not None:
                 # sometimes (wrong) data for GPU sensors is reported, even if
                 # not installed
                 if "GPU" in reading.name and has_no_gpu:
                     continue
-                sensors.append(self._parse_sensor_reading(sensor.sensor_number, reading))
+                self._logger.debug("Raw reading states of %s: %s", reading.name, reading.states)
+                sensors.append(IPMISensor.from_reading(sensor.sensor_number, reading))
 
         return AgentRawData(
             b"<<<ipmi_sensors:sep(124)>>>\n"
-            + b"".join(b"|".join(sensor) + b"\n" for sensor in sensors)
+            + b"".join(self._make_line(astuple(sensor)) for sensor in sensors)
         )
 
     def _firmware_section(self) -> AgentRawData:
         if self._command is None:
-            raise MKFetcherError("Not connected")
+            raise OSError(errno.ENOTCONN, os.strerror(errno.ENOTCONN))
 
         self._logger.debug("Fetching firmware information via UDP from %s:623", self._command.bmc)
         try:
             firmware_entries = self._command.get_firmware()
+        except MKTimeout:
+            raise
         except Exception as e:
             self._logger.log(VERBOSE, "Failed to fetch firmware information: %r", e)
             self._logger.debug("Exception", exc_info=True)
             return AgentRawData(b"")
 
-        output = b"<<<ipmi_firmware:sep(124)>>>\n"
-        for entity_name, attributes in firmware_entries:
-            for attribute_name, value in attributes.items():
-                output += b"|".join(
-                    str(f).encode("utf8") for f in (entity_name, attribute_name, value)
-                )
-                output += b"\n"
+        return AgentRawData(
+            b"<<<ipmi_firmware:sep(124)>>>\n"
+            + b"".join(
+                self._make_line(str(f).encode("utf8") for f in (entity_name, attribute_name, value))
+                for entity_name, attributes in firmware_entries
+                for attribute_name, value in attributes.items()
+            )
+        )
 
-        return AgentRawData(output)
+    @staticmethod
+    def _make_line(words: Iterable[bytes]) -> bytes:
+        return b"|".join(words) + b"\n"
 
     def _has_gpu(self) -> bool:
         if self._command is None:
@@ -213,6 +288,8 @@ class IPMIFetcher(Fetcher[AgentRawData]):
         self._logger.debug("Fetching inventory information via UDP from %s:623", self._command.bmc)
         try:
             inventory_entries = self._command.get_inventory_descriptions()
+        except MKTimeout:
+            raise
         except Exception as e:
             self._logger.log(VERBOSE, "Failed to fetch inventory information: %r", e)
             self._logger.debug("Exception", exc_info=True)
@@ -221,64 +298,3 @@ class IPMIFetcher(Fetcher[AgentRawData]):
             return True
 
         return any("GPU" in line for line in inventory_entries)
-
-    def _parse_sensor_reading(
-        self, number: int, reading: ipmi_sdr.SensorReading
-    ) -> list[AgentRawData]:
-        # {'states': [], 'health': 0, 'name': 'CPU1 Temp', 'imprecision': 0.5,
-        #  'units': '\xc2\xb0C', 'state_ids': [], 'type': 'Temperature',
-        #  'value': 25.0, 'unavailable': 0}]]
-        health_txt = b"N/A"
-        if reading.health >= ipmi_const.Health.Failed:
-            health_txt = b"FAILED"
-        elif reading.health >= ipmi_const.Health.Critical:
-            health_txt = b"CRITICAL"
-        elif reading.health >= ipmi_const.Health.Warning:
-            # workaround for pyghmi bug: https://bugs.launchpad.net/pyghmi/+bug/1790120
-            health_txt = self._handle_false_positive_warnings(reading)
-        elif reading.health == ipmi_const.Health.Ok:
-            health_txt = b"OK"
-        # ? would that be correct: SensorReading.name:str, SensorReading.type:str, SensorReading.units: bytes/str ?
-        return [
-            AgentRawData(_)
-            for _ in (
-                b"%d" % number,
-                ensure_binary(reading.name),  # pylint: disable= six-ensure-str-bin-call
-                ensure_binary(reading.type),  # pylint: disable= six-ensure-str-bin-call
-                (b"%0.2f" % reading.value) if reading.value else b"N/A",
-                ensure_binary(reading.units)  # pylint: disable= six-ensure-str-bin-call
-                if reading.units != b"\xc2\xb0C"
-                else b"C",
-                health_txt,
-            )
-        ]
-
-    def _handle_false_positive_warnings(self, reading: ipmi_sdr.SensorReading) -> AgentRawData:
-        """This is a workaround for a pyghmi bug
-        (bug report: https://bugs.launchpad.net/pyghmi/+bug/1790120)
-
-        For some sensors undefined states are looked up, which results in readings of the form
-        {'states': ['Present',
-                    'Unknown state 8 for reading type 111/sensor type 8',
-                    'Unknown state 9 for reading type 111/sensor type 8',
-                    'Unknown state 10 for reading type 111/sensor type 8',
-                    'Unknown state 11 for reading type 111/sensor type 8',
-                    'Unknown state 12 for reading type 111/sensor type 8', ...],
-        'health': 1, 'name': 'PS Status', 'imprecision': None, 'units': '',
-        'state_ids': [552704, 552712, 552713, 552714, 552715, 552716, 552717, 552718],
-        'type': 'Power Supply', 'value': None, 'unavailable': 0}
-
-        The health warning is set, but only due to the lookup errors. We remove the lookup
-        errors, and see whether the remaining states are meaningful.
-        """
-        self._logger.debug("Raw reading states of %s: %s", reading.name, reading.states)
-
-        states = [s.encode("utf-8") for s in reading.states if not s.startswith("Unknown state ")]
-
-        if not states:
-            return AgentRawData(b"no state reported")
-
-        # just keep all the available info. It should be dealt with in
-        # ipmi_sensors.include (freeipmi_status_txt_mapping),
-        # where it will default to 2(CRIT)
-        return AgentRawData(b", ".join(states))

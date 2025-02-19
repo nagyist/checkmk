@@ -2,13 +2,16 @@
 # Copyright (C) 2021 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
+
 import collections
 import typing
+from collections.abc import Mapping, Sequence
+from functools import cached_property
+from typing import cast, Self
 
 from apispec.ext.marshmallow import common
 from marshmallow import (
     EXCLUDE,
-    fields,
     INCLUDE,
     post_dump,
     post_load,
@@ -18,7 +21,9 @@ from marshmallow import (
     utils,
     ValidationError,
 )
-from marshmallow.base import SchemaABC
+from marshmallow import (
+    fields as ma_fields,
+)
 from marshmallow.decorators import POST_DUMP, POST_LOAD, PRE_DUMP, pre_dump, PRE_LOAD
 from marshmallow.error_store import ErrorStore
 
@@ -28,12 +33,8 @@ from cmk.fields import base
 class BaseSchema(Schema):
     """The Base Schema for all request and response schemas."""
 
-    class Meta:
-        """Holds configuration for marshmallow"""
-
-        ordered = True  # we want to have documentation in definition-order
-
     cast_to_dict: bool = False
+    schema_example: dict[str, typing.Any] | None = None
 
     # Marshmallow removed dump-validation starting from 3.0.0rc9. When we want to verify we don't
     # try to dump (superfluous fields are filtered anyway) we need to do it ourselves.
@@ -42,6 +43,17 @@ class BaseSchema(Schema):
     @property
     def dict_class(self) -> type:
         return dict
+
+    context: dict[typing.Any, typing.Any] = {}
+
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ):
+        context = kwargs.pop("context", {})
+        super().__init__(*args, **kwargs)
+        self.context = context
 
     @post_load(pass_many=True)
     @post_dump(pass_many=True)
@@ -77,6 +89,27 @@ class BaseSchema(Schema):
 
         return data
 
+    @classmethod
+    def from_dict(
+        cls,
+        fields: dict[str, ma_fields.Field],
+        *,
+        name: str = "GeneratedSchema",
+    ) -> type[Self]:
+        """Create a new schema class from a dictionary of fields.
+
+        Since the `from_dict` function returns a new type that inherits from the class from which
+        it was called but the return type hint is `type[Schema]` it is necessary to set the type
+        accordingly.
+
+        Another alternative evaluated in order to avoid calling `cast` was to duplicate the
+        function body and adjust the return type hint, but this would have implied that future
+        changes to the base function would not be immediately reflected.
+        """
+
+        schema_cls = super().from_dict(fields, name=name)
+        return cast(type[Self], schema_cls)
+
 
 class FieldWrapper:
     """Wrapper for marshmallow fields.
@@ -88,7 +121,7 @@ class FieldWrapper:
     registered as attributes.
     """
 
-    def __init__(self, field: fields.Field) -> None:
+    def __init__(self, field: ma_fields.Field) -> None:
         self.field = field
 
 
@@ -104,7 +137,7 @@ class ValueTypedDictSchema(BaseSchema):
     value_type: type[Schema] | FieldWrapper
 
     @classmethod
-    def field(cls, field: fields.Field) -> FieldWrapper:
+    def field(cls, field: ma_fields.Field) -> FieldWrapper:
         return FieldWrapper(field)
 
     def _convert_with_schema(self, data, schema_func):
@@ -113,7 +146,9 @@ class ValueTypedDictSchema(BaseSchema):
             result[key] = schema_func(value)
         return result
 
-    def _serialize_field(self, data, field: fields.Field):  # type: ignore[no-untyped-def]
+    def _serialize_field(
+        self, data: Mapping[str, object], field: ma_fields.Field
+    ) -> dict[str, object]:
         result = {}
         for key, value in data.items():
             try:
@@ -126,7 +161,9 @@ class ValueTypedDictSchema(BaseSchema):
                 raise ValidationError(str(exc), field_name=key)
         return result
 
-    def _deserialize_field(self, data, field: fields.Field):  # type: ignore[no-untyped-def]
+    def _deserialize_field(
+        self, data: Mapping[str, object], field: ma_fields.Field
+    ) -> dict[str, object]:
         result = {}
         for key, value in data.items():
             try:
@@ -137,7 +174,7 @@ class ValueTypedDictSchema(BaseSchema):
         return result
 
     def load(self, data, *, many=None, partial=None, unknown=None):
-        if self._has_processors(PRE_LOAD):
+        if self._hooks[PRE_LOAD]:
             data = self._invoke_load_processors(
                 PRE_LOAD, data, many=many, original_data=data, partial=partial
             )
@@ -148,7 +185,7 @@ class ValueTypedDictSchema(BaseSchema):
         if isinstance(self.value_type, FieldWrapper):
             result = self._serialize_field(data, field=self.value_type.field)
         elif isinstance(self.value_type, BaseSchema) or (
-            isinstance(self.value_type, type) and issubclass(self.value_type, SchemaABC)
+            isinstance(self.value_type, type) and issubclass(self.value_type, Schema)
         ):
             schema = common.resolve_schema_instance(self.value_type)
             result = self._convert_with_schema(data, schema_func=schema.load)
@@ -157,7 +194,7 @@ class ValueTypedDictSchema(BaseSchema):
                 f"Data type is not known: {type(self.value_type)} {self.value_type}"
             )
 
-        if self._has_processors(POST_LOAD):
+        if self._hooks[POST_LOAD]:
             result = self._invoke_load_processors(
                 POST_LOAD,
                 result,
@@ -168,27 +205,45 @@ class ValueTypedDictSchema(BaseSchema):
 
         return result
 
-    def dump(self, obj: typing.Any, *, many=None):  # type: ignore[no-untyped-def]
-        if self._has_processors(PRE_DUMP):
+    def dump(self, obj: typing.Any, *, many: bool | None = None) -> object:
+        many = self.many if many is None else bool(many)
+        if self._hooks[PRE_DUMP]:
             obj = self._invoke_dump_processors(PRE_DUMP, obj, many=many, original_data=obj)
 
         if isinstance(self.value_type, FieldWrapper):
             result = self._deserialize_field(obj, field=self.value_type.field)
         elif isinstance(self.value_type, BaseSchema) or (
-            isinstance(self.value_type, type) and issubclass(self.value_type, SchemaABC)
+            isinstance(self.value_type, type) and issubclass(self.value_type, Schema)
         ):
             schema = common.resolve_schema_instance(self.value_type)
             result = self._convert_with_schema(obj, schema_func=schema.dump)
         else:
             raise ValidationError(f"Data type is not known: {type(obj)}")
 
-        if self._has_processors(POST_DUMP):
+        if self._hooks[POST_DUMP]:
             result = self._invoke_dump_processors(POST_DUMP, result, many=many, original_data=obj)
 
         return result
 
 
-class MultiNested(base.OpenAPIAttributes, fields.Field):
+class LazySequence(Sequence):
+    """Calculates the items of the list on first access"""
+
+    def __init__(self, compute_items: typing.Callable[[], list[Schema]]) -> None:
+        self._compute_items = compute_items
+
+    @cached_property
+    def _items(self) -> list[Schema]:
+        return self._compute_items()
+
+    def __getitem__(self, i):
+        return self._items[i]
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+class MultiNested(base.OpenAPIAttributes, ma_fields.Field):
     """Combine many distinct models under one overarching model
 
     Standard behaviour is to only allow one of the sub-model to be true at the same time, i.e.
@@ -213,13 +268,13 @@ class MultiNested(base.OpenAPIAttributes, fields.Field):
 
         >>> class Schema1(BaseSchema):
         ...     cast_to_dict = True
-        ...     required1 = fields.String(required=True)
-        ...     optional1 = fields.String()
+        ...     required1 = ma_fields.String(required=True)
+        ...     optional1 = ma_fields.String()
 
         >>> class Schema2(BaseSchema):
         ...     cast_to_dict = True
-        ...     required2 = fields.String(required=True)
-        ...     optional2 = fields.String()
+        ...     required2 = ma_fields.String(required=True)
+        ...     optional2 = ma_fields.String()
         ...
         ...     @post_load
         ...     def _valid(self, data, **kwargs):
@@ -238,8 +293,8 @@ class MultiNested(base.OpenAPIAttributes, fields.Field):
     a Union type.
 
         >>> nested = Entries()
-        >>> nested.declared_fields['entries'].metadata
-        {'anyOf': [<Schema1(many=False)>, <Schema2(many=False)>]}
+        >>> list(nested.declared_fields['entries'].metadata["anyOf"])
+        [<Schema1(many=False)>, <Schema2(many=False)>]
 
     When serializing and deserializing, we can use either model in our collections.
 
@@ -334,7 +389,7 @@ required field.'], 'something': ['Unknown field.']}
 
             >>> class DumpOnly(BaseSchema):
             ...     cast_to_dict = True
-            ...     dump_only = fields.String(dump_only=True)
+            ...     dump_only = ma_fields.String(dump_only=True)
 
             >>> class WithDumpOnly(BaseSchema):
             ...      cast_to_dict = True
@@ -355,7 +410,7 @@ required field.'], 'something': ['Unknown field.']}
 
         When merging, all keys can only occur once:
 
-            >>> MultiNested([Schema1(), Schema1()], merged=True)
+            >>> MultiNested([Schema1(), Schema1()], merged=True).deserialize({})
             Traceback (most recent call last):
             ...
             RuntimeError: Schemas [<Schema1(many=False)>, <Schema1(many=False)>] are not disjoint. \
@@ -417,12 +472,12 @@ Keys 'optional1', 'required1' occur more than once.
 
     Result = dict[str, typing.Any]
 
-    def __init__(  # type: ignore[no-untyped-def]
+    def __init__(
         self,
-        nested: typing.Sequence[type[Schema] | Schema],
+        nested: typing.Sequence[type[Schema] | Schema | typing.Callable[[], type[Schema]]],
         mode: typing.Literal["anyOf", "allOf"] = "anyOf",
         *,
-        default: typing.Any = fields.missing_,
+        default: typing.Any = ma_fields.missing_,  # type: ignore[attr-defined, unused-ignore]
         only: types.StrSequenceOrSet | None = None,
         exclude: types.StrSequenceOrSet = (),
         many: bool = False,
@@ -435,8 +490,10 @@ Keys 'optional1', 'required1' occur more than once.
         # For this we assume the schema is always symmetrical (i.e. a round trip is
         # idempotent) to get at the original keys. If this is not true, there may be bugs.
         merged: bool = False,
-        **kwargs,
+        **kwargs: typing.Any,
     ):
+        super().__init__(default=default, **kwargs)
+
         if unknown is not None:
             raise ValueError("unknown is not supported for MultiNested")
 
@@ -446,39 +503,14 @@ Keys 'optional1', 'required1' occur more than once.
         if mode != "anyOf":
             raise NotImplementedError("allOf is not yet implemented.")
 
-        metadata = kwargs.pop("metadata", {})
-        context = getattr(self.parent, "context", {})
-        context.update(metadata.get("context", {}))
+        self._context = getattr(self.parent, "context", {})
+        self._context.update(self.metadata.get("context", {}))
 
-        self._nested = []
-        schema_inst: Schema
-        for schema in nested:
-            schema_inst = common.resolve_schema_instance(schema)
-            schema_inst.context.update(context)
-            if not self._has_fields(schema_inst):
-                # NOTE
-                # We want all values to be included in the result, even if the schema hasn't
-                # defined any fields on it. This is, because these schemas are used to validate
-                # through the hooks @post_load, @pre_dump, etc.
-                schema_inst.unknown = INCLUDE
+        self._nested_args = nested
 
-            self._nested.append(schema_inst)
-
-        metadata["anyOf"] = self._nested
-
-        # We need to check that the key names of all schemas are completely disjoint, because
-        # we can't represent multiple schemas with the same key in merge-mode.
-        if merged:
-            set1: set[str] = set()
-            for schema_inst in self._nested:
-                keys = set(schema_inst.declared_fields.keys())
-                if not set1.isdisjoint(keys):
-                    wrong_keys = ", ".join(repr(key) for key in sorted(set1.intersection(keys)))
-                    raise RuntimeError(
-                        f"Schemas {self._nested} are not disjoint. "
-                        f"Keys {wrong_keys} occur more than once."
-                    )
-                set1.update(keys)
+        # We must not evaluate self._nested now, but can only hand over a list like object to
+        # marshmallow. So we use a small helper to do the late evaluation for us.
+        self.metadata["anyOf"] = LazySequence(lambda: self._nested)
 
         self.mode = mode
         self.only = only
@@ -488,7 +520,40 @@ Keys 'optional1', 'required1' occur more than once.
         # When we are merging, we don't want to have errors due to cross-schema validation.
         # When we operate in standard mode, we really want to know these errors.
         self.unknown = EXCLUDE if self.merged else RAISE
-        super().__init__(default=default, metadata=metadata, **kwargs)
+
+    @cached_property
+    def _nested(self) -> list[Schema]:
+        nested = []
+        schema_inst: Schema
+        for schema in self._nested_args:
+            if callable(schema):
+                schema = schema()
+            schema_inst = common.resolve_schema_instance(schema)
+            schema_inst.context.update(self._context)
+            if not self._has_fields(schema_inst):
+                # NOTE
+                # We want all values to be included in the result, even if the schema hasn't
+                # defined any fields on it. This is, because these schemas are used to validate
+                # through the hooks @post_load, @pre_dump, etc.
+                schema_inst.unknown = INCLUDE
+
+            nested.append(schema_inst)
+
+        # We need to check that the key names of all schemas are completely disjoint, because
+        # we can't represent multiple schemas with the same key in merge-mode.
+        if self.merged:
+            set1: set[str] = set()
+            for schema_inst in nested:
+                keys = set(schema_inst.declared_fields.keys())
+                if not set1.isdisjoint(keys):
+                    wrong_keys = ", ".join(repr(key) for key in sorted(set1.intersection(keys)))
+                    raise RuntimeError(
+                        f"Schemas {nested} are not disjoint. "
+                        f"Keys {wrong_keys} occur more than once."
+                    )
+                set1.update(keys)
+
+        return nested
 
     def _nested_schemas(self) -> list[Schema]:
         return self._nested + [MultiNested.ValidateOnDump(unknown=RAISE)]
@@ -556,12 +621,12 @@ Keys 'optional1', 'required1' occur more than once.
 
         return rv
 
-    def _serialize(  # type: ignore[no-untyped-def]
+    def _serialize(
         self,
         value: typing.Any,
         attr: str | None,
         obj: typing.Any,
-        **kwargs,
+        **kwargs: typing.Any,
     ) -> Result | list[Result]:
         result: typing.Any
         error_store = ErrorStore()
@@ -590,14 +655,14 @@ Keys 'optional1', 'required1' occur more than once.
 
         return result
 
-    def _make_type_error(self, value) -> ValidationError:  # type: ignore[no-untyped-def]
+    def _make_type_error(self, value: object) -> ValidationError:
         return self.make_error(
             "type",
             input=value,
             type=value.__class__.__name__,
         )
 
-    def _load_schemas(  # pylint: disable=too-many-branches
+    def _load_schemas(
         self, scalar: Result, partial: bool | typing.Sequence[str] | set[str] | None = None
     ) -> Result:
         rv = {}
@@ -629,9 +694,6 @@ Keys 'optional1', 'required1' occur more than once.
                         if key in value:
                             del value[key]
                 except ValidationError as exc:
-                    for key in schema_inst.declared_fields:
-                        if key in value and key not in exc.messages:
-                            del value[key]
                     self._add_error(error_store, exc.messages)
                     continue
 
@@ -670,14 +732,14 @@ Keys 'optional1', 'required1' occur more than once.
                 del error_store.errors[key]
         return result
 
-    def _deserialize(  # type: ignore[no-untyped-def]
+    def _deserialize(
         self,
         value: Result | list[Result],
         attr: str | None,
         data: typing.Mapping[str, typing.Any] | None,
-        **kwargs,
+        **kwargs: typing.Any,
     ) -> Result | list[Result]:
-        if isinstance(value, list):  # pylint: disable=no-else-return
+        if isinstance(value, list):
             if self.many:
                 result = []
                 for collection_entry in value:

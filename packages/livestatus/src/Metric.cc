@@ -7,11 +7,11 @@
 
 #include <fstream>
 #include <regex>
-#include <sstream>
 
 #include "livestatus/Logger.h"
 
 namespace {
+// NOLINTNEXTLINE(cert-err58-cpp)
 const std::regex label_regex{
     R"(\s+<LABEL>(.+)</LABEL>)",
     std::regex_constants::ECMAScript | std::regex_constants::icase};
@@ -42,4 +42,12 @@ Metric::Names scan_rrd(const std::filesystem::path &basedir,
         Warning(logger) << ge;
     }
     return names;
+}
+
+double Metric::value_as_double() const {
+    try {
+        return std::stod(value());
+    } catch (...) {
+        return 0.0;
+    }
 }

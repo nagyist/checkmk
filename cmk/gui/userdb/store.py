@@ -13,47 +13,52 @@ import traceback
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, cast, Literal, TypeVar
 
-from six import ensure_str
-
-import cmk.utils.paths
-from cmk.utils.crypto import password_hashing
-from cmk.utils.crypto.password import Password, PasswordHash
-from cmk.utils.crypto.secrets import AutomationUserSecret
-from cmk.utils.paths import htpasswd_file, var_dir
-from cmk.utils.store import (
+from cmk.ccc.store import (
     acquire_lock,
     load_from_mk_file,
     load_text_from_file,
     mkdir,
+    release_lock,
     save_text_to_file,
     save_to_mk_file,
 )
-from cmk.utils.type_defs import ContactgroupName, UserId
 
-import cmk.gui.hooks as hooks
+import cmk.utils.paths
+from cmk.utils.local_secrets import AutomationUserSecret
+from cmk.utils.paths import htpasswd_file, var_dir
+from cmk.utils.user import UserId
+
 import cmk.gui.pages
-import cmk.gui.utils as utils
+from cmk.gui import hooks, utils
 from cmk.gui.config import active_config
 from cmk.gui.hooks import request_memoize
 from cmk.gui.htmllib.html import html
 from cmk.gui.i18n import _
-from cmk.gui.plugins.userdb.utils import (
-    active_connections,
-    add_internal_attributes,
-    get_connection,
-    get_user_attributes,
-    load_cached_profile,
-    release_users_lock,
-    save_cached_profile,
-    UserConnector,
+from cmk.gui.logged_in import LoggedInUser, save_user_file
+from cmk.gui.type_defs import (
+    SessionInfo,
+    TwoFactorCredentials,
+    UserContactDetails,
+    UserDetails,
+    Users,
+    UserSpec,
 )
-from cmk.gui.type_defs import SessionInfo, TwoFactorCredentials, Users, UserSpec
-from cmk.gui.userdb.htpasswd import Htpasswd
-from cmk.gui.utils.roles import roles_of_user
+from cmk.gui.utils.htpasswd import Htpasswd
+from cmk.gui.utils.roles import AutomationUserFile, roles_of_user
+
+from cmk.crypto import password_hashing
+from cmk.crypto.password import Password
+
+from ._connections import active_connections, get_connection
+from ._connector import UserConnector
+from ._user_attribute import get_user_attributes
+from ._user_spec import add_internal_attributes
 
 T = TypeVar("T")
+
+_ContactgroupName = str
 
 
 def load_custom_attr(
@@ -63,7 +68,27 @@ def load_custom_attr(
     parser: Callable[[str], T],
     lock: bool = False,
 ) -> T | None:
-    result = load_text_from_file(Path(custom_attr_path(user_id, key)), lock=lock)
+    """This function can be called thousands of times during a single request
+    The load_text_from_file adds additional overhead(cpu load) that is not required
+    for simple read-only operations.
+    In addition to providing the data, the task of this function is to check whether
+    load_text_from_file can be replaced by a simpler operation
+    """
+    attr_path = custom_attr_path(user_id, key)
+    if not os.path.exists(attr_path):
+        return None
+
+    if lock:
+        result = load_text_from_file(Path(attr_path), lock=lock)
+    else:
+        # Simpler operation if no lock is required. Does NOT check file permissions
+        # These are only considered critical in case of pickled data
+        # Files in the ~/var/check_mk/web/{username} do and WILL never contain pickled data
+        try:
+            with open(str(attr_path)) as file_object:
+                result = file_object.read()
+        except (FileNotFoundError, OSError):
+            return None
     return None if result == "" else parser(result.strip())
 
 
@@ -93,8 +118,24 @@ def _multisite_dir() -> str:
     return cmk.utils.paths.default_config_dir + "/multisite.d/wato/"
 
 
+def get_authserials_lines() -> list[str]:
+    authserials_path = Path(cmk.utils.paths.htpasswd_file).with_name("auth.serials")
+    if not authserials_path.exists():
+        return []
+    with authserials_path.open(encoding="utf-8") as f:
+        return f.readlines()
+
+
+def load_users_uncached(lock: bool = False) -> Users:
+    return _load_users(lock)
+
+
 @request_memoize()
-def load_users(lock: bool = False) -> Users:  # pylint: disable=too-many-branches
+def load_users(lock: bool = False) -> Users:
+    return _load_users(lock)
+
+
+def _load_users(lock: bool = False) -> Users:
     if lock:
         # Note: the lock will be released on next save_users() call or at
         #       end of page request automatically.
@@ -112,30 +153,19 @@ def load_users(lock: bool = False) -> Users:  # pylint: disable=too-many-branche
 
     # Merge them together. Monitoring users not known to Multisite
     # will be added later as normal users.
-    result = {}
-    for uid, user in users.items():
-        # Transform user IDs which were stored with a wrong type
-        uid = ensure_str(uid)  # pylint: disable= six-ensure-str-bin-call
-
-        profile = contacts.get(uid, {})
-        profile.update(user)
-        result[UserId(uid)] = profile
-
-        # Convert non unicode mail addresses
-        if "email" in profile:
-            profile["email"] = ensure_str(  # pylint: disable= six-ensure-str-bin-call
-                profile["email"]
-            )
+    result: Users = _merge_users_and_contacts(users, contacts)
 
     # This loop is only necessary if someone has edited
     # contacts.mk manually. But we want to support that as
     # far as possible.
     for uid, contact in contacts.items():
         if (uid := UserId(uid)) not in result:
-            result[uid] = contact
+            # making the use of cast since we are handling a legacy support case
+            user_profile: UserSpec = cast(UserSpec, contact)
+            result[uid] = user_profile
             result[uid]["roles"] = ["user"]
             result[uid]["locked"] = True
-            result[uid]["password"] = PasswordHash("")
+            result[uid]["password"] = password_hashing.PasswordHash("")
 
     # Passwords are read directly from the apache htpasswd-file.
     # That way heroes of the command line will still be able to
@@ -144,42 +174,11 @@ def load_users(lock: bool = False) -> Users:  # pylint: disable=too-many-branche
     # they are getting according to the multisite old-style
     # configuration variables.
 
-    htpwd_entries = Htpasswd(Path(cmk.utils.paths.htpasswd_file)).load(allow_missing_file=True)
-    for uid, password in htpwd_entries.items():
-        if password.startswith("!"):
-            locked = True
-            password = PasswordHash(password[1:])
-        else:
-            locked = False
-
-        if uid in result:
-            result[uid]["password"] = password
-            result[uid]["locked"] = locked
-        else:
-            # Create entry if this is an admin user
-            new_user = UserSpec(
-                roles=roles_of_user(uid),
-                password=password,
-                locked=False,
-                connector="htpasswd",
-            )
-
-            add_internal_attributes(new_user)
-
-            result[uid] = new_user
-        # Make sure that the user has an alias
-        result[uid].setdefault("alias", uid)
+    result = _add_passwords(result)
 
     # Now read the serials, only process for existing users
-    serials_file = Path(cmk.utils.paths.htpasswd_file).with_name("auth.serials")
-    try:
-        for line in serials_file.read_text(encoding="utf-8").splitlines():
-            if ":" in line:
-                user_id, serial = line.split(":")[:2]
-                if (user_id := UserId(user_id)) in result:
-                    result[user_id]["serial"] = utils.saveint(serial)
-    except OSError:  # file not found
-        pass
+
+    result = _add_serials(result)
 
     attributes: list[
         tuple[
@@ -194,6 +193,8 @@ def load_users(lock: bool = False) -> Users:  # pylint: disable=too-many-branche
                 "ui_theme",
                 "two_factor_credentials",
                 "ui_sidebar_position",
+                "ui_saas_onboarding_button_toggle",
+                "last_login",
             ],
             Callable,
         ]
@@ -207,6 +208,8 @@ def load_users(lock: bool = False) -> Users:  # pylint: disable=too-many-branche
         ("ui_theme", lambda x: x),
         ("two_factor_credentials", ast.literal_eval),
         ("ui_sidebar_position", lambda x: None if x == "None" else x),
+        ("ui_saas_onboarding_button_toggle", lambda x: None if x == "None" else x),
+        ("last_login", ast.literal_eval),
     ]
 
     # Now read the user specific files
@@ -215,29 +218,92 @@ def load_users(lock: bool = False) -> Users:  # pylint: disable=too-many-branche
             continue
 
         uid = UserId(user_dir)
+        if uid not in result:
+            continue
 
         # read special values from own files
-        if uid in result:
-            for attr, conv_func in attributes:
-                val = load_custom_attr(user_id=uid, key=attr, parser=conv_func)
-                if val is not None:
-                    result[uid][attr] = val
+        for attr, conv_func in attributes:
+            val = load_custom_attr(user_id=uid, key=attr, parser=conv_func)
+            if val is not None:
+                result[uid][attr] = val
 
-        # read automation secrets and add them to existing users or create new users automatically
-        try:
-            secret = AutomationUserSecret(uid).read()
-            if uid not in result:
-                # new guest automation user
-                result[uid] = {"roles": ["guest"]}
-
-            result[uid]["automation_secret"] = secret
-        except OSError:
-            # no secret; nothing to do
-            pass
-        # Empty secret files will raise a value error that we don't want to ignore here. Otherwise
-        # checking if a user is an automation user via existence of the file will go wrong.
+        result[uid]["store_automation_secret"] = AutomationUserSecret(uid).exists()
+        # The AutomationUserFile was added with 2.4. Previously the info to decide if a user is an
+        # automation user was the automation secret. Instead of creating an update action let's
+        # check both.
+        result[uid]["is_automation_user"] = (
+            AutomationUserSecret(uid).exists() or AutomationUserFile(uid).load()
+        )
 
     return result
+
+
+def _merge_users_and_contacts(
+    users: dict[str, UserDetails], contacts: dict[str, UserContactDetails]
+) -> Users:
+    result: Users = {}
+    for uid, user in users.items():
+        profile: dict[str, object] = {}
+        if (contact := contacts.get(uid)) is not None:
+            profile.update(contact)
+
+        profile.update(user)
+
+        # Convert non unicode mail addresses
+        if "email" in profile:
+            # TODO: according to UserDetails & UserContactDetails, email can only come from
+            #  UserContactDetails. We keep this just in case UserDetails is incomplete and perform
+            #  the cast to str. Once verified, the condition can be switched to
+            #  `if "email" in contact`.
+            email = cast(str, profile["email"])
+            profile["email"] = email
+
+        # see TODO in UserSpec why the cast is currently necessary
+        result[UserId(uid)] = cast(UserSpec, profile)
+    return result
+
+
+def _add_passwords(users: Users) -> Users:
+    htpwd_entries = Htpasswd(Path(cmk.utils.paths.htpasswd_file)).load(allow_missing_file=True)
+    for uid, password in htpwd_entries.items():
+        if password.startswith("!"):
+            locked = True
+            password = password_hashing.PasswordHash(password[1:])
+        else:
+            locked = False
+
+        if uid in users:
+            users[uid]["password"] = password
+            users[uid]["locked"] = locked
+        else:
+            # Create entry if this is an admin user
+            new_user = UserSpec(
+                roles=roles_of_user(uid),
+                password=password,
+                locked=False,
+                connector="htpasswd",
+            )
+
+            add_internal_attributes(new_user)
+
+            users[uid] = new_user
+        # Make sure that the user has an alias
+        users[uid].setdefault("alias", uid)
+    return users
+
+
+def _add_serials(users: Users) -> Users:
+    serials_file = Path(cmk.utils.paths.htpasswd_file).with_name("auth.serials")
+    try:
+        for line in serials_file.read_text(encoding="utf-8").splitlines():
+            if ":" in line:
+                user_id, serial = line.split(":")[:2]
+                if (user_id := UserId(user_id)) in users:
+                    users[user_id]["serial"] = utils.saveint(serial)
+    except OSError:  # file not found
+        pass
+
+    return users
 
 
 def remove_custom_attr(userid: UserId, key: str) -> None:
@@ -258,6 +324,34 @@ def get_online_user_ids(now: datetime) -> list[UserId]:
 
 def get_last_activity(user: UserSpec) -> int:
     return max([s.last_activity for s in user.get("session_info", {}).values()] + [0])
+
+
+def get_last_seen(user: UserSpec) -> tuple[int, str]:
+    """
+    The function returns information about the last activity of a user.
+    For those users who log in to the website, the information is obtained
+    from their active sessions. In the case of REST API authentication,
+    the last_login custom attribute is taken into account.
+
+    As a user can authenticate using both methods, this function obtains
+    information from both sources and returns the most recent one.
+    """
+
+    timestamp = 0
+    auth_type = ""
+
+    for s in user.get("session_info", {}).values():
+        if s.last_activity > timestamp:
+            timestamp = s.last_activity
+            auth_type = "" if s.auth_type is None else s.auth_type
+
+    if ((last_login_info := user.get("last_login")) is not None) and last_login_info[
+        "timestamp"
+    ] > timestamp:
+        timestamp = last_login_info["timestamp"]
+        auth_type = last_login_info["auth_type"]
+
+    return timestamp, auth_type
 
 
 def split_dict(d: Mapping[str, Any], keylist: list[str], positive: bool) -> dict[str, Any]:
@@ -296,7 +390,9 @@ def _add_custom_macro_attributes(profiles: Users) -> Users:
 
     # Add custom macros
     core_custom_macros = {
-        name for name, attr in get_user_attributes() if attr.add_custom_macro()  #
+        name
+        for name, attr in get_user_attributes()
+        if attr.add_custom_macro()  #
     }
     for user in updated_profiles.keys():
         for macro in core_custom_macros:
@@ -309,7 +405,7 @@ def _add_custom_macro_attributes(profiles: Users) -> Users:
 
 
 # Write user specific files
-def _save_user_profiles(  # pylint: disable=too-many-branches
+def _save_user_profiles(
     updated_profiles: Users,
     now: datetime,
 ) -> None:
@@ -321,10 +417,12 @@ def _save_user_profiles(  # pylint: disable=too-many-branches
 
         # authentication secret for local processes
         secret = AutomationUserSecret(user_id)
-        if "automation_secret" in user:
+        if user.get("store_automation_secret", False) and "automation_secret" in user:
             secret.save(user["automation_secret"])
-        else:
+        elif not user.get("store_automation_secret", False):
             secret.delete()
+
+        AutomationUserFile(user_id).save(user.get("is_automation_user", False))
 
         # Write out user attributes which are written to dedicated files in the user
         # profile directory. The primary reason to have separate files, is to reduce
@@ -364,6 +462,15 @@ def _save_user_profiles(  # pylint: disable=too-many-branches
         else:
             remove_custom_attr(user_id, "ui_sidebar_position")
 
+        if "ui_saas_onboarding_button_toggle" in user:
+            save_custom_attr(
+                user_id,
+                "ui_saas_onboarding_button_toggle",
+                user["ui_saas_onboarding_button_toggle"],
+            )
+        else:
+            remove_custom_attr(user_id, "ui_saas_onboarding_button_toggle")
+
         _save_cached_profile(user_id, user, multisite_keys, non_contact_keys)
 
 
@@ -394,7 +501,8 @@ def _cleanup_old_user_profiles(updated_profiles: Users) -> None:
 
 
 def write_contacts_and_users_file(
-    profiles: Users, custom_default_config_dir: str | None = None
+    profiles: Users,
+    custom_default_config_dir: str | None = None,
 ) -> None:
     non_contact_keys = _non_contact_keys()
     multisite_keys = _multisite_keys()
@@ -418,7 +526,7 @@ def write_contacts_and_users_file(
 
     # Remove multisite keys in contacts.
     # TODO: Clean this up. Just improved the performance, but still have no idea what its actually doing...
-    contacts = dict(
+    contacts: dict[str, Any] = dict(
         e
         for e in [
             (
@@ -439,7 +547,7 @@ def write_contacts_and_users_file(
     )
 
     # Only allow explicitely defined attributes to be written to multisite config
-    users = {}
+    users: dict[str, Any] = {}
     for uid, profile in updated_profiles.items():
         users[uid] = {
             p: val
@@ -505,12 +613,12 @@ def _multisite_keys() -> list[str]:
     multisite_variables = [
         var
         for var in _get_multisite_custom_variable_names()
-        if var not in ("start_url", "ui_theme", "ui_sidebar_position")
+        if var
+        not in ("start_url", "ui_theme", "ui_sidebar_position", "ui_saas_onboarding_button_toggle")
     ]
     return [
         "roles",
         "locked",
-        "automation_secret",
         "alias",
         "language",
         "connector",
@@ -530,15 +638,19 @@ def _save_auth_serials(updated_profiles: Users) -> None:
     save_text_to_file("%s/auth.serials" % os.path.dirname(cmk.utils.paths.htpasswd_file), serials)
 
 
-def create_cmk_automation_user(now: datetime) -> None:
-    secret = utils.gen_id()
+def create_cmk_automation_user(
+    now: datetime, name: str, alias: str, role: str, store_secret: bool
+) -> None:
+    secret = Password.random(24)
     users = load_users(lock=True)
-    users[UserId("automation")] = {
-        "alias": "Check_MK Automation - used for calling web services",
+    users[UserId(name)] = {
+        "alias": alias,
         "contactgroups": [],
-        "automation_secret": secret,
-        "password": password_hashing.hash_password(Password(secret)),
-        "roles": ["admin"],
+        "automation_secret": secret.raw,
+        "store_automation_secret": store_secret,
+        "is_automation_user": True,
+        "password": password_hashing.hash_password(secret),
+        "roles": [role],
         "locked": False,
         "serial": 0,
         "email": "",
@@ -557,14 +669,21 @@ def _save_cached_profile(
     # infos that are stored in the custom attribute files.
     cache = UserSpec()
     for key in user.keys():
+        if key in ("automation_secret",):
+            # Stripping away sensitive information
+            continue
         if key in multisite_keys or key not in non_contact_keys:
             # UserSpec is now a TypedDict, unfortunately not complete yet, thanks to such constructs.
             cache[key] = user[key]  # type: ignore[literal-required]
 
-    save_cached_profile(user_id, cache)
+    save_user_file("cached_profile", cache, user_id=user_id)
 
 
-def contactgroups_of_user(user_id: UserId) -> list[ContactgroupName]:
+def load_cached_profile(user_id: UserId) -> UserSpec | None:
+    return LoggedInUser(user_id).load_file("cached_profile", None)
+
+
+def contactgroups_of_user(user_id: UserId) -> list[_ContactgroupName]:
     return load_user(user_id).get("contactgroups", [])
 
 
@@ -575,7 +694,7 @@ def convert_idle_timeout(value: str) -> int | bool | None:
         return None  # Invalid value -> use global setting
 
 
-def load_contacts() -> dict[str, Any]:
+def load_contacts() -> dict[str, UserContactDetails]:
     return load_from_mk_file(_contacts_filepath(), "contacts", {})
 
 
@@ -583,7 +702,7 @@ def _contacts_filepath() -> str:
     return _root_dir() + "contacts.mk"
 
 
-def load_multisite_users() -> dict[str, Any]:
+def load_multisite_users() -> dict[str, UserDetails]:
     return load_from_mk_file(_multisite_dir() + "users.mk", "multisite_users", {})
 
 
@@ -659,3 +778,7 @@ def convert_session_info(value: str) -> dict[str, SessionInfo]:
             flashes=[],
         ),
     }
+
+
+def release_users_lock() -> None:
+    release_lock(cmk.utils.paths.check_mk_config_dir + "/wato/contacts.mk")

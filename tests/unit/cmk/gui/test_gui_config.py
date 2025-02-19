@@ -3,14 +3,13 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-# pylint: disable=redefined-outer-name
 
 from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 
-from tests.testlib import is_enterprise_repo, is_managed_repo
+from tests.testlib.common.repo import is_enterprise_repo, is_managed_repo
 
 import cmk.utils.paths
 
@@ -50,7 +49,7 @@ def test_default_config_from_plugins() -> None:
         "view_option_refreshes",
         "view_option_columns",
         "doculink_urlformat",
-        "view_action_defaults",
+        "acknowledge_problems",
         "custom_links",
         "debug_livestatus_queries",
         "show_livestatus_errors",
@@ -91,7 +90,6 @@ def test_default_config_from_plugins() -> None:
         "default_user_profile",
         "log_logon_failures",
         "lock_on_logon_failures",
-        "user_idle_timeout",
         "single_user_session",
         "password_policy",
         "user_localizations",
@@ -100,6 +98,7 @@ def test_default_config_from_plugins() -> None:
         "user_downtime_timeranges",
         "builtin_icon_visibility",
         "trusted_certificate_authorities",
+        "user_security_notification_duration",
         "mkeventd_enabled",
         "mkeventd_pprint_rules",
         "mkeventd_notify_contactgroup",
@@ -109,6 +108,7 @@ def test_default_config_from_plugins() -> None:
         "log_level",
         "log_rulehits",
         "rule_optimizer",
+        "session_mgmt",
         "mkeventd_service_levels",
         "wato_host_tags",
         "wato_aux_tags",
@@ -116,10 +116,8 @@ def test_default_config_from_plugins() -> None:
         "wato_enabled",
         "wato_hide_filenames",
         "wato_hide_hosttags",
-        "wato_upload_insecure_snapshots",
         "wato_hide_varnames",
         "wato_hide_help_in_lists",
-        "wato_activate_changes_concurrency",
         "wato_max_snapshots",
         "wato_num_hostspecs",
         "wato_num_itemspecs",
@@ -144,12 +142,20 @@ def test_default_config_from_plugins() -> None:
         "bi_compile_log",
         "bi_precompile_on_demand",
         "bi_use_legacy_compilation",
+        "broker_connections",
         "sites",
         "config_storage_format",
         "tags",
         "enable_login_via_get",
+        "enable_deprecated_automation_user_authentication",
         "enable_community_translations",
         "default_temperature_unit",
+        "vue_experimental_features",
+        "inject_js_profiling_code",
+        "load_frontend_vue",
+        "configuration_bundles",
+        "default_dynamic_visual_permission",
+        "require_two_factor_all_users",
     ]
 
     # The below lines are confusing and incorrect. The reason we need them is
@@ -158,7 +164,7 @@ def test_default_config_from_plugins() -> None:
     # precondition is a more cleanly separated structure.
 
     if is_enterprise_repo():
-        # CEE plugins are added when the CEE plugins for WATO are available, i.e.
+        # CEE plug-ins are added when the CEE plug-ins for WATO are available, i.e.
         # when the "enterprise/" path is present.
         expected += [
             "agent_deployment_enabled",
@@ -168,7 +174,6 @@ def test_default_config_from_plugins() -> None:
             "agent_signature_keys",
             "have_combined_graphs",
             "licensing_settings",
-            "licensing_notification_settings",
             "reporting_use",
             "reporting_rangespec",
             "reporting_filename",
@@ -189,7 +194,7 @@ def test_default_config_from_plugins() -> None:
         ]
 
     if is_managed_repo():
-        # CME plugins are added when the CEE plugins for WATO are available, i.e.
+        # CME plug-ins are added when the CEE plug-ins for WATO are available, i.e.
         # when the "managed/" path is present.
         expected += [
             "customers",
@@ -203,7 +208,7 @@ def test_default_config_from_plugins() -> None:
     assert sorted(default_config2.keys()) == sorted(expected)
 
 
-def test_load_config() -> None:
+def test_load_config(request_context: None) -> None:
     config_path = Path(cmk.utils.paths.default_config_dir, "multisite.mk")
     config_path.unlink(missing_ok=True)
 
@@ -225,17 +230,17 @@ def local_config_plugin():
 
 
 @pytest.mark.usefixtures("local_config_plugin")
-def test_load_config_respects_local_plugin() -> None:
+def test_load_config_respects_local_plugin(request_context: None) -> None:
     cmk.gui.config.load_config()
-    assert active_config.ding == "dong"  # type: ignore[attr-defined]
+    assert active_config.ding == "dong"  # type: ignore[attr-defined, unused-ignore]
 
 
 @pytest.mark.usefixtures("local_config_plugin")
-def test_load_config_allows_local_plugin_setting() -> None:
+def test_load_config_allows_local_plugin_setting(request_context: None) -> None:
     with Path(cmk.utils.paths.default_config_dir, "multisite.mk").open("w") as f:
         f.write("ding = 'ding'\n")
     cmk.gui.config.load_config()
-    assert active_config.ding == "ding"  # type: ignore[attr-defined]
+    assert active_config.ding == "ding"  # type: ignore[attr-defined, unused-ignore]
 
 
 @pytest.mark.usefixtures("load_config")

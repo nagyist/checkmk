@@ -15,7 +15,7 @@ from cmk.gui.valuespec import Percentage, TextInput, Tuple
 
 def _item_spec_esx_vsphere_datastores():
     return TextInput(
-        title=_("Datastore Name"), help=_("The name of the Datastore"), allow_empty=False
+        title=_("Datastore name"), help=_("The name of the datastore"), allow_empty=False
     )
 
 
@@ -25,8 +25,9 @@ def _parameter_valuespec_esx_vsphere_datastores():
             (
                 "provisioning_levels",
                 Tuple(
-                    title=_("Provisioning Levels"),
+                    title=_("Provisioning levels"),
                     help=_(
+                        # xgettext: no-python-format
                         "A provisioning of more than 100% is called "
                         "over provisioning and can be a useful strategy for saving disk space. But you cannot guarantee "
                         "any longer that every VM can really use all space that it was assigned. Here you can "

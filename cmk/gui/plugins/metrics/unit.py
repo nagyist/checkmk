@@ -3,14 +3,14 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Mapping, Sequence
 
 import cmk.utils.render
 
 from cmk.gui.config import active_config
+from cmk.gui.graphing._legacy import unit_info, UnitInfoWithOrWithoutID
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
-from cmk.gui.plugins.metrics.utils import unit_info, UnitInfo
 from cmk.gui.utils.temperate_unit import TemperatureUnit
 from cmk.gui.valuespec import Age, Filesize, Float, Integer, Percentage
 
@@ -77,6 +77,9 @@ unit_info["%"] = {
     "render": lambda v: cmk.utils.render.percent(v, scientific_notation=True),
     "js_render": "v => cmk.number_format.percent(v, true)",
     "valuespec": Percentage,
+    "perfometer_render": lambda v: (
+        "0%" if v == 0 else "<0.01%" if v < 0.01 else cmk.utils.render.percent(v)
+    ),
 }
 
 unit_info["s"] = {
@@ -131,11 +134,13 @@ unit_info["s/s"] = {
 }
 
 
-def physical_precision_list(  # type: ignore[no-untyped-def]
-    values, precision, unit_symbol
+def physical_precision_list(
+    values: Sequence[float],
+    precision: int,
+    unit_symbol: str,
 ) -> tuple[str, list[str]]:
     if not values:
-        reference = 0
+        reference = 0.0
     else:
         reference = min(abs(v) for v in values)
 
@@ -157,22 +162,18 @@ unit_info["bits/s"] = {
 }
 
 
-def bytes_human_readable_list(  # type: ignore[no-untyped-def]
-    values: Iterable[float], *_args, **kwargs
+def bytes_human_readable_list(
+    values: Collection[float],
+    precision: int,
+    unit_symbol: str,
 ) -> tuple[str, list[str]]:
     if not values:
         reference = 0.0
     else:
         reference = min(abs(v) for v in values)
-
     scale_factor, scale_prefix = cmk.utils.render.IECUnitPrefixes.scale_factor_and_prefix(reference)
-    precision = kwargs.get("precision", 2)
-
     scaled_values = ["%.*f" % (precision, value / scale_factor) for value in values]
-
-    unit_txt = kwargs.get("unit", "B")
-
-    return scale_prefix + unit_txt, scaled_values
+    return scale_prefix + unit_symbol, scaled_values
 
 
 # Output in bytes/days, value is in bytes/s
@@ -182,12 +183,12 @@ unit_info["bytes/d"] = {
     "render": lambda v: cmk.utils.render.fmt_bytes(v * 86400.0) + "/d",
     "js_render": "v => cmk.number_format.fmt_bytes(v * 86400) + '/d'",
     "graph_unit": lambda values: bytes_human_readable_list(
-        [v * 86400.0 for v in values], unit=_("B/d")
+        [v * 86400.0 for v in values], precision=2, unit_symbol=_("B/d")
     ),
     "stepping": "binary",  # for vertical graph labels
 }
 
-_TEMPERATURE_UNIT_SPECS: Mapping[TemperatureUnit, UnitInfo] = {
+_TEMPERATURE_UNIT_SPECS: Mapping[TemperatureUnit, UnitInfoWithOrWithoutID] = {
     TemperatureUnit.CELSIUS: {
         "title": _("Degree Celsius"),
         "symbol": "°C",
@@ -197,8 +198,9 @@ _TEMPERATURE_UNIT_SPECS: Mapping[TemperatureUnit, UnitInfo] = {
     TemperatureUnit.FAHRENHEIT: {
         "title": _("Degree Fahrenheit"),
         "symbol": "°F",
-        "render": lambda v: "{} {}".format(cmk.utils.render.drop_dotzero(v * 1.8 + 32), "°F"),
-        "js_render": "v => cmk.number_format.drop_dotzero(v * 1.8 + 32) + ' °F'",
+        "render": lambda v: "{} {}".format(cmk.utils.render.drop_dotzero(v), "°F"),
+        "js_render": "v => cmk.number_format.drop_dotzero(v) + ' °F'",
+        "conversion": lambda v: v * 1.8 + 32,
     },
 }
 
@@ -330,7 +332,7 @@ unit_info["EUR"] = {
 unit_info["RCU"] = {
     "title": _("RCU"),
     "symbol": _("RCU"),
-    "description": _("Read Capacity Units"),
+    "description": _("Read capacity units"),
     "render": lambda v: cmk.utils.render.fmt_number_with_precision(v, precision=3, unit="RCU"),
     "js_render": "v => cmk.number_format.fmt_number_with_precision(v, cmk.number_format.SIUnitPrefixes, 3, false, 'RCU')",
 }
@@ -338,7 +340,7 @@ unit_info["RCU"] = {
 unit_info["WCU"] = {
     "title": _("WCU"),
     "symbol": _("WCU"),
-    "description": _("Write Capacity Units"),
+    "description": _("Write capacity units"),
     "render": lambda v: cmk.utils.render.fmt_number_with_precision(v, precision=3, unit="WCU"),
     "js_render": "v => cmk.number_format.fmt_number_with_precision(v, cmk.number_format.SIUnitPrefixes, 3, false, 'WCU')",
 }

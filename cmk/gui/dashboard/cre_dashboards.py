@@ -3,8 +3,10 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-import cmk.utils.version as cmk_version
-from cmk.utils.type_defs import UserId
+import cmk.ccc.version as cmk_version
+
+from cmk.utils import paths
+from cmk.utils.user import UserId
 
 from cmk.gui.i18n import _, _l
 from cmk.gui.type_defs import ColumnSpec, SorterSpec, VisualLinkSpec
@@ -19,7 +21,7 @@ def register_builtin_dashboards(builtin: dict[DashboardName, DashboardConfig]) -
 
     # CEE uses specific "main" dashboard with new CEE specific dashlets.
     # CRE should use the problem dashboard as main dashboard
-    if cmk_version.is_raw_edition():
+    if cmk_version.edition(paths.omd_root) is cmk_version.Edition.CRE:
         main_dashboard = builtin["main"] = builtin.pop("problems")
         main_dashboard["title"] = _l("Main dashboard")
         main_dashboard["icon"] = "dashboard_main"
@@ -51,12 +53,9 @@ ProblemsDashboard = DashboardConfig(
                     "title": _("Host statistics"),
                     "type": "hoststats",
                     "position": (1, 1),
+                    "size": (30, 18),
                     "show_title": True,
-                    "context": {
-                        "wato_folder": {
-                            "wato_folder": "",
-                        }
-                    },
+                    "context": {},
                     "single_infos": [],
                 }
             ),
@@ -65,12 +64,9 @@ ProblemsDashboard = DashboardConfig(
                     "title": _("Service statistics"),
                     "type": "servicestats",
                     "position": (31, 1),
+                    "size": (30, 18),
                     "show_title": True,
-                    "context": {
-                        "wato_folder": {
-                            "wato_folder": "",
-                        }
-                    },
+                    "context": {},
                     "single_infos": [],
                 }
             ),
@@ -120,7 +116,7 @@ ProblemsDashboard = DashboardConfig(
             ViewDashletConfig(
                 {
                     "type": "view",
-                    "title": _("Service Problems (unhandled)"),
+                    "title": _("Service problems (unhandled)"),
                     "title_url": "view.py?view_name=svcproblems&is_service_acknowledged=0",
                     "position": (1, 19),
                     "size": (GROW, MAX),
@@ -224,6 +220,7 @@ ProblemsDashboard = DashboardConfig(
         "add_context_to_title": True,
         "is_show_more": False,
         "packaged": False,
+        "megamenu_search_terms": [],
     }
 )
 
@@ -284,7 +281,7 @@ SimpleProblemsDashboard = DashboardConfig(
             ViewDashletConfig(
                 {
                     "type": "view",
-                    "title": _("Service Problems (unhandled)"),
+                    "title": _("Service problems (unhandled)"),
                     "title_url": "view.py?view_name=svcproblems&is_service_acknowledged=0",
                     "show_title": True,
                     "position": (1, 19),
@@ -345,6 +342,7 @@ SimpleProblemsDashboard = DashboardConfig(
         "add_context_to_title": True,
         "is_show_more": False,
         "packaged": False,
+        "megamenu_search_terms": [],
     }
 )
 
@@ -355,7 +353,7 @@ CheckmkOverviewDashboard = DashboardConfig(
         "sort_index": 5,
         "hidebutton": False,
         "title": _l("Checkmk dashboard"),
-        "description": _l("Displays an overview of all Checkmk servers and instances\n"),
+        "description": _l("Displays an overview of all Checkmk servers and sites\n"),
         "add_context_to_title": False,
         "link_from": {},
         "context": {},
@@ -396,5 +394,6 @@ CheckmkOverviewDashboard = DashboardConfig(
         "name": "checkmk",
         "is_show_more": False,
         "packaged": False,
+        "megamenu_search_terms": [],
     }
 )

@@ -3,22 +3,25 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+from collections.abc import Sized
 from functools import partial
+from typing import TypeVar
 
-from cmk.utils.exceptions import MKFetcherError
-from cmk.utils.type_defs import result
+from cmk.ccc.exceptions import MKFetcherError, MKTimeout
 
-from cmk.snmplib.type_defs import TRawData
+import cmk.utils.resulttype as result
 
 from ._abstract import Fetcher, Mode
 from .filecache import FileCache
 
 __all__ = ["get_raw_data"]
 
+_TRawData = TypeVar("_TRawData", bound=Sized)
+
 
 def get_raw_data(
-    file_cache: FileCache[TRawData], fetcher: Fetcher[TRawData], mode: Mode
-) -> result.Result[TRawData, Exception]:
+    file_cache: FileCache[_TRawData], fetcher: Fetcher[_TRawData], mode: Mode
+) -> result.Result[_TRawData, Exception]:
     try:
         cached = file_cache.read(mode)
         if cached is not None:
@@ -27,13 +30,14 @@ def get_raw_data(
         if file_cache.simulation:
             raise MKFetcherError(f"{fetcher}: data unavailable in simulation mode")
 
-        fetched: result.Result[TRawData, Exception] = result.Error(
-            MKFetcherError(f"{fetcher}: unknown error")
-        )
+        fetched: result.Result[_TRawData, Exception] = result.Error(MKFetcherError("unknown error"))
         with fetcher:
             fetched = fetcher.fetch(mode)
         fetched.map(partial(file_cache.write, mode=mode))
         return fetched
+
+    except MKTimeout:
+        raise
 
     except Exception as exc:
         return result.Error(exc)

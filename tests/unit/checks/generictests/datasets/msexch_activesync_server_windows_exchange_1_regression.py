@@ -8,6 +8,13 @@
 
 checkname = "msexch_activesync"
 
+mock_item_state = {
+    "": {
+        "RequestsPersec_": (0, 15426),
+    },
+}
+
+
 info = [
     [
         "AvailabilityRequestsPersec",
@@ -237,7 +244,7 @@ info = [
     ],
 ]
 
-discovery = {"": [(None, None)]}
+discovery = {"": [(None, {})]}
 
 checks = {
     "": [

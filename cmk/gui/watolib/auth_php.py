@@ -35,35 +35,48 @@
 # Returns true/false whether or not the user is permitted
 
 import copy
+from pathlib import Path
+from typing import Any, Literal
 
-import cmk.utils.store as store
+from cmk.ccc import store
 
-import cmk.gui.userdb as userdb
+from cmk.gui import userdb
 from cmk.gui.config import active_config
-from cmk.gui.groups import load_contact_group_information
+from cmk.gui.groups import GroupName
+from cmk.gui.hooks import ClearEvent
+from cmk.gui.type_defs import Users
 from cmk.gui.utils.roles import get_role_permissions
+from cmk.gui.watolib.groups_io import load_contact_group_information
 from cmk.gui.watolib.paths import wato_var_dir
 from cmk.gui.watolib.utils import format_php
 
+_CalleeHooks = ClearEvent | Literal["page_hook"]
 
-def _auth_php():
+
+def _auth_php() -> Path:
     return wato_var_dir() / "auth" / "auth.php"
 
 
-def _create_php_file(callee, users, role_permissions, groups):
+def _create_php_file(
+    callee: _CalleeHooks,
+    users: Users,
+    role_permissions: dict[str, list[str]],
+    groups: dict[GroupName, Any],
+) -> None:
     # Do not change Setup internal objects
     nagvis_users = copy.deepcopy(users)
 
     for user in nagvis_users.values():
         user.setdefault("language", active_config.default_language)  # Set a language for all users
         user.pop("session_info", None)  # remove the SessionInfo object
+        user.pop("automation_secret", None)
 
-    content = """<?php
-// Created by Multisite UserDB Hook ({})
+    content = f"""<?php
+// Created by Multisite UserDB Hook ({callee})
 global $mk_users, $mk_roles, $mk_groups;
-$mk_users   = {};
-$mk_roles   = {};
-$mk_groups  = {};
+$mk_users   = {format_php(nagvis_users)};
+$mk_roles   = {format_php(role_permissions)};
+$mk_groups  = {format_php(groups)};
 
 function all_users() {{
     global $mk_users;
@@ -162,18 +175,13 @@ function permitted_maps($username) {{
 }}
 
 ?>
-""".format(
-        callee,
-        format_php(nagvis_users),
-        format_php(role_permissions),
-        format_php(groups),
-    )
+"""
 
     store.makedirs(_auth_php().parent)
     store.save_text_to_file(_auth_php(), content)
 
 
-def _create_auth_file(callee, users=None):
+def _create_auth_file(callee: _CalleeHooks, users: Users | None = None) -> None:
     if users is None:
         users = userdb.load_users()
 
@@ -186,7 +194,7 @@ def _create_auth_file(callee, users=None):
     _create_php_file(callee, users, get_role_permissions(), groups)
 
 
-def _on_userdb_job():
+def _on_userdb_job() -> None:
     # Working around the problem that the auth.php file needed for multisite based
     # authorization of external addons might not exist when setting up a new installation
     # This is a good place to replace old api based files in the future.

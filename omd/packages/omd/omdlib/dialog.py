@@ -1,26 +1,8 @@
 #!/usr/bin/env python3
-#
-#       U  ___ u  __  __   ____
-#        \/"_ \/U|' \/ '|u|  _"\
-#        | | | |\| |\/| |/| | | |
-#    .-,_| |_| | | |  | |U| |_| |\
-#     \_)-\___/  |_|  |_| |____/ u
-#          \\   <<,-,,-.   |||_
-#         (__)   (./  \.) (__)_)
-#
-# This file is part of OMD - The Open Monitoring Distribution.
-# The official homepage is at <http://omdistro.org>.
-#
-# OMD  is  free software;  you  can  redistribute it  and/or modify it
-# under the  terms of the  GNU General Public License  as published by
-# the  Free Software  Foundation  in  version 2.  OMD  is  distributed
-# in the hope that it will be useful, but WITHOUT ANY WARRANTY;  with-
-# out even the implied warranty of  MERCHANTABILITY  or  FITNESS FOR A
-# PARTICULAR PURPOSE. See the  GNU General Public License for more de-
-# ails.  You should have  received  a copy of the  GNU  General Public
-# License along with GNU Make; see the file  COPYING.  If  not,  write
-# to the Free Software Foundation, Inc., 51 Franklin St,  Fifth Floor,
-# Boston, MA 02110-1301 USA.
+# Copyright (C) 2023 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
 """Wrapper functions for interactive dialogs using the dialog cmd tool"""
 
 import os
@@ -31,8 +13,11 @@ from re import Pattern
 from tty import setraw
 from typing import TYPE_CHECKING
 
+from omdlib.type_defs import ConfigChoiceHasError
+
+from cmk.ccc.exceptions import MKTerminate
+
 from cmk.utils import tty
-from cmk.utils.exceptions import MKTerminate
 
 if TYPE_CHECKING:
     from omdlib.contexts import SiteContext
@@ -84,15 +69,46 @@ def dialog_regex(
             return True, new_value
 
 
+def dialog_config_choice_has_error(
+    title: str, text: str, pattern: ConfigChoiceHasError, value: str, oktext: str, canceltext: str
+) -> DialogResult:
+    while True:
+        args = [
+            "--ok-label",
+            oktext,
+            "--cancel-label",
+            canceltext,
+            "--title",
+            title,
+            "--inputbox",
+            text,
+            "0",
+            "0",
+            value,
+        ]
+        change, new_value = _run_dialog(args)
+        if not change:
+            return False, value
+        validity = pattern(new_value)
+        if validity.is_error():
+            dialog_message(validity.error)
+            value = new_value
+        else:
+            return True, new_value
+
+
 def dialog_yesno(
     text: str,
     yeslabel: str = "yes",
     nolabel: str = "no",
     default_no: bool = False,
+    scrollbar: bool = False,
 ) -> bool:
     command: list[str] = ["--yes-label", yeslabel, "--no-label", nolabel]
     if default_no:
         command += ["--defaultno"]
+    if scrollbar:
+        command += ["--scrollbar"]
     state, _response = _run_dialog(command + ["--yesno", text, "0", "0"])
     return state
 
@@ -114,6 +130,10 @@ def _run_dialog(args: list[str]) -> DialogResult:
         encoding="utf-8",
         check=False,
     )
+    # dialog returns 1 on the nolabel answer. But a return code of 1 is
+    # used for errors. So we need to check the output.
+    if completed_process.returncode != 0 and completed_process.stderr != "":
+        sys.stderr.write(completed_process.stderr + "\n")
     return completed_process.returncode == 0, completed_process.stderr
 
 

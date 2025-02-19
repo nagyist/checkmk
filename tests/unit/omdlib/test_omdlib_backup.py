@@ -3,7 +3,6 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-# pylint: disable=redefined-outer-name
 
 import tarfile
 from pathlib import Path
@@ -12,17 +11,17 @@ import pytest
 
 import omdlib
 import omdlib.backup
-import omdlib.main
+from omdlib.contexts import SiteContext
 
 
 @pytest.fixture()
-def site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> omdlib.main.SiteContext:
+def site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SiteContext:
     monkeypatch.setattr(omdlib, "__version__", "1.3.3i7.cee")
     omd_root = tmp_path / "site"
     omd_root.mkdir(parents=True, exist_ok=True)
     (omd_root / "version").symlink_to("../versions/%s" % omdlib.__version__)
 
-    class UnitTestSite(omdlib.main.SiteContext):
+    class UnitTestSite(SiteContext):
         @property
         def dir(self):
             return str(omd_root)
@@ -30,7 +29,7 @@ def site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> omdlib.main.SiteCon
     return UnitTestSite("unit")
 
 
-def test_backup_site_to_tarfile(site: omdlib.main.SiteContext, tmp_path: Path) -> None:
+def test_backup_site_to_tarfile(site: SiteContext, tmp_path: Path) -> None:
     # Write some file for testing the backup procedure
     with Path(site.dir + "/test123").open("w", encoding="utf-8") as f:
         f.write("uftauftauftata")
@@ -48,7 +47,7 @@ def test_backup_site_to_tarfile(site: omdlib.main.SiteContext, tmp_path: Path) -
     assert "unit/test123" in names
 
 
-def test_backup_site_to_tarfile_broken_link(site: omdlib.main.SiteContext, tmp_path: Path) -> None:
+def test_backup_site_to_tarfile_broken_link(site: SiteContext, tmp_path: Path) -> None:
     Path(site.dir + "/link").symlink_to("agag")
 
     tar_path = tmp_path / "backup.tar"
@@ -64,7 +63,7 @@ def test_backup_site_to_tarfile_broken_link(site: omdlib.main.SiteContext, tmp_p
 
 
 def test_backup_site_to_tarfile_vanishing_files(
-    site: omdlib.main.SiteContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    site: SiteContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     test_dir = Path(site.dir) / "xyz"
     test_file = test_dir / "test_file"

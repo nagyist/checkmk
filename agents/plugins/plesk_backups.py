@@ -4,7 +4,7 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-__version__ = "2.3.0b1"
+__version__ = "2.5.0b1"
 
 # Monitors FTP backup spaces of plesk domains.
 # Data format
@@ -18,12 +18,12 @@ import time
 from ftplib import FTP  # nosec B402 # BNS:97f639
 
 try:
-    from typing import Any, List  # noqa: F401 # pylint: disable=unused-import
+    from typing import Any  # noqa: F401
 except ImportError:
     pass
 
 try:
-    import MySQLdb  # type: ignore[import] # pylint: disable=import-error
+    import MySQLdb  # type: ignore[import-untyped]
 except ImportError as e:
     sys.stdout.write(
         "<<<plesk_backups>>>\n%s. Please install missing module via pip install <module>." % e
@@ -55,8 +55,8 @@ def get_domains():
     domain_collection = {}
     for this_domain_id, this_domain in cursor.fetchall():
         cursor2.execute(
-            "SELECT param, value FROM BackupsSettings "
-            "WHERE id = %d AND type = 'domain'" % this_domain_id
+            "SELECT param, value FROM BackupsSettings WHERE id = %s AND type = 'domain'",
+            (int(this_domain_id),),
         )
         params = dict(cursor2.fetchall())
         domain_collection[this_domain] = params
@@ -97,7 +97,7 @@ for domain, p in domains.items():
         )
 
         # Zeilen holen
-        files = []  # type: List[str]
+        files = []  # type: list[str]
         ftp.retrlines("LIST %s" % p["backup_ftp_settingdirectory"], callback=files.append)
         # example line:
         # -rw----r--   1 b091045  cust     13660160 Dec  3 01:50 bla_v8_bla-v8.bla0.net_1212030250.tar
@@ -120,7 +120,7 @@ for domain, p in domains.items():
             continue
 
         # Get total size of all files on FTP
-        f = []  # type: List[Any]
+        f = []  # type: list[Any]
 
         def get_size(ftp_conn, base_dir, l=None):
             if l and l.split()[-1] in [".", ".."]:
@@ -128,9 +128,8 @@ for domain, p in domains.items():
 
             size = 0
             if not l or l[0] == "d":
-                # pylint: disable=cell-var-from-loop
                 subdir = "/" + l.split()[-1] if l else ""
-                dir_files = []  # type: List[str]
+                dir_files = []  # type: list[str]
                 ftp_conn.retrlines("LIST %s%s" % (base_dir, subdir), callback=dir_files.append)
                 for ln in dir_files:
                     size += get_size(ftp_conn, "%s%s" % (base_dir, subdir), ln)

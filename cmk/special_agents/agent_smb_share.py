@@ -12,16 +12,15 @@ from datetime import datetime, timezone
 from fnmatch import fnmatch
 from typing import NamedTuple
 
-from smb.base import NotConnectedError, SharedFile  # type: ignore[import]
-from smb.smb_structs import OperationFailure  # type: ignore[import]
-from smb.SMBConnection import SMBConnection  # type: ignore[import]
+from smb.base import NotConnectedError, SharedFile
+from smb.smb_structs import OperationFailure
+from smb.SMBConnection import SMBConnection
 
-from cmk.special_agents.utils.agent_common import SectionWriter, special_agent_main
-from cmk.special_agents.utils.argument_parsing import Args, create_default_argument_parser
+from cmk.special_agents.v0_unstable.agent_common import SectionWriter, special_agent_main
+from cmk.special_agents.v0_unstable.argument_parsing import Args, create_default_argument_parser
 
 
-class SMBShareAgentError(Exception):
-    ...
+class SMBShareAgentError(Exception): ...
 
 
 class File(NamedTuple):
@@ -149,24 +148,25 @@ def get_all_shared_files(
         pattern = pattern_string.strip("\\").split("\\")
         if len(pattern) < 3:
             raise SMBShareAgentError(
-                f"Invalid pattern {pattern_string}. Pattern has to consist of hostname, share and file matching pattern"
+                f"Invalid pattern {pattern_string}. Pattern has to consist of host name, share and file matching pattern"
             )
 
         if pattern[0] != hostname:
-            raise SMBShareAgentError(f"Pattern {pattern_string} doesn't match {hostname} hostname")
+            raise SMBShareAgentError(f"Pattern {pattern_string} doesn't match {hostname} host name")
 
         share_name = pattern[1]
         if share_name.lower() not in share_names:
             raise SMBShareAgentError(f"Share {share_name} doesn't exist on host {hostname}")
 
-        yield pattern_string, set(
-            iter_shared_files(conn, hostname, share_name, pattern[2:], recursive=recursive)
+        yield (
+            pattern_string,
+            set(iter_shared_files(conn, hostname, share_name, pattern[2:], recursive=recursive)),
         )
 
 
 def write_section(all_files: Generator[tuple[str, set[File]], None, None]) -> None:
     with SectionWriter("fileinfo", separator="|") as writer:
-        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        now = datetime.now(tz=timezone.utc)
         writer.append(int(datetime.timestamp(now)))
         writer.append("[[[header]]]")
         writer.append("name|status|size|time")

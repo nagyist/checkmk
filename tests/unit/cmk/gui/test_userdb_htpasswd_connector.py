@@ -8,13 +8,13 @@ from pathlib import Path
 import pytest
 from pytest import MonkeyPatch
 
-from cmk.utils.crypto import password_hashing
-from cmk.utils.crypto.password import Password
-from cmk.utils.type_defs import UserId
+from cmk.utils.user import UserId
 
 from cmk.gui.exceptions import MKUserError
-from cmk.gui.plugins.userdb.utils import CheckCredentialsResult
-from cmk.gui.userdb import htpasswd
+from cmk.gui.userdb import CheckCredentialsResult, htpasswd
+
+from cmk.crypto import password_hashing
+from cmk.crypto.password import Password
 
 
 @pytest.fixture(name="htpasswd_file", autouse=True)
@@ -74,7 +74,16 @@ def test_truncation_error() -> None:
 def test_user_connector_verify_password(
     uid: UserId, password: Password, expect: CheckCredentialsResult
 ) -> None:
-    assert htpasswd.HtpasswdUserConnector({}).check_credentials(uid, password) == expect
+    assert (
+        htpasswd.HtpasswdUserConnector(
+            {
+                "type": "htpasswd",
+                "id": "htpasswd",
+                "disabled": False,
+            }
+        ).check_credentials(uid, password)
+        == expect
+    )
 
 
 @pytest.mark.parametrize(
@@ -89,4 +98,10 @@ def test_user_connector_verify_password_locked_users(
     password: Password,
 ) -> None:
     with pytest.raises(MKUserError, match="User is locked"):
-        htpasswd.HtpasswdUserConnector({}).check_credentials(uid, password)
+        htpasswd.HtpasswdUserConnector(
+            {
+                "type": "htpasswd",
+                "id": "htpasswd",
+                "disabled": False,
+            }
+        ).check_credentials(uid, password)

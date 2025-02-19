@@ -14,26 +14,38 @@ import flask
 from flask import Flask
 from flask.sessions import SessionInterface, SessionMixin
 
-from cmk.utils.exceptions import MKException
-from cmk.utils.site import omd_site
-from cmk.utils.type_defs import UserId
+from cmk.ccc.exceptions import MKException
+from cmk.ccc.site import omd_site
 
-import cmk.gui.userdb.session  # NOQA  # pylint: disable=unused-import
+from cmk.utils.log.security_event import log_security_event
+from cmk.utils.user import UserId
+
 from cmk.gui import config, userdb
-from cmk.gui.auth import check_auth, parse_and_check_cookie
+from cmk.gui.auth import (
+    check_auth,
+    parse_and_check_cookie,
+)
 from cmk.gui.exceptions import MKAuthException
-from cmk.gui.logged_in import LoggedInNobody, LoggedInSuperUser, LoggedInUser
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import LoggedInNobody, LoggedInRemoteSite, LoggedInSuperUser, LoggedInUser
+from cmk.gui.pseudo_users import PseudoUserId, RemoteSitePseudoUser, SiteInternalPseudoUser
 from cmk.gui.type_defs import AuthType, SessionId, SessionInfo
 from cmk.gui.userdb.session import auth_cookie_value
+from cmk.gui.userdb.store import convert_idle_timeout, load_custom_attr
+from cmk.gui.utils.flashed_messages import MsgType
+from cmk.gui.utils.security_log_events import AuthenticationSuccessEvent
 from cmk.gui.wsgi.utils import dict_property
+
+from cmk import trace
+
+tracer = trace.get_tracer()
 
 
 class CheckmkFileBasedSession(dict, SessionMixin):
     new = True
-
     session_info = dict_property[SessionInfo]()
-    persist_session = dict_property[bool]()
     exc = dict_property[MKException | None](default=None)
+    is_gui_session = dict_property[bool](default=True)
 
     def update_cookie(self) -> None:
         # Cookies only get set when the session is new, so we make ourselves new again.
@@ -49,7 +61,7 @@ class CheckmkFileBasedSession(dict, SessionMixin):
 
     @user.setter
     def user(self, user: LoggedInUser) -> None:
-        if not isinstance(user, (LoggedInNobody, LoggedInSuperUser)):
+        if not isinstance(user, (LoggedInNobody, LoggedInSuperUser, LoggedInRemoteSite)):
             assert user.id is not None
         self["_user"] = user
 
@@ -57,11 +69,21 @@ class CheckmkFileBasedSession(dict, SessionMixin):
     def user_id(self):
         raise AttributeError("Don't set user_id please.")
 
+    @property
+    def persist_session(self) -> bool:
+        if isinstance(self.user, (LoggedInNobody, LoggedInSuperUser, LoggedInRemoteSite)):
+            return False
+
+        if not self.is_gui_session:
+            # No persistant sessions for RestAPI
+            return False
+
+        return not self.user.automation_user
+
     def initialize(
         self,
         user_name: UserId | None,
         auth_type: AuthType | None,
-        persist: bool = True,
     ) -> None:
         now = datetime.now()
         if user_name is not None:
@@ -69,7 +91,7 @@ class CheckmkFileBasedSession(dict, SessionMixin):
             self.user = LoggedInUser(user_name)
         else:
             self.user = LoggedInNobody()
-        self.persist_session = persist
+
         self.session_info = SessionInfo(
             session_id=userdb.session.create_session_id(),
             started_at=int(now.timestamp()),
@@ -94,14 +116,28 @@ class CheckmkFileBasedSession(dict, SessionMixin):
         cls,
         user_name: UserId,
         auth_type: AuthType,
-        persist: bool = True,
     ) -> CheckmkFileBasedSession:
         sess = cls()
         sess.initialize(
             user_name,
             auth_type,
-            persist=persist,
         )
+        return sess
+
+    @classmethod
+    def create_pseudo_user_session(cls, pseudo_user_id: PseudoUserId) -> CheckmkFileBasedSession:
+        """This method is reserved for pseudo users
+
+        These should not really be sessions but currently everything is a session..."""
+
+        sess = cls()
+        match pseudo_user_id:
+            case SiteInternalPseudoUser():
+                sess.user = LoggedInSuperUser()
+            case RemoteSitePseudoUser():
+                sess.user = LoggedInRemoteSite(site_name=pseudo_user_id.site_name)
+            case _:
+                raise NotImplementedError
         return sess
 
     @classmethod
@@ -135,7 +171,6 @@ class CheckmkFileBasedSession(dict, SessionMixin):
 
         sess = cls()
         sess.user = LoggedInUser(user_name)
-        sess.persist_session = True
         sess.session_info = info
         # NOTE: This is only called from a "cookie" auth location. If you add more, refactor.
         sess.session_info.auth_type = "cookie"
@@ -143,6 +178,7 @@ class CheckmkFileBasedSession(dict, SessionMixin):
         sess["_flashes"] = info.flashes
         return sess
 
+    @tracer.instrument("CheckmkFileBas.login")
     def login(self, user_obj: LoggedInUser) -> None:
         userdb.session.on_succeeded_login(user_obj.ident, datetime.now())
         self.user = user_obj
@@ -167,6 +203,67 @@ class CheckmkFileBasedSession(dict, SessionMixin):
 
     def invalidate(self) -> None:
         self.session_info.logged_out = True
+
+    def is_expired(self, now: datetime) -> bool:
+        """Check if session has expired either due to maximum duration or exceeded idle time."""
+        session_duration = now.timestamp() - self.session_info.started_at
+        max_duration = config.active_config.session_mgmt.get("max_duration", {}).get(
+            "enforce_reauth"
+        )
+        if max_duration and session_duration > max_duration:
+            return True
+
+        assert self.user.id is not None
+
+        idle_time = int(now.timestamp()) - self.session_info.last_activity
+        idle_timeout = load_custom_attr(
+            user_id=self.user.id, key="idle_timeout", parser=convert_idle_timeout
+        )
+        if idle_timeout is None:
+            idle_timeout = config.active_config.session_mgmt.get("user_idle_timeout")
+
+        return idle_timeout is not None and idle_timeout is not False and idle_time > idle_timeout
+
+    def warn_if_session_expires_soon(self, now: datetime) -> None:
+        """Warn user if they are close to maximum session duration only"""
+        session_duration = now.timestamp() - self.session_info.started_at
+        max_duration = config.active_config.session_mgmt.get("max_duration", {}).get(
+            "enforce_reauth"
+        )
+        warning_threshold = config.active_config.session_mgmt.get("max_duration", {}).get(
+            "enforce_reauth_warning_threshold"
+        )
+        if (
+            max_duration
+            and warning_threshold
+            and (warning_threshold >= max_duration - session_duration)
+        ):
+            self._flash_message(
+                "warning",
+                _(
+                    "Maximum session duration almost reached. Re-authenticate session to prevent data loss."
+                ),
+            )
+
+    def _flash_message(self, msg_type: MsgType, message: str) -> None:
+        """
+
+        Copy of the flash.flash functionality.
+        We cannot use original flask.flash method as we do not have a session within our request context
+
+        """
+        tuple_to_add = (msg_type, message)
+        if tuple_to_add not in self.session_info.flashes:
+            self.session_info.flashes.append(tuple_to_add)
+
+    def two_factor_pending(self) -> bool:
+        if isinstance(self.user, (LoggedInNobody, LoggedInSuperUser)):
+            return False
+
+        return (
+            userdb.is_two_factor_login_enabled(self.user.ident)
+            and not self.session_info.two_factor_completed
+        )
 
 
 class FileBasedSession(SessionInterface):
@@ -196,55 +293,82 @@ class FileBasedSession(SessionInterface):
         # the tests.
         return f"/{omd_site()}/"
 
+    def _resume_session(self, app: Flask, request: flask.Request) -> CheckmkFileBasedSession | None:
+        """Check if there is a session to resume to
+
+        check if cookie is there and if it is valid. If so return the session
+        otherwise return None"""
+
+        if not (cookie_value := request.cookies.get(self.get_cookie_name(app), type=str)):
+            # No cookie, nothing to resume
+            return None
+
+        try:
+            user_name, session_id, _cookie_hash = parse_and_check_cookie(cookie_value)
+            sess = self.session_class.load_session(user_name, session_id)
+            sess.warn_if_session_expires_soon(datetime.now())
+            if sess.is_expired(datetime.now()):
+                return None
+        except MKAuthException:
+            # Catches an invalid cred issue checked by test_session.py
+            return None
+        return sess
+
+    def _authenticate_and_open(self, app: Flask, request: flask.Request) -> CheckmkFileBasedSession:
+        """Authenticate and open new session
+
+        try to authenticate a request based on headers, password login is
+        handled in login.py"""
+
+        identity, auth_type = check_auth()
+
+        if isinstance(identity, PseudoUserId):
+            return self.session_class.create_pseudo_user_session(identity)
+
+        user_name = identity
+
+        userdb.session.on_succeeded_login(user_name, datetime.now())
+
+        # Our REST API doesn't hand out session tokens, so every request is a new session.
+        # Filter those for now to avoid spamming the log.
+        if auth_type != "bearer":
+            log_security_event(
+                AuthenticationSuccessEvent(
+                    auth_method=auth_type,
+                    username=user_name,
+                    remote_ip=request.remote_addr,
+                )
+            )
+
+        self.update_last_login(user_name, auth_type, request)
+
+        return self.session_class.create_session(user_name, auth_type)
+
+    def update_last_login(
+        self, userid: UserId, auth_type: AuthType, request: flask.Request
+    ) -> None:
+        last_login_info = {
+            "auth_type": auth_type,
+            "timestamp": int(datetime.now().timestamp()),
+            "remote_address": request.remote_addr,
+        }
+        userdb.save_custom_attr(userid, "last_login", last_login_info)
+
+    @tracer.instrument("FileBasedSession.open_session")
     def open_session(self, app: Flask, request: flask.Request) -> CheckmkFileBasedSession | None:
-        # In order to log in a user, we need to do the following:
-        #
-        # 1. In the login page, validate the user, persist the current session.
-        # 2. In the session opener, we only validate that there actually is a session. If there is
-        #    not, or it is marked as "logged out", we deny the user access.
-        #
         # We need the config to be able to set the timeout values correctly.
         config.initialize()
 
         try:
-            user_name, auth_type = check_auth()
+            return self._resume_session(app, request) or self._authenticate_and_open(app, request)
         except MKAuthException as exc:
-            # Authentication failed.
-            return self.session_class.create_empty_session(exc=exc)
-
-        # From here on out, the user is considered authenticated.
-        now = datetime.now()
-        try:
-            userdb.session.on_succeeded_login(user_name, now)
-        except MKException as exc:
-            # We can't let the user log in due to some reason, even though successfully logged in.
-            return self.session_class.create_empty_session(exc=exc)
-
-        # No cookie present. We create a new session and the cookie will be sent to the user
-        # through `save_session` below.
-        if not (cookie_value := request.cookies.get(self.get_cookie_name(app), type=str)):
-            # We didn't receive a cookie, so this is the first time we use this session.
-            return self.session_class.create_session(user_name, auth_type)
-
-        # From here on out, we know we received a cookie. We'll verify its integrity.
-        try:
-            user_name, session_id, _cookie_hash = parse_and_check_cookie(cookie_value)
-            userdb.on_access(user_name, session_id, datetime.now())
-        except MKAuthException as exc:
-            # The cookie is not considered valid, timed out, etc. So we don't auto-renew it.
-            return self.session_class.create_empty_session(exc=exc)
-
-        # Everything else taken care of, we load the session...
-        try:
-            return self.session_class.load_session(user_name, session_id)
-        except MKAuthException as exc:
-            # ... unless we can't.
             return self.session_class.create_empty_session(exc=exc)
 
     # NOTE: The type-ignore[override] here is due to the fact, that any alternative would result
     # in multiple hundreds of lines changes and hundreds of mypy errors at this point and is thus
     # deferred to a later date.
-    def save_session(  # type: ignore[override]  # pylint: disable=redefined-outer-name
+    @tracer.instrument("FileBasedSession.save_session")
+    def save_session(  # type: ignore[override]
         self, app: Flask, session: CheckmkFileBasedSession, response: flask.Response
     ) -> None:
         # NOTE
@@ -259,8 +383,6 @@ class FileBasedSession(SessionInterface):
         domain = self.get_cookie_domain(app)
         path = self.get_cookie_path(app)
         secure = self.get_cookie_secure(app)
-        samesite = self.get_cookie_samesite(app)
-        httponly = self.get_cookie_httponly(app)
         expires = self.get_expiration_time(app, session)
 
         if not self.should_set_cookie(app, session):
@@ -291,11 +413,11 @@ class FileBasedSession(SessionInterface):
                 cookie_name,
                 cookie_value,
                 expires=expires,
-                httponly=httponly,
+                httponly=True,
                 domain=domain,
                 path=path,
                 secure=secure,
-                samesite=samesite,
+                samesite="Lax",
             )
 
 
