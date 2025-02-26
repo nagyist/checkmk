@@ -14,10 +14,10 @@ from cmk.utils.password_store import replace_passwords
 
 def bail_out(message, debug=False):
     if debug:
-        print("----------------------------------\n", file=sys.stderr, end="")
-        print(traceback.format_exc(), file=sys.stderr, end="")
-        print("==================================\n", file=sys.stderr)
-    print("Error: %s\n" % message, file=sys.stderr)
+        sys.stderr.write("----------------------------------\n")
+        sys.stderr.write(traceback.format_exc())
+        sys.stderr.write("==================================\n")
+    sys.stderr.write("Error: %s\n" % message)
     sys.exit(1)
 
 
@@ -27,7 +27,7 @@ class ArgParser(argparse.ArgumentParser):
         bail_out("Parsing the arguments failed - %s." % message)
 
 
-def parse_args():
+def parse_arguments(argv):
     parser = ArgParser(description="Special agent to retrieve data from Aerohive HiveManagerNG")
     parser.add_argument("-d", "--debug", help="enable debugging", action="store_true")
     parser.add_argument("url", help="URL to Aerohive NG, e.g. https://cloud.aerohive.com")
@@ -36,14 +36,14 @@ def parse_args():
     parser.add_argument("client_id", help="Client ID")
     parser.add_argument("client_secret", help="Client secret")
     parser.add_argument("redirect_url", help="Redirect URL")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main():
     replace_passwords()
-    args = parse_args()
+    args = parse_arguments(sys.argv[1:])
 
-    print("<<<hivemanager_ng_devices:sep(124)>>>")
+    sys.stdout.write("<<<hivemanager_ng_devices:sep(124)>>>\n")
 
     address = "%s/xapi/v1/monitor/devices" % args.url
     params = {
@@ -59,7 +59,7 @@ def main():
     }
 
     try:
-        response = requests.get(address, headers=headers, params=params)  # nosec B113
+        response = requests.get(address, headers=headers, params=params)  # nosec B113 # BNS:0b0eac
     except requests.RequestException:
         bail_out(
             "Request to the API failed. Please check your connection settings. "
@@ -92,4 +92,4 @@ def main():
 
     for device in json["data"]:
         device_txt = "|".join([f"{k}::{v}" for (k, v) in device.items() if k in used])
-        print(device_txt)
+        sys.stdout.write(device_txt + "\n")

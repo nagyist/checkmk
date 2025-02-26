@@ -2,27 +2,23 @@
 # Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
-"""Compute the cluster check function from the plugin and parameters."""
+"""Compute the cluster check function from the plug-in and parameters."""
 
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
-from typing import Any, Final, NamedTuple, Protocol
+from typing import Any, Final, Literal, NamedTuple, Protocol
 
-from cmk.utils.type_defs import ClusterMode, HostName, state_markers
+from cmk.utils.hostaddress import HostName
 
-from cmk.checkers import CheckPlugin
-from cmk.checkers.check_table import ServiceID
+from cmk.checkengine.checking import ServiceID
+from cmk.checkengine.checkresults import state_markers
 
-from cmk.base.api.agent_based.checking_classes import (
-    CheckResult,
-    IgnoreResults,
-    IgnoreResultsError,
-    Metric,
-    Result,
-    State,
-)
+from cmk.base.api.agent_based.plugin_classes import CheckPlugin
 from cmk.base.api.agent_based.value_store import ValueStoreManager
+
+from cmk.agent_based.v1 import IgnoreResults, IgnoreResultsError, Metric, Result, State
+from cmk.agent_based.v1.type_defs import CheckResult
 
 _Kwargs = Mapping[str, Any]
 
@@ -30,10 +26,11 @@ _NON_SECTION_KEYS: Final = {"item", "params"}
 
 _INF = float("inf")
 
+ClusterMode = Literal["native", "failover", "worst", "best"]
+
 
 class Selector(Protocol):
-    def __call__(self, *a: State) -> State:
-        ...
+    def __call__(self, *a: State) -> State: ...
 
 
 def _unfit_for_clustering(**_kw: object) -> CheckResult:
@@ -57,7 +54,7 @@ def get_cluster_check_function(
     value_store_manager: ValueStoreManager,
 ) -> Callable[..., Iterable[object]]:
     if mode == "native":
-        return plugin.cluster_function or _unfit_for_clustering
+        return plugin.cluster_check_function or _unfit_for_clustering
 
     executor = NodeCheckExecutor(
         service_id=service_id,
@@ -69,7 +66,7 @@ def get_cluster_check_function(
             _cluster_check,
             clusterization_parameters=clusterization_parameters,
             executor=executor,
-            check_function=plugin.function,
+            check_function=plugin.check_function,
             label="active",
             selector=State.worst,
             levels_additional_nodes_count=(1, _INF),
@@ -81,7 +78,7 @@ def get_cluster_check_function(
             _cluster_check,
             clusterization_parameters=clusterization_parameters,
             executor=executor,
-            check_function=plugin.function,
+            check_function=plugin.check_function,
             label="worst",
             selector=State.worst,
             levels_additional_nodes_count=(_INF, _INF),
@@ -93,7 +90,7 @@ def get_cluster_check_function(
             _cluster_check,
             clusterization_parameters=clusterization_parameters,
             executor=executor,
-            check_function=plugin.function,
+            check_function=plugin.check_function,
             label="best",
             selector=State.best,
             levels_additional_nodes_count=(_INF, _INF),

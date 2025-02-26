@@ -5,10 +5,13 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Any
 
+from cmk.utils.hostaddress import HostName
+
 # TODO: fix duplicate type def. the original type def is in gui-managed (module layer violation)
-from cmk.utils.type_defs import HostName, ServiceName
+from cmk.utils.servicename import ServiceName
 
 from cmk.bi.lib import (
     ABCBICompiledNode,
@@ -18,7 +21,6 @@ from cmk.bi.lib import (
     create_nested_schema,
     create_nested_schema_for_class,
     ReqString,
-    String,
 )
 from cmk.bi.node_generator import BINodeGenerator
 from cmk.bi.node_vis import BIAggregationVisualizationSchema
@@ -26,6 +28,7 @@ from cmk.bi.rule import BIRule
 from cmk.bi.schema import Schema
 from cmk.bi.trees import BICompiledAggregation, BICompiledRule
 from cmk.bi.type_defs import AggrConfigDict
+from cmk.fields import String
 
 SCOPE_GLOBAL = None
 
@@ -120,8 +123,9 @@ class BIAggregation:
 
 
 class BIAggregationSchema(Schema):
-    class Meta:
-        ordered = True
+    @property
+    def dict_class(self) -> type:
+        return OrderedDict
 
     id = ReqString(
         dump_default="",
@@ -144,7 +148,17 @@ class BIAggregationSchema(Schema):
             "names": ["groupA", "groupB"],
             "paths": [["path", "group", "a"], ["path", "group", "b"]],
         },
+        description="Groups.",
     )
-    node = create_nested_schema_for_class(BINodeGenerator)
-    aggregation_visualization = create_nested_schema(BIAggregationVisualizationSchema)
-    computation_options = create_nested_schema_for_class(BIAggregationComputationOptions)
+    node = create_nested_schema_for_class(
+        BINodeGenerator,
+        description="Node generation.",
+    )
+    aggregation_visualization = create_nested_schema(
+        BIAggregationVisualizationSchema,
+        description="Aggregation visualization options.",
+    )
+    computation_options = create_nested_schema_for_class(
+        BIAggregationComputationOptions,
+        description="Computation options.",
+    )

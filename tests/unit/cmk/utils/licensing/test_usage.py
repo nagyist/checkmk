@@ -13,26 +13,28 @@ import pytest
 
 import livestatus
 
+from cmk.utils import man_pages
 from cmk.utils.licensing.export import (
     LicenseUsageExtensions,
     LicenseUsageSample,
-    UnknownSampleParserError,
+    LicensingProtocolVersion,
+    RawLicenseUsageReport,
 )
 from cmk.utils.licensing.usage import (
     _load_extensions,
+    _parse_extensions,
     _serialize_dump,
     CLOUD_SERVICE_PREFIXES,
-    get_license_usage_report_filepath,
+    get_license_usage_report_file_path,
     HostsOrServicesCloudCounter,
-    LicenseUsageReportVersion,
-    load_license_usage_history,
+    load_raw_license_usage_report,
     LocalLicenseUsageHistory,
     Now,
-    RawLicenseUsageReport,
     save_extensions,
     try_update_license_usage,
 )
-from cmk.utils.man_pages import load_man_page_catalog, ManPageCatalogPath
+
+from cmk.discover_plugins import discover_families, PluginGroup
 
 
 def test_try_update_license_usage() -> None:
@@ -60,15 +62,17 @@ def test_try_update_license_usage() -> None:
             num_services_cloud=2,
             num_services_shadow=7,
             num_services_excluded=5,
+            num_synthetic_tests=1,
+            num_synthetic_tests_excluded=2,
+            num_synthetic_kpis=3,
+            num_synthetic_kpis_excluded=4,
             extension_ntop=True,
         ),
     )
     assert (
         len(
-            load_license_usage_history(
-                get_license_usage_report_filepath(),
-                instance_id,
-                site_hash,
+            LocalLicenseUsageHistory.parse(
+                load_raw_license_usage_report(get_license_usage_report_file_path())
             )
         )
         == 1
@@ -92,10 +96,8 @@ def test_try_update_license_usage_livestatus_socket_error() -> None:
         )
     assert (
         len(
-            load_license_usage_history(
-                get_license_usage_report_filepath(),
-                instance_id,
-                site_hash,
+            LocalLicenseUsageHistory.parse(
+                load_raw_license_usage_report(get_license_usage_report_file_path())
             )
         )
         == 0
@@ -119,10 +121,8 @@ def test_try_update_license_usage_livestatus_not_found_error() -> None:
         )
     assert (
         len(
-            load_license_usage_history(
-                get_license_usage_report_filepath(),
-                instance_id,
-                site_hash,
+            LocalLicenseUsageHistory.parse(
+                load_raw_license_usage_report(get_license_usage_report_file_path())
             )
         )
         == 0
@@ -154,15 +154,17 @@ def test_try_update_license_usage_next_run_ts_not_reached() -> None:
             num_services_cloud=2,
             num_services_shadow=7,
             num_services_excluded=5,
+            num_synthetic_tests=1,
+            num_synthetic_tests_excluded=2,
+            num_synthetic_kpis=3,
+            num_synthetic_kpis_excluded=4,
             extension_ntop=True,
         ),
     )
     assert (
         len(
-            load_license_usage_history(
-                get_license_usage_report_filepath(),
-                instance_id,
-                site_hash,
+            LocalLicenseUsageHistory.parse(
+                load_raw_license_usage_report(get_license_usage_report_file_path())
             )
         )
         == 0
@@ -209,33 +211,40 @@ def test_serialize_license_usage_report() -> None:
             },
         ],
     }
-    history = LocalLicenseUsageHistory.parse(
+    history = LocalLicenseUsageHistory.update(
         raw_report,
         instance_id=UUID("937495cb-78f7-40d4-9b5f-f2c5a81e66b8"),
         site_hash="site-hash",
     )
-    assert (
-        _serialize_dump(
-            RawLicenseUsageReport(
-                VERSION=LicenseUsageReportVersion,
-                history=history.for_report(),
-            )
+    assert _serialize_dump(
+        RawLicenseUsageReport(
+            VERSION=LicensingProtocolVersion,
+            history=history.for_report(),
         )
-        == b"LQ't#$x~}Qi Qa]`Q[ Q9:DE@CJQi ,LQ:?DE2?460:5Qi Qhbfchd43\\fg7f\\c_5c\\h3d7\\7a4d2g`6ee3gQ[ QD:E6092D9Qi QD:E6\\92D9Q[ QG6CD:@?Qi QQ[ Q65:E:@?Qi QQ[ QA=2E7@C>Qi Qp G6CJ =@?8 DEC:?8 H:E9 =6?md_ 56D4C:3:?8 E96 A=2EQ[ Q:D04>2Qi 72=D6[ QD2>A=60E:>6Qi `[ QE:>6K@?6Qi QQ[ Q?F>09@DEDQi a[ Q?F>09@DED04=@F5Qi _[ Q?F>09@DED0D925@HQi _[ Q?F>09@DED06I4=F565Qi b[ Q?F>0D6CG:46DQi c[ Q?F>0D6CG:46D04=@F5Qi _[ Q?F>0D6CG:46D0D925@HQi _[ Q?F>0D6CG:46D06I4=F565Qi d[ Q6IE6?D:@?0?E@AQi ECF6N.N"
+    ) == (
+        b"LQ't#$x~}Qi Qb]`Q[ Q9:DE@CJQi ,LQ:?DE2?460:5Qi Qhbfchd43\\fg7f\\c_5c\\h3d7\\"
+        b"7a4d2g`6ee3gQ[ QD:E6092D9Qi QD:E6\\92D9Q[ QG6CD:@?Qi QQ[ Q65:E:@?Qi QQ[ Q"
+        b"A=2E7@C>Qi Qp G6CJ =@?8 DEC:?8 H:E9 =6?md_ 56D4C:3:?8 E96 A=2EQ[ Q:D04>2Qi 7"
+        b"2=D6[ QD2>A=60E:>6Qi `[ QE:>6K@?6Qi QQ[ Q?F>09@DEDQi a[ Q?F>09@DED04=@F5Qi _"
+        b"[ Q?F>09@DED0D925@HQi _[ Q?F>09@DED06I4=F565Qi b[ Q?F>0D6CG:46DQi c[ Q?F>0D6"
+        b"CG:46D04=@F5Qi _[ Q?F>0D6CG:46D0D925@HQi _[ Q?F>0D6CG:46D06I4=F565Qi d[ Q?F>"
+        b"0DJ?E96E:40E6DEDQi _[ Q?F>0DJ?E96E:40E6DED06I4=F565Qi _[ Q?F>0DJ?E96E:40<A:D"
+        b"Qi _[ Q?F>0DJ?E96E:40<A:D06I4=F565Qi _[ Q6IE6?D:@?0?E@AQi ECF6N.N"
     )
 
 
 @pytest.mark.parametrize(
     "raw_report, expected_history",
     [
-        (
+        pytest.param(
             {
                 "VERSION": "1.0",
                 "history": [],
             },
             LocalLicenseUsageHistory([]),
+            id="1.0-empty",
         ),
-        (
+        pytest.param(
             {
                 "VERSION": "1.0",
                 "history": [
@@ -273,12 +282,17 @@ def test_serialize_license_usage_report() -> None:
                         num_services_cloud=0,
                         num_services_shadow=0,
                         num_services_excluded=0,
+                        num_synthetic_tests=0,
+                        num_synthetic_tests_excluded=0,
+                        num_synthetic_kpis=0,
+                        num_synthetic_kpis_excluded=0,
                         extension_ntop=False,
                     ),
                 ]
             ),
+            id="1.0",
         ),
-        (
+        pytest.param(
             {
                 "VERSION": "1.1",
                 "history": [
@@ -318,12 +332,17 @@ def test_serialize_license_usage_report() -> None:
                         num_services_cloud=0,
                         num_services_shadow=0,
                         num_services_excluded=5,
+                        num_synthetic_tests=0,
+                        num_synthetic_tests_excluded=0,
+                        num_synthetic_kpis=0,
+                        num_synthetic_kpis_excluded=0,
                         extension_ntop=False,
                     ),
                 ]
             ),
+            id="1.1-no-extensions",
         ),
-        (
+        pytest.param(
             {
                 "VERSION": "1.1",
                 "history": [
@@ -366,12 +385,232 @@ def test_serialize_license_usage_report() -> None:
                         num_services_cloud=0,
                         num_services_shadow=0,
                         num_services_excluded=5,
+                        num_synthetic_tests=0,
+                        num_synthetic_tests_excluded=0,
+                        num_synthetic_kpis=0,
+                        num_synthetic_kpis_excluded=0,
                         extension_ntop=True,
                     ),
                 ]
             ),
+            id="1.1",
         ),
-        (
+        pytest.param(
+            {
+                "VERSION": "1.2",
+                "history": [
+                    {
+                        "version": "",
+                        "edition": "",
+                        "platform": (
+                            "A very long string with len>50 describing the platform"
+                            " a Checkmk server is operating on."
+                        ),
+                        "is_cma": False,
+                        "sample_time": 1,
+                        "timezone": "",
+                        "num_hosts": 2,
+                        "num_hosts_excluded": 3,
+                        "num_services": 4,
+                        "num_services_excluded": 5,
+                        "extensions": {
+                            "ntop": True,
+                        },
+                    },
+                ],
+            },
+            LocalLicenseUsageHistory(
+                [
+                    LicenseUsageSample(
+                        instance_id=UUID("937495cb-78f7-40d4-9b5f-f2c5a81e66b8"),
+                        site_hash="site-hash",
+                        version="",
+                        edition="",
+                        platform="A very long string with len>50 describing the plat",
+                        is_cma=False,
+                        sample_time=1,
+                        timezone="",
+                        num_hosts=2,
+                        num_hosts_cloud=0,
+                        num_hosts_shadow=0,
+                        num_hosts_excluded=3,
+                        num_services=4,
+                        num_services_cloud=0,
+                        num_services_shadow=0,
+                        num_services_excluded=5,
+                        num_synthetic_tests=0,
+                        num_synthetic_tests_excluded=0,
+                        num_synthetic_kpis=0,
+                        num_synthetic_kpis_excluded=0,
+                        extension_ntop=True,
+                    ),
+                ]
+            ),
+            id="1.2",
+        ),
+        pytest.param(
+            {
+                "VERSION": "1.3",
+                "history": [
+                    {
+                        "version": "",
+                        "edition": "",
+                        "platform": (
+                            "A very long string with len>50 describing the platform"
+                            " a Checkmk server is operating on."
+                        ),
+                        "is_cma": False,
+                        "sample_time": 1,
+                        "timezone": "",
+                        "num_hosts": 2,
+                        "num_hosts_excluded": 3,
+                        "num_services": 4,
+                        "num_services_excluded": 5,
+                        "extensions": {
+                            "ntop": True,
+                        },
+                    },
+                ],
+            },
+            LocalLicenseUsageHistory(
+                [
+                    LicenseUsageSample(
+                        instance_id=UUID("937495cb-78f7-40d4-9b5f-f2c5a81e66b8"),
+                        site_hash="site-hash",
+                        version="",
+                        edition="",
+                        platform="A very long string with len>50 describing the plat",
+                        is_cma=False,
+                        sample_time=1,
+                        timezone="",
+                        num_hosts=2,
+                        num_hosts_cloud=0,
+                        num_hosts_shadow=0,
+                        num_hosts_excluded=3,
+                        num_services=4,
+                        num_services_cloud=0,
+                        num_services_shadow=0,
+                        num_services_excluded=5,
+                        num_synthetic_tests=0,
+                        num_synthetic_tests_excluded=0,
+                        num_synthetic_kpis=0,
+                        num_synthetic_kpis_excluded=0,
+                        extension_ntop=True,
+                    ),
+                ]
+            ),
+            id="1.3",
+        ),
+        pytest.param(
+            {
+                "VERSION": "1.4",
+                "history": [
+                    {
+                        "version": "",
+                        "edition": "",
+                        "platform": (
+                            "A very long string with len>50 describing the platform"
+                            " a Checkmk server is operating on."
+                        ),
+                        "is_cma": False,
+                        "sample_time": 1,
+                        "timezone": "",
+                        "num_hosts": 2,
+                        "num_shadow_hosts": 1,
+                        "num_hosts_excluded": 3,
+                        "num_services": 4,
+                        "num_services_excluded": 5,
+                        "extensions": {
+                            "ntop": True,
+                        },
+                    },
+                ],
+            },
+            LocalLicenseUsageHistory(
+                [
+                    LicenseUsageSample(
+                        instance_id=UUID("937495cb-78f7-40d4-9b5f-f2c5a81e66b8"),
+                        site_hash="site-hash",
+                        version="",
+                        edition="",
+                        platform="A very long string with len>50 describing the plat",
+                        is_cma=False,
+                        sample_time=1,
+                        timezone="",
+                        num_hosts=2,
+                        num_hosts_cloud=0,
+                        num_hosts_shadow=1,
+                        num_hosts_excluded=3,
+                        num_services=4,
+                        num_services_cloud=0,
+                        num_services_shadow=0,
+                        num_services_excluded=5,
+                        num_synthetic_tests=0,
+                        num_synthetic_tests_excluded=0,
+                        num_synthetic_kpis=0,
+                        num_synthetic_kpis_excluded=0,
+                        extension_ntop=True,
+                    ),
+                ]
+            ),
+            id="1.4",
+        ),
+        pytest.param(
+            {
+                "VERSION": "1.5",
+                "history": [
+                    {
+                        "instance_id": "4b66f726-c4fc-454b-80a6-4917d1b386ce",
+                        "version": "",
+                        "edition": "",
+                        "platform": (
+                            "A very long string with len>50 describing the platform"
+                            " a Checkmk server is operating on."
+                        ),
+                        "is_cma": False,
+                        "sample_time": 1,
+                        "timezone": "",
+                        "num_hosts": 2,
+                        "num_shadow_hosts": 1,
+                        "num_hosts_excluded": 3,
+                        "num_services": 4,
+                        "num_services_excluded": 5,
+                        "extensions": {
+                            "ntop": True,
+                        },
+                    },
+                ],
+            },
+            LocalLicenseUsageHistory(
+                [
+                    LicenseUsageSample(
+                        instance_id=UUID("4b66f726-c4fc-454b-80a6-4917d1b386ce"),
+                        site_hash="site-hash",
+                        version="",
+                        edition="",
+                        platform="A very long string with len>50 describing the plat",
+                        is_cma=False,
+                        sample_time=1,
+                        timezone="",
+                        num_hosts=2,
+                        num_hosts_cloud=0,
+                        num_hosts_shadow=1,
+                        num_hosts_excluded=3,
+                        num_services=4,
+                        num_services_cloud=0,
+                        num_services_shadow=0,
+                        num_services_excluded=5,
+                        num_synthetic_tests=0,
+                        num_synthetic_tests_excluded=0,
+                        num_synthetic_kpis=0,
+                        num_synthetic_kpis_excluded=0,
+                        extension_ntop=True,
+                    ),
+                ]
+            ),
+            id="1.5",
+        ),
+        pytest.param(
             {
                 "VERSION": "2.0",
                 "history": [
@@ -418,12 +657,17 @@ def test_serialize_license_usage_report() -> None:
                         num_services_cloud=2,
                         num_services_shadow=7,
                         num_services_excluded=5,
+                        num_synthetic_tests=0,
+                        num_synthetic_tests_excluded=0,
+                        num_synthetic_kpis=0,
+                        num_synthetic_kpis_excluded=0,
                         extension_ntop=True,
                     ),
                 ]
             ),
+            id="2.0",
         ),
-        (
+        pytest.param(
             {
                 "VERSION": "2.1",
                 "history": [
@@ -470,10 +714,135 @@ def test_serialize_license_usage_report() -> None:
                         num_services_cloud=2,
                         num_services_shadow=7,
                         num_services_excluded=5,
+                        num_synthetic_tests=0,
+                        num_synthetic_tests_excluded=0,
+                        num_synthetic_kpis=0,
+                        num_synthetic_kpis_excluded=0,
                         extension_ntop=True,
                     ),
                 ]
             ),
+            id="2.1",
+        ),
+        pytest.param(
+            {
+                "VERSION": "3.0",
+                "history": [
+                    {
+                        "instance_id": "4b66f726-c4fc-454b-80a6-4917d1b386ce",
+                        "site_hash": "the-site-hash",
+                        "version": "",
+                        "edition": "",
+                        "platform": (
+                            "A very long string with len>50 describing the platform"
+                            " a Checkmk server is operating on."
+                        ),
+                        "is_cma": False,
+                        "sample_time": 1,
+                        "timezone": "",
+                        "num_hosts": 2,
+                        "num_hosts_cloud": 1,
+                        "num_hosts_shadow": 6,
+                        "num_hosts_excluded": 3,
+                        "num_services": 4,
+                        "num_services_cloud": 2,
+                        "num_services_shadow": 7,
+                        "num_services_excluded": 5,
+                        "num_synthetic_tests": 1,
+                        "num_synthetic_tests_excluded": 2,
+                        "extension_ntop": True,
+                    },
+                ],
+            },
+            LocalLicenseUsageHistory(
+                [
+                    LicenseUsageSample(
+                        instance_id=UUID("4b66f726-c4fc-454b-80a6-4917d1b386ce"),
+                        site_hash="the-site-hash",
+                        version="",
+                        edition="",
+                        platform="A very long string with len>50 describing the plat",
+                        is_cma=False,
+                        sample_time=1,
+                        timezone="",
+                        num_hosts=2,
+                        num_hosts_cloud=1,
+                        num_hosts_shadow=6,
+                        num_hosts_excluded=3,
+                        num_services=4,
+                        num_services_cloud=2,
+                        num_services_shadow=7,
+                        num_services_excluded=5,
+                        num_synthetic_tests=1,
+                        num_synthetic_tests_excluded=2,
+                        num_synthetic_kpis=0,
+                        num_synthetic_kpis_excluded=0,
+                        extension_ntop=True,
+                    ),
+                ]
+            ),
+            id="3.0",
+        ),
+        pytest.param(
+            {
+                "VERSION": "3.1",
+                "history": [
+                    {
+                        "instance_id": "4b66f726-c4fc-454b-80a6-4917d1b386ce",
+                        "site_hash": "the-site-hash",
+                        "version": "",
+                        "edition": "",
+                        "platform": (
+                            "A very long string with len>50 describing the platform"
+                            " a Checkmk server is operating on."
+                        ),
+                        "is_cma": False,
+                        "sample_time": 1,
+                        "timezone": "",
+                        "num_hosts": 2,
+                        "num_hosts_cloud": 1,
+                        "num_hosts_shadow": 6,
+                        "num_hosts_excluded": 3,
+                        "num_services": 4,
+                        "num_services_cloud": 2,
+                        "num_services_shadow": 7,
+                        "num_services_excluded": 5,
+                        "num_synthetic_tests": 1,
+                        "num_synthetic_tests_excluded": 2,
+                        "num_synthetic_kpis": 3,
+                        "num_synthetic_kpis_excluded": 4,
+                        "extension_ntop": True,
+                    },
+                ],
+            },
+            LocalLicenseUsageHistory(
+                [
+                    LicenseUsageSample(
+                        instance_id=UUID("4b66f726-c4fc-454b-80a6-4917d1b386ce"),
+                        site_hash="the-site-hash",
+                        version="",
+                        edition="",
+                        platform="A very long string with len>50 describing the plat",
+                        is_cma=False,
+                        sample_time=1,
+                        timezone="",
+                        num_hosts=2,
+                        num_hosts_cloud=1,
+                        num_hosts_shadow=6,
+                        num_hosts_excluded=3,
+                        num_services=4,
+                        num_services_cloud=2,
+                        num_services_shadow=7,
+                        num_services_excluded=5,
+                        num_synthetic_tests=1,
+                        num_synthetic_tests_excluded=2,
+                        num_synthetic_kpis=3,
+                        num_synthetic_kpis_excluded=4,
+                        extension_ntop=True,
+                    ),
+                ]
+            ),
+            id="3.1",
         ),
     ],
 )
@@ -481,7 +850,7 @@ def test_license_usage_report(
     raw_report: Mapping[str, Any],
     expected_history: LocalLicenseUsageHistory,
 ) -> None:
-    history = LocalLicenseUsageHistory.parse(
+    history = LocalLicenseUsageHistory.update(
         raw_report,
         instance_id=UUID("937495cb-78f7-40d4-9b5f-f2c5a81e66b8"),
         site_hash="site-hash",
@@ -503,43 +872,46 @@ def test_license_usage_report(
         assert sample.num_services_cloud == expected_sample.num_services_cloud
         assert sample.num_services_shadow == expected_sample.num_services_shadow
         assert sample.num_services_excluded == expected_sample.num_services_excluded
+        assert sample.num_synthetic_tests == expected_sample.num_synthetic_tests
+        assert sample.num_synthetic_tests_excluded == expected_sample.num_synthetic_tests_excluded
         assert sample.extension_ntop == expected_sample.extension_ntop
 
 
 def test_license_usage_report_from_remote() -> None:
-    raw_report = {
-        "VERSION": "-1",
-        "history": [
+    with pytest.raises(ValueError) as e:
+        LocalLicenseUsageHistory.parse(
             {
-                "instance_id": "4b66f726-c4fc-454b-80a6-4917d1b386ce",
-                "site_hash": "remote-site-hash",
-                "version": "",
-                "edition": "",
-                "platform": (
-                    "A very long string with len>50 describing the platform"
-                    " a Checkmk server is operating on."
-                ),
-                "is_cma": False,
-                "sample_time": 1,
-                "timezone": "",
-                "num_hosts": 2,
-                "num_hosts_cloud": 1,
-                "num_hosts_shadow": 6,
-                "num_hosts_excluded": 3,
-                "num_services": 4,
-                "num_services_cloud": 2,
-                "num_services_shadow": 7,
-                "num_services_excluded": 5,
-                "extension_ntop": True,
-                "VERY_NEW_FIELD": "VERY NEW VALUE",
+                "VERSION": "-1",
+                "history": [
+                    {
+                        "instance_id": "4b66f726-c4fc-454b-80a6-4917d1b386ce",
+                        "site_hash": "remote-site-hash",
+                        "version": "",
+                        "edition": "",
+                        "platform": (
+                            "A very long string with len>50 describing the platform"
+                            " a Checkmk server is operating on."
+                        ),
+                        "is_cma": False,
+                        "sample_time": 1,
+                        "timezone": "",
+                        "num_hosts": 2,
+                        "num_hosts_cloud": 1,
+                        "num_hosts_shadow": 6,
+                        "num_hosts_excluded": 3,
+                        "num_services": 4,
+                        "num_services_cloud": 2,
+                        "num_services_shadow": 7,
+                        "num_services_excluded": 5,
+                        "num_synthetic_tests": 1,
+                        "num_synthetic_tests_excluded": 2,
+                        "extension_ntop": True,
+                        "VERY_NEW_FIELD": "VERY NEW VALUE",
+                    }
+                ],
             }
-        ],
-    }
-    site_hash = "remote-site-hash-2"
-    with pytest.raises(UnknownSampleParserError) as e:
-        LocalLicenseUsageHistory.parse_from_remote(raw_report, site_hash=site_hash)
-
-    assert str(e.value) == "Unknown report version: '-1'"
+        )
+    assert str(e.value) == "Unknown protocol version: '-1'"
 
 
 def test_history_add_sample() -> None:
@@ -563,6 +935,10 @@ def test_history_add_sample() -> None:
                 num_services_cloud=0,
                 num_services_shadow=0,
                 num_services_excluded=5,
+                num_synthetic_tests=1,
+                num_synthetic_tests_excluded=2,
+                num_synthetic_kpis=3,
+                num_synthetic_kpis_excluded=4,
                 extension_ntop=False,
             ),
         )
@@ -584,6 +960,10 @@ def test_history_add_sample() -> None:
         num_services_cloud=0,
         num_services_shadow=0,
         num_services_excluded=5,
+        num_synthetic_tests=1,
+        num_synthetic_tests_excluded=2,
+        num_synthetic_kpis=3,
+        num_synthetic_kpis_excluded=4,
         extension_ntop=False,
     )
 
@@ -594,12 +974,15 @@ def test_cloud_service_prefixes_up_to_date():
      prefixes, update the prefix list or update the manpage catalog"""
     not_cloud_for_licensing_purposes = ["datadog"]
 
-    def is_cloud_manpage(catalog_path: ManPageCatalogPath) -> bool:
+    def is_cloud_manpage(catalog_path: man_pages.ManPageCatalogPath) -> bool:
         return (
             catalog_path[0] == "cloud" and catalog_path[1] not in not_cloud_for_licensing_purposes
         )
 
-    catalog = load_man_page_catalog()
+    catalog = man_pages.load_man_page_catalog(
+        discover_families(raise_errors=True), PluginGroup.CHECKMAN.value
+    )
+
     cloud_man_pages = [
         manpage
         for catalog_path, man_pages in catalog.items()
@@ -628,6 +1011,10 @@ def test_history_try_add_sample_from_same_day() -> None:
         num_services_cloud=0,
         num_services_shadow=0,
         num_services_excluded=5,
+        num_synthetic_tests=1,
+        num_synthetic_tests_excluded=2,
+        num_synthetic_kpis=3,
+        num_synthetic_kpis_excluded=4,
         extension_ntop=False,
     )
     history = LocalLicenseUsageHistory([first_sample])
@@ -649,6 +1036,10 @@ def test_history_try_add_sample_from_same_day() -> None:
             num_services_cloud=0,
             num_services_shadow=0,
             num_services_excluded=6,
+            num_synthetic_tests=5,
+            num_synthetic_tests_excluded=6,
+            num_synthetic_kpis=7,
+            num_synthetic_kpis_excluded=8,
             extension_ntop=True,
         )
     )
@@ -667,3 +1058,12 @@ def test_save_load_extensions(expected_extensions: LicenseUsageExtensions) -> No
     save_extensions(expected_extensions)
 
     assert _load_extensions() == expected_extensions
+
+
+@pytest.mark.parametrize(
+    "expected_ntop_enabled",
+    [pytest.param(True, id="ntop enabled"), pytest.param(False, id="ntop disabled")],
+)
+def test_LicenseUsageExtensions_parse(expected_ntop_enabled: bool) -> None:
+    extensions = _parse_extensions(LicenseUsageExtensions(ntop=expected_ntop_enabled).for_report())
+    assert extensions.ntop is expected_ntop_enabled

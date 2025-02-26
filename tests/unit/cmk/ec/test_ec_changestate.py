@@ -6,13 +6,12 @@
 
 import pytest
 
-from tests.testlib import CMKEventConsole
+from tests.unit.cmk.ec.helpers import FakeStatusSocket, new_event
 
-from tests.unit.cmk.ec.helpers import FakeStatusSocket
+from cmk.utils.hostaddress import HostName
 
-from cmk.utils.type_defs import HostName
-
-from cmk.ec.main import Event, EventStatus, StatusServer
+import cmk.ec.export as ec
+from cmk.ec.main import EventStatus, StatusServer
 from cmk.ec.query import MKClientError
 
 
@@ -29,12 +28,12 @@ def test_changestate_of_nonexistent_event(status_server: StatusServer) -> None:
 
 def test_change_event_state(event_status: EventStatus, status_server: StatusServer) -> None:
     """Changestate 1 event."""
-    event: Event = {
-        "host": "ABC1",
-        "text": "not important",
-        "core_host": HostName("ABC"),
-    }
-    event_status.new_event(CMKEventConsole.new_event(event))
+    event = ec.Event(
+        host=HostName("ABC1"),
+        text="not important",
+        core_host=HostName("ABC"),
+    )
+    event_status.new_event(new_event(event))
     assert len(event_status.events()) == 1
 
     s = FakeStatusSocket(b"COMMAND CHANGESTATE;1;testuser;2")
@@ -47,20 +46,20 @@ def test_changetestate_of_multiple_events(
     event_status: EventStatus, status_server: StatusServer
 ) -> None:
     """Changestate event list."""
-    events: list[Event] = [
+    events: list[ec.Event] = [
         {
-            "host": "ABC1",
+            "host": HostName("ABC1"),
             "text": "event1 text",
             "core_host": HostName("ABC"),
         },
         {
-            "host": "ABC2",
+            "host": HostName("ABC2"),
             "text": "event2 text",
             "core_host": HostName("ABC"),
         },
     ]
     for event in events:
-        event_status.new_event(CMKEventConsole.new_event(event))
+        event_status.new_event(new_event(event))
 
     assert len(event_status.events()) == 2
 
@@ -75,20 +74,20 @@ def test_changestate_of_partially_existing_multiple_events(
     event_status: EventStatus, status_server: StatusServer
 ) -> None:
     """Event list with a missing ID still changes the state of the existing event IDs"""
-    events: list[Event] = [
+    events: list[ec.Event] = [
         {
-            "host": "ABC1",
+            "host": HostName("ABC1"),
             "text": "event1 text",
             "core_host": HostName("ABC"),
         },
         {
-            "host": "ABC2",
+            "host": HostName("ABC2"),
             "text": "event2 text",
             "core_host": HostName("ABC"),
         },
     ]
     for event in events:
-        event_status.new_event(CMKEventConsole.new_event(event))
+        event_status.new_event(new_event(event))
 
     assert len(event_status.events()) == 2
 

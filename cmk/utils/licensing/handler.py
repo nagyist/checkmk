@@ -10,7 +10,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import auto, Enum
+from pathlib import Path
 from typing import NamedTuple
+
+from cmk.ccc import store
 
 
 class LicenseState(Enum):
@@ -49,19 +52,48 @@ class EmailNotification:
 @dataclass
 class HeaderNotification:
     roles: Sequence[str]
+    subject: str
+    message_lines: Sequence[str]
+
+    @property
+    def message_html(self) -> str:
+        message = "<br><br>".join(self.message_lines)
+        return f"<b>{self.subject}</b><br><br>{message}"
+
+
+@dataclass
+class HeaderNotificationSingleLine:
+    roles: Sequence[str]
+    subject: str
     message: str
+
+    @property
+    def message_html(self) -> str:
+        return f"<b>{self.subject}</b> {self.message}"
 
 
 @dataclass
 class ActivationBlock:
-    message: str
+    subject: str
+    message_lines: Sequence[str]
+
+    @property
+    def message_raw(self) -> str:
+        message = "\n".join(self.message_lines)
+        return f"{self.subject}\n{message}"
+
+    @property
+    def message_html(self) -> str:
+        message = "<br>".join(self.message_lines)
+        return f"<b>{self.subject}</b><br>{message}"
 
 
 @dataclass
 class UserEffect:
-    header: HeaderNotification | None
+    header: HeaderNotification | HeaderNotificationSingleLine | None
     email: EmailNotification | None
     block: ActivationBlock | None
+    banner: HeaderNotificationSingleLine | None = None
 
 
 class NotificationHandler(abc.ABC):
@@ -75,6 +107,7 @@ class NotificationHandler(abc.ABC):
 
 class RemainingTrialTime(NamedTuple):
     days: int
+    hours: int
     perc: float
 
 
@@ -108,5 +141,14 @@ class LicensingHandler(abc.ABC):
         raise NotImplementedError()
 
     @property
-    def remaining_trial_time(self) -> RemainingTrialTime:
+    def remaining_trial_time_rounded(self) -> RemainingTrialTime:
         raise NotImplementedError()
+
+    def persist_licensed_state(self, file_path: Path) -> None:
+        write_licensed_state(file_path, self.state)
+
+
+def write_licensed_state(file_path: Path, state: LicenseState) -> None:
+    state_repr = 1 if state is LicenseState.LICENSED else 0
+    with store.locked(file_path):
+        file_path.write_text(str(state_repr))

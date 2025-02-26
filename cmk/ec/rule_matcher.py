@@ -6,16 +6,18 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from logging import Logger
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from livestatus import SiteId
 
-from cmk.utils.type_defs import TimeperiodName
+import cmk.utils.regex
+from cmk.utils.timeperiod import TimeperiodName
 
-from .config import MatchGroups, Rule, TextMatchResult, TextPattern
+from .config import MatchGroups, Rule, StatePatterns, TextMatchResult, TextPattern
 from .event import Event
 
 
@@ -38,11 +40,90 @@ class MatchSuccess:
 MatchResult = MatchFailure | MatchSuccess
 
 
-def match(pattern: TextPattern, text: str, complete: bool) -> TextMatchResult:
-    """Performs an EC style matching test of pattern on text
+def compile_matching_value(key: str, original_value: str) -> TextPattern | None:
+    """Tries to convert a string to a compiled regex pattern.
+
+    If the value is empty, it returns None.
+    Or returns the value.lower() if it is not a regex.
+
+    The leading '.*' is removed from the regex since it has a performance impact.
+    See the benchmarks last 4 lines on a longer string here:
+
+    Testing pattern         'ODBC' on test_string:  0.00043 seconds
+    Testing pattern         '.*ODBC' on test_string:        0.00049 seconds
+    Testing pattern         '.*ODBC.*' on test_string:      0.00049 seconds
+    Testing pattern         'ODBC.*' on test_string:        0.00050 seconds
+    Testing pattern         'ODBC' on test_string:  0.00076 seconds
+    Testing pattern         '.*ODBC' on test_string:        0.09972 seconds
+    Testing pattern         '.*ODBC.*' on test_string:      0.10019 seconds
+    Testing pattern         'ODBC.*' on test_string:        0.00056 seconds
+
+    Especially the search is dramatically slower on a NON-MATCHING long(100 characters) string.
+
+    """
+
+    value = original_value.strip()
+    # Remove leading .* from regex. This is redundant and
+    # dramatically destroys performance when doing an infix search.
+    if key in {"match", "match_ok"}:
+        while value.startswith(".*") and not value.startswith(".*?"):
+            value = value[2:]
+    if not value:
+        return None
+    if cmk.utils.regex.is_regex(value):
+        return re.compile(value, re.IGNORECASE)
+    return value.lower()
+
+
+def compile_rule_attribute(
+    rule: Rule,
+    key: Literal["match", "match_ok", "match_host", "match_application", "cancel_application"],
+) -> None:
+    if key not in rule:
+        return
+    value = rule[key]
+    if not isinstance(value, str):  # TODO: Remove when we have CompiledRule
+        raise ValueError(f"attribute {key} of rule {rule['id']} already compiled")
+    compiled_value = compile_matching_value(key, value)
+    if compiled_value is None:
+        del rule[key]
+    else:
+        rule[key] = compiled_value
+
+
+def compile_state_pattern(state_patterns: StatePatterns, key: Literal["0", "1", "2"]) -> None:
+    if key not in state_patterns:
+        return
+    value = state_patterns[key]
+    if not isinstance(value, str):  # TODO: Remove when we have CompiledRule
+        raise ValueError(f"state pattern {key} already compiled")
+    compiled_value = compile_matching_value("state", value)
+    if compiled_value is None:
+        del state_patterns[key]
+    else:
+        state_patterns[key] = compiled_value
+
+
+def compile_rule(rule: Rule) -> None:
+    """Tries to convert strings to compiled regex patterns."""
+    compile_rule_attribute(rule, "match")
+    compile_rule_attribute(rule, "match_ok")
+    compile_rule_attribute(rule, "match_host")
+    compile_rule_attribute(rule, "match_application")
+    compile_rule_attribute(rule, "cancel_application")
+    if "state" in rule and isinstance(rule["state"], tuple) and rule["state"][0] == "text_pattern":
+        state_patterns: StatePatterns = rule["state"][1]
+        compile_state_pattern(state_patterns, "2")
+        compile_state_pattern(state_patterns, "1")
+        compile_state_pattern(state_patterns, "0")
+
+
+def match(pattern: TextPattern | None, text: str, complete: bool) -> TextMatchResult:
+    """Performs an EC style matching test of pattern on text.
 
     Returns False in case of no match or a tuple with the match groups.
-    In case no match group is produced, it returns an empty tuple."""
+    In case no match group is produced, it returns an empty tuple.
+    """
     if pattern is None:
         return ()
     if isinstance(pattern, str):
@@ -52,7 +133,7 @@ def match(pattern: TextPattern, text: str, complete: bool) -> TextMatchResult:
     return m.groups("") if m else False
 
 
-def format_pattern(pattern: TextPattern) -> str:
+def format_pattern(pattern: TextPattern | None) -> str:
     if pattern is None:
         return str(pattern)
     if isinstance(pattern, str):
@@ -89,13 +170,12 @@ class RuleMatcher:
         omd_site_id: SiteId,
         is_active_time_period: Callable[[TimeperiodName], bool],
     ) -> None:
-        super().__init__()
         self._logger = logger
         self._omd_site = omd_site_id
         self._is_active_time_period = is_active_time_period
 
     def _log_rule_matching(self, message: str, *args: object, indent: bool = True) -> None:
-        """Check if logger is present and log the message as info level"""
+        """Check if logger is present and log the message as info level."""
         if self._logger:
             self._logger.info(f"  {message}" if indent else message, *args)
 
@@ -130,9 +210,7 @@ class RuleMatcher:
         return self._check_match_outcome(rule, match_groups, match_priority)
 
     def event_rule_matches(self, rule: Rule, event: Event) -> MatchResult:
-        """
-        Matches the rule and inverts the match if invert_matching is true
-        """
+        """Matches the rule and inverts the match if invert_matching is true."""
         result = self.event_rule_matches_non_inverted(rule, event)
         if rule.get("invert_matching"):
             if isinstance(result, MatchFailure):
@@ -145,11 +223,10 @@ class RuleMatcher:
                 self._log_rule_matching(result.reason)
         return result
 
-    def _check_match_outcome(  # pylint: disable=too-many-branches
+    def _check_match_outcome(
         self, rule: Rule, match_groups: MatchGroups, match_priority: MatchPriority
     ) -> MatchResult:
-        """Decide or not a event is created, canceled or nothing is done"""
-
+        """Decide or not a event is created, canceled or nothing is done."""
         # Check canceling-event
         has_canceling_condition = bool(
             [x for x in ["match_ok", "cancel_application", "cancel_priority"] if x in rule]

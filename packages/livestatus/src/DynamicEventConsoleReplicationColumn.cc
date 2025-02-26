@@ -8,16 +8,19 @@
 #include <filesystem>
 #include <iosfwd>
 #include <iterator>
+#include <memory>
+#include <ostream>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "livestatus/BlobColumn.h"
+#include "livestatus/Column.h"
 #include "livestatus/EventConsoleConnection.h"
+#include "livestatus/ICore.h"
 #include "livestatus/Interface.h"
 #include "livestatus/Logger.h"
-#include "livestatus/MonitoringCore.h"
 
 class TableEventConsoleReplication;
 
@@ -40,7 +43,7 @@ private:
 }  // namespace
 
 DynamicEventConsoleReplicationColumn::DynamicEventConsoleReplicationColumn(
-    const std::string &name, const std::string &description, MonitoringCore *mc,
+    const std::string &name, const std::string &description, ICore *mc,
     const ColumnOffsets &offsets)
     : DynamicColumn(name, description, offsets), _mc(mc) {}
 

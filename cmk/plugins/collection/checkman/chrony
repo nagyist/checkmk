@@ -1,0 +1,23 @@
+title: Chrony: NTP Time Synchronization
+agents: linux
+catalog: os/services
+license: GPLv2
+distribution: check_mk
+description:
+ This check uses the output of {chronyc tracking} in order to
+ check the time synchronization when using {chrony}. The check
+ is very similar to {ntp}, which monitors the {ntpd}, but it
+ does not support jitter.
+
+ You can set levels for the maximum stratum and for the time offset
+ in milliseconds. The configuration is compatible with {ntp}.
+
+ The default {WARN} alert is set to 1025 seconds
+ (default chrony's {maxpoll} values is 1024 seconds,
+ see https://chrony-project.org/examples.html#_client_using_public_servers)
+ and thus differs from the default {WARN} alert of the {NTP} check.
+
+ When {chrony} is not found running, the check goes to {CRIT}.
+
+discovery:
+ One service is created if chrony is running.

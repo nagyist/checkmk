@@ -3,20 +3,22 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
+import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
+import time_machine
 from pytest_mock import MockerFixture
 
-from tests.testlib import on_time
-
+from cmk.utils.hostaddress import HostName
 from cmk.utils.livestatus_helpers.testing import MockLiveStatusConnection
 from cmk.utils.paths import default_config_dir
-from cmk.utils.type_defs import HostName
 
 from cmk.gui.watolib import automatic_host_removal
-from cmk.gui.watolib.hosts_and_folders import Folder
+from cmk.gui.watolib.hosts_and_folders import folder_tree
 from cmk.gui.watolib.rulesets import FolderRulesets, Rule, RuleConditions, RuleOptions, Ruleset
 
 
@@ -35,16 +37,16 @@ def fixture_activate_changes(mocker: MockerFixture) -> MagicMock:
 
 
 def test_remove_hosts_no_rules_early_return(
-    mocker: MockerFixture,
     activate_changes_mock: MagicMock,
+    request_context: None,
 ) -> None:
-    automatic_host_removal._remove_hosts(mocker.MagicMock())
+    automatic_host_removal.execute_host_removal_job()
     activate_changes_mock.assert_not_called()
 
 
 @pytest.fixture(name="setup_hosts")
 def fixture_setup_hosts() -> None:
-    Folder.root_folder().create_hosts(
+    folder_tree().root_folder().create_hosts(
         [
             (hostname, {}, None)
             for hostname in (
@@ -60,7 +62,7 @@ def fixture_setup_hosts() -> None:
 
 @pytest.fixture(name="setup_rules")
 def fixture_setup_rules() -> None:
-    root_folder = Folder.root_folder()
+    root_folder = folder_tree().root_folder()
     ruleset = Ruleset("automatic_host_removal", {})
     ruleset.append_rule(
         root_folder,
@@ -71,10 +73,10 @@ def fixture_setup_rules() -> None:
             conditions=RuleConditions(
                 host_folder=root_folder.path(),
                 host_tags=None,
-                host_labels=None,
+                host_label_groups=None,
                 host_name=["host_crit_remove", "host_crit_keep", "host_ok"],
                 service_description=None,
-                service_labels=None,
+                service_label_groups=None,
             ),
             options=RuleOptions(
                 disabled=None,
@@ -97,10 +99,10 @@ def fixture_setup_rules() -> None:
             conditions=RuleConditions(
                 host_folder=root_folder.path(),
                 host_tags=None,
-                host_labels=None,
+                host_label_groups=None,
                 host_name=["host_removal_disabled"],
                 service_description=None,
-                service_labels=None,
+                service_label_groups=None,
             ),
             options=RuleOptions(
                 disabled=None,
@@ -115,7 +117,7 @@ def fixture_setup_rules() -> None:
         ),
     )
     (Path(default_config_dir) / "main.mk").touch()
-    FolderRulesets({"automatic_host_removal": ruleset}, folder=root_folder).save()
+    FolderRulesets({"automatic_host_removal": ruleset}, folder=root_folder).save_folder()
 
 
 @pytest.fixture(name="setup_livestatus_mock")
@@ -171,13 +173,15 @@ def fixture_mock_delete_hosts_automation(mocker: MockerFixture) -> MagicMock:
 @pytest.mark.usefixtures("setup_rules")
 @pytest.mark.usefixtures("setup_livestatus_mock")
 @pytest.mark.usefixtures("with_admin_login")
-def test_remove_hosts(
-    mocker: MockerFixture,
+def test_execute_host_removal_job(
     mock_livestatus: MockLiveStatusConnection,
     activate_changes_mock: MagicMock,
     mock_delete_hosts_automation: MagicMock,
 ) -> None:
-    with on_time(1000, "UTC"), mock_livestatus(expect_status_query=False):
+    with (
+        time_machine.travel(datetime.datetime.fromtimestamp(1000, tz=ZoneInfo("UTC"))),
+        mock_livestatus(expect_status_query=False),
+    ):
         mock_livestatus.expect_query(
             [
                 "GET services",
@@ -187,9 +191,9 @@ def test_remove_hosts(
                 "ColumnHeaders: off",
             ]
         )
-        automatic_host_removal._remove_hosts(mocker.MagicMock())
+        automatic_host_removal.execute_host_removal_job()
 
-    assert sorted(Folder.root_folder().all_hosts_recursively()) == [
+    assert sorted(folder_tree().root_folder().all_hosts_recursively()) == [
         "host_crit_keep",
         "host_no_rule_match",
         "host_ok",

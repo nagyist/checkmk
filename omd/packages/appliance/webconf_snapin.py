@@ -8,13 +8,13 @@ import json
 import subprocess
 from pathlib import Path
 
-import cmk.utils.version as cmk_version
+import cmk.ccc.version as cmk_version
 
 from cmk.gui.htmllib.html import html  # pylint: disable=cmk-module-layer-violation
 
 # Does not detect the module hierarchy correctly. Imports are fine.
 from cmk.gui.i18n import _  # pylint: disable=cmk-module-layer-violation
-from cmk.gui.plugins.sidebar.utils import (  # pylint: disable=cmk-module-layer-violation
+from cmk.gui.sidebar import (  # pylint: disable=cmk-module-layer-violation
     SidebarSnapin,
     snapin_registry,
 )
@@ -24,7 +24,6 @@ def nav_modules_path() -> Path:
     return Path("/usr/share/cma/webconf/nav_modules")
 
 
-@snapin_registry.register
 class SidebarSnapinCMAWebconf(SidebarSnapin):
     @staticmethod
     def type_name() -> str:
@@ -113,6 +112,9 @@ class SidebarSnapinCMAWebconf(SidebarSnapin):
     def _iconlink(self, text: str, url: str, icon: str) -> None:
         html.open_a(class_=["iconlink", "link"], target="main", href=url)
         html.icon("/webconf/images/icon_%s.png" % icon, cssclass="inline")
-        html.write_text(text)
+        html.write_text_permissive(text)
         html.close_a()
         html.br()
+
+
+snapin_registry.register(SidebarSnapinCMAWebconf)

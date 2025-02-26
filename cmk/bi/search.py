@@ -8,12 +8,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from marshmallow import fields, post_dump, pre_load
+from marshmallow import post_dump, post_load, pre_dump, pre_load
 from marshmallow_oneofschema import OneOfSchema
 
+from cmk.utils.hostaddress import HostName
+from cmk.utils.labels import AndOrNotLiteral, LabelGroup
 from cmk.utils.macros import MacroMapping
-from cmk.utils.type_defs import HostName
 
+from cmk import fields
 from cmk.bi.lib import (
     ABCBISearch,
     ABCBISearcher,
@@ -33,17 +35,21 @@ from cmk.bi.schema import Schema
 
 
 class BIAllHostsChoiceSchema(Schema):
-    type = ReqConstant("all_hosts")
+    type = ReqConstant("all_hosts", description="Select all hosts.")
 
 
 class BIHostNameRegexChoiceSchema(Schema):
-    type = ReqConstant("host_name_regex")
-    pattern = ReqString(dump_default="", example="testhostn.*")
+    type = ReqConstant(
+        "host_name_regex", description="Select hosts based on a regex against their host name."
+    )
+    pattern = ReqString(dump_default="", example="testhostn.*", description="Regex pattern.")
 
 
 class BIHostAliasRegexChoiceSchema(Schema):
-    type = ReqConstant("host_alias_regex")
-    pattern = ReqString(dump_default="", example="testali.*")
+    type = ReqConstant(
+        "host_alias_regex", description="Select hosts based on a regex against their alias."
+    )
+    pattern = ReqString(dump_default="", example="testali.*", description="Regex pattern.")
 
 
 class BIHostChoice(OneOfSchema):
@@ -59,18 +65,108 @@ class BIHostChoice(OneOfSchema):
         return obj["type"]
 
 
+class LabelConditionSchema(Schema):
+    operator = ReqString(enum=["and", "or", "not"], description="Condition operator.")
+    label = ReqString(description="Label name and value.")
+
+
+class LabelGroupConditionSchema(Schema):
+    operator = fields.String(
+        enum=["and", "or", "not"],
+        description="Condition operator.",
+        load_default="and",
+    )
+    label_group = ReqList(
+        fields.Nested(LabelConditionSchema),
+        description="Label conditions.",
+    )
+
+    @pre_dump
+    def _pre_dump(
+        self, data: dict[str, Any] | tuple[AndOrNotLiteral, LabelGroup], **kwargs: Any
+    ) -> dict[str, Any]:
+        if isinstance(data, dict):
+            return data
+        return {
+            "operator": data[0],
+            "label_group": [{"operator": op, "label": val} for op, val in data[1]],
+        }
+
+    @post_load
+    def _post_load(self, data: dict[str, Any], **kwargs: Any) -> tuple[AndOrNotLiteral, LabelGroup]:
+        op: AndOrNotLiteral = data["operator"]
+        label_group: LabelGroup = [
+            (label_condition["operator"], label_condition["label"])
+            for label_condition in data["label_group"]
+        ]
+        return op, label_group
+
+
 class HostConditionsSchema(Schema):
-    host_folder = ReqString(dump_default="", example="servers/groupA")
-    host_labels = ReqDict(dump_default={}, example={"db": "mssql"})
-    host_tags = ReqDict(dump_default={}, example={})
+    host_folder = ReqString(dump_default="", example="servers/groupA", description="Host folder.")
+    host_label_groups = ReqList(
+        fields.Nested(LabelGroupConditionSchema),
+        dump_default=[],
+        example=[
+            {
+                "label_group": [
+                    {
+                        "operator": "and",
+                        "label": "db:mssql",
+                    },
+                ],
+            },
+            {
+                "operator": "and",
+                "label_group": [
+                    {
+                        "operator": "and",
+                        "label": "network/primary:yes",
+                    },
+                ],
+            },
+        ],
+        description="Host label conditions. Although all items in this list have a default operator"
+        " value, the operator value for the the first item in the list does not have any effect.",
+    )
+    host_tags = ReqDict(dump_default={}, example={}, description="Host tags.")
     host_choice = ReqNested(
-        BIHostChoice, dump_default={"type": "all_hosts"}, example={"type": "all_hosts"}
+        BIHostChoice,
+        dump_default={"type": "all_hosts"},
+        example={"type": "all_hosts"},
+        description="Host selection.",
     )
 
 
 class ServiceConditionsSchema(HostConditionsSchema):
-    service_regex = ReqString(dump_default="", example="Filesystem.*")
-    service_labels = ReqDict(dump_default={}, example={"db": "mssql"})
+    service_regex = ReqString(
+        dump_default="", example="Filesystem.*", description="Service name regex."
+    )
+    service_label_groups = ReqList(
+        fields.Nested(LabelGroupConditionSchema),
+        dump_default=[],
+        example=[
+            {
+                "label_group": [
+                    {
+                        "operator": "and",
+                        "label": "db:mssql",
+                    },
+                ],
+            },
+            {
+                "operator": "and",
+                "label_group": [
+                    {
+                        "operator": "and",
+                        "label": "network/primary:yes",
+                    },
+                ],
+            },
+        ],
+        description="Service label conditions. Although all items in this list have a default operator"
+        " value, the operator value for the the first item in the list does not have any effect.",
+    )
 
 
 #   .--Empty---------------------------------------------------------------.
@@ -103,7 +199,7 @@ class BIEmptySearch(ABCBISearch):
 
 
 class BIEmptySearchSchema(Schema):
-    type = ReqConstant(BIEmptySearch.kind())
+    type = ReqConstant(BIEmptySearch.kind(), description="Empty search.")
 
 
 #   .--Host----------------------------------------------------------------.
@@ -227,7 +323,9 @@ class BIHostSearch(ABCBISearch):
         )
         matched_hosts = bi_searcher.filter_host_folder(hosts, conditions["host_folder"])
         matched_hosts = bi_searcher.filter_host_tags(matched_hosts, conditions["host_tags"])
-        matched_hosts = bi_searcher.filter_host_labels(matched_hosts, conditions["host_labels"])
+        matched_hosts = bi_searcher.filter_host_labels(
+            matched_hosts, conditions["host_label_groups"]
+        )
 
         search_results = []
         for host in matched_hosts:
@@ -240,21 +338,32 @@ class BIHostSearch(ABCBISearch):
 
 
 class HostSchema(Schema):
-    type = ReqConstant("host")
+    type = ReqConstant("host", description="Create nodes from the matched hosts themselves.")
 
 
 class ParentSchema(Schema):
-    type = ReqConstant("parent")
+    type = ReqConstant("parent", description="Create nodes for all the parents of matched hosts.")
 
 
 class ChildSchema(Schema):
-    type = ReqConstant("child")
+    type = ReqConstant("child", description="Create nodes for all the children of matched hosts.")
 
 
 class ChildWithSchema(Schema):
-    conditions = ReqNested(HostConditionsSchema, dump_default=HostConditionsSchema().dump({}))
+    type = ReqConstant(
+        "child_with",
+        description="Create nodes for all the children of matched hosts that also match other conditions.",
+    )
+    conditions = ReqNested(
+        HostConditionsSchema,
+        dump_default=HostConditionsSchema().dump({}),
+        description="Extra conditions for the child.",
+    )
     host_choice = ReqNested(
-        BIHostChoice, dump_default={"type": "all_hosts"}, example={"type": "all_hosts"}
+        BIHostChoice,
+        dump_default={"type": "all_hosts"},
+        example={"type": "all_hosts"},
+        description="Child host selector.",
     )
 
 
@@ -269,15 +378,21 @@ class ReferToSchema(OneOfSchema):
     }
 
     def get_obj_type(self, obj: str | dict[str, Any]) -> str:
-        if isinstance(obj, str):
-            return obj
-        return obj["type"]
+        return obj if isinstance(obj, str) else obj["type"]
 
 
 class BIHostSearchSchema(Schema):
-    type = ReqConstant(BIHostSearch.kind())
-    conditions = ReqNested(HostConditionsSchema, dump_default=HostConditionsSchema().dump({}))
-    refer_to = ReqNested(ReferToSchema, dump_default={"type": "host"})
+    type = ReqConstant(BIHostSearch.kind(), description="Host search.")
+    conditions = ReqNested(
+        HostConditionsSchema,
+        dump_default=HostConditionsSchema().dump({}),
+        description="Host conditions.",
+    )
+    refer_to = ReqNested(
+        ReferToSchema,
+        dump_default={"type": "host"},
+        description="Create nodes based on the matched hosts, their parents or their children.",
+    )
 
     @pre_load
     def pre_load(self, data: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
@@ -288,10 +403,8 @@ class BIHostSearchSchema(Schema):
 
     @post_dump
     def post_dump(self, data: str | dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        if isinstance(data, str):
-            # Fixes legacy schema config: {"refer_to": "host"}
-            return {"type": data}
-        return data
+        # Fixes legacy schema config: {"refer_to": "host"}
+        return {"type": data} if isinstance(data, str) else data
 
 
 #   .--Service-------------------------------------------------------------.
@@ -344,8 +457,12 @@ class BIServiceSearch(ABCBISearch):
 
 
 class BIServiceSearchSchema(Schema):
-    type = ReqConstant(BIServiceSearch.kind())
-    conditions = ReqNested(ServiceConditionsSchema, dump_default=ServiceConditionsSchema().dump({}))
+    type = ReqConstant(BIServiceSearch.kind(), description="Service search.")
+    conditions = ReqNested(
+        ServiceConditionsSchema,
+        dump_default=ServiceConditionsSchema().dump({}),
+        description="Service conditions.",
+    )
 
 
 #   .--Fixed---------------------------------------------------------------.
@@ -386,19 +503,21 @@ class BIFixedArgumentsSearch(ABCBISearch):
             for idx, value in enumerate(argument["values"]):
                 if len(results) <= idx:
                     results.append({})
-                results[idx]["$%s$" % key] = value
+                results[idx][f"${key}$"] = value
 
         return results
 
 
 class BIFixedArgumentsSearchTokenSchema(Schema):
-    key = ReqString()
-    values = ReqList(fields.String)
+    key = ReqString(description="Argument name.")
+    values = ReqList(fields.String, description="Argument value.")
 
 
 class BIFixedArgumentsSearchSchema(Schema):
-    type = ReqConstant(BIFixedArgumentsSearch.kind())
-    arguments = ReqList(fields.Nested(BIFixedArgumentsSearchTokenSchema))
+    type = ReqConstant(BIFixedArgumentsSearch.kind(), description="Fixed search arguments.")
+    arguments = ReqList(
+        fields.Nested(BIFixedArgumentsSearchTokenSchema), description="Search arguments."
+    )
 
 
 #   .--Schemas-------------------------------------------------------------.
@@ -417,6 +536,4 @@ class BISearchSchema(OneOfSchema):
     type_schemas = {k: v.schema() for k, v in bi_search_registry.items()}
 
     def get_obj_type(self, obj: ABCBISearch | dict) -> str:
-        if isinstance(obj, dict):
-            return obj["type"]
-        return obj.kind()
+        return obj["type"] if isinstance(obj, dict) else obj.kind()

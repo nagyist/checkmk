@@ -3,11 +3,12 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 import logging
 
 import pytest
 
-from cmk.ec.main import Perfcounters
+from cmk.ec.perfcounters import Perfcounters
 
 logger = logging.getLogger("cmk.mkeventd")
 
@@ -76,22 +77,20 @@ def test_perfcounters_columns_match_status_length() -> None:
 def test_perfcounters_column_default_values() -> None:
     c = Perfcounters(logger)
     for column_name, default_value in c.status_columns():
-        if column_name.startswith("status_average_") and column_name.endswith("_time"):
-            assert isinstance(default_value, float)
-            assert default_value == 0.0
-
-        elif column_name.startswith("status_average_") and column_name.endswith("_rate"):
-            assert isinstance(default_value, float)
-            assert default_value == 0.0
-
-        elif column_name.startswith("status_") and column_name.endswith("_rate"):
+        if (
+            column_name.startswith("status_average_")
+            and column_name.endswith("_time")
+            or column_name.startswith("status_average_")
+            and column_name.endswith("_rate")
+            or column_name.startswith("status_")
+            and column_name.endswith("_rate")
+        ):
             assert isinstance(default_value, float)
             assert default_value == 0.0
 
         elif column_name.startswith("status_"):
-            assert isinstance(default_value, int), "Wrong column type {!r}: {}".format(
-                column_name,
-                type(default_value),
+            assert isinstance(default_value, int), (
+                f"Wrong column type {column_name!r}: {type(default_value)}"
             )
             assert default_value == 0, "Wrong column default value %r: %d" % (
                 column_name,
@@ -129,10 +128,9 @@ def test_perfcounters_correct_status_values() -> None:
 
         elif column_name.startswith("status_"):
             counter_name = "_".join(column_name.split("_")[1:])
-            assert column_value == c._counters[counter_name], "Invalid value {!r}: {!r}".format(
-                column_name,
-                c._counters[counter_name],
+            assert column_value == c._counters[counter_name], (
+                f"Invalid value {column_name!r}: {c._counters[counter_name]!r}"
             )
 
         else:
-            raise NotImplementedError()
+            raise NotImplementedError

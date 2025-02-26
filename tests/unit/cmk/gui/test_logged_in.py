@@ -11,14 +11,15 @@ import pytest
 from pytest import MonkeyPatch
 from pytest_mock import MockerFixture
 
-from tests.testlib.users import create_and_destroy_user
+from tests.unit.cmk.gui.users import create_and_destroy_user
 
 from livestatus import SiteConfigurations, SiteId
 
 import cmk.utils.paths
-from cmk.utils.type_defs import UserId
+from cmk.utils.rulesets.definition import RuleGroup
+from cmk.utils.user import UserId
 
-import cmk.gui.permissions as permissions
+from cmk.gui import permissions
 from cmk.gui.config import (
     active_config,
     builtin_role_ids,
@@ -99,7 +100,7 @@ def test_user_context_explicit_permissions(with_user: tuple[UserId, str]) -> Non
         ),
         (
             LoggedInSuperUser(),
-            "Superuser for unauthenticated pages",
+            "Superuser for internal use",
             "admin",
             ["admin"],
             "admin",
@@ -125,7 +126,7 @@ def test_unauthenticated_users(
     assert user.stars == set()
     assert user.is_site_disabled(SiteId("any_site")) is False
 
-    assert user.load_file("any_file", "default") == "default"
+    assert user.load_file("unittest", "default") == "default"
     assert user.file_modified("any_file") == 0
 
     with pytest.raises(TypeError):
@@ -166,21 +167,6 @@ def test_unauthenticated_users_authorized_sites(
     assert user.authorized_sites() == {"site1": {}, "site2": {}}
 
 
-@pytest.mark.parametrize("user", [LoggedInNobody(), LoggedInSuperUser()])
-def test_unauthenticated_users_authorized_login_sites(
-    monkeypatch: MonkeyPatch, user: LoggedInUser
-) -> None:
-    monkeypatch.setattr("cmk.gui.site_config.get_login_slave_sites", lambda: ["slave_site"])
-    monkeypatch.setattr(
-        "cmk.gui.site_config.enabled_sites",
-        lambda: {
-            "master_site": {},
-            "slave_site": {},
-        },
-    )
-    assert user.authorized_login_sites() == {"slave_site": {}}
-
-
 @pytest.mark.usefixtures("request_context")
 def test_logged_in_nobody_permissions(mocker: MockerFixture, monkeypatch: MonkeyPatch) -> None:
     user = LoggedInNobody()
@@ -218,7 +204,7 @@ MONITORING_USER_CACHED_PROFILE = {
     "authorized_sites": ["heute", "heute_slave_1"],
     "contactgroups": ["all"],
     "disable_notifications": {},
-    "email": "test_user@tribe29.com",
+    "email": "test_user@checkmk.com",
     "fallback_contact": False,
     "force_authuser": False,
     "locked": False,
@@ -256,18 +242,18 @@ def fixture_monitoring_user() -> Iterator[LoggedInUser]:
     user_dir.joinpath("favorites.mk").write_text(str(MONITORING_USER_FAVORITES))
 
     assert default_authorized_builtin_role_ids == ["user", "admin", "guest"]
-    assert default_unauthorized_builtin_role_ids == ["agent_registration"]
-    assert builtin_role_ids == ["user", "admin", "guest", "agent_registration"]
+    assert default_unauthorized_builtin_role_ids == ["agent_registration", "no_permissions"]
+    assert builtin_role_ids == ["user", "admin", "guest", "agent_registration", "no_permissions"]
     assert "test" not in active_config.admin_users
 
     with create_and_destroy_user(username="test") as user:
         yield LoggedInUser(user[0])
 
 
-def test_monitoring_user(monitoring_user: LoggedInUser) -> None:
+def test_monitoring_user(request_context: None, monitoring_user: LoggedInUser) -> None:
     assert monitoring_user.id == "test"
     assert monitoring_user.alias == "Test user"
-    assert monitoring_user.email == "test_user_test@tribe29.com"
+    assert monitoring_user.email == "test_user_test@checkmk.com"
     assert monitoring_user.confdir
     assert monitoring_user.confdir.endswith("/web/test")
 
@@ -298,9 +284,9 @@ def test_monitoring_user(monitoring_user: LoggedInUser) -> None:
     assert monitoring_user.is_site_disabled(SiteId("heute_slave_1")) is True
     assert monitoring_user.is_site_disabled(SiteId("heute_slave_2")) is False
 
-    assert monitoring_user.show_help is False
-    monitoring_user.show_help = True
-    assert monitoring_user.show_help is True
+    assert monitoring_user.inline_help_as_text is False
+    monitoring_user.inline_help_as_text = True
+    assert monitoring_user.inline_help_as_text is True
 
     assert monitoring_user.acknowledged_notifications == 0
     timestamp = 1578479929
@@ -308,16 +294,21 @@ def test_monitoring_user(monitoring_user: LoggedInUser) -> None:
     assert monitoring_user.acknowledged_notifications == timestamp
 
 
-def test_monitoring_user_read_broken_file(monitoring_user: LoggedInUser) -> None:
+def test_monitoring_user_read_broken_file(
+    request_context: None, monitoring_user: LoggedInUser
+) -> None:
     assert monitoring_user.confdir
-    with Path(monitoring_user.confdir, "asd.mk").open("w") as f:
+    with Path(monitoring_user.confdir, "unittest.mk").open("w") as f:
         f.write("%#%#%")
 
-    assert monitoring_user.load_file("asd", deflt="xyz") == "xyz"
+    assert monitoring_user.load_file("unittest", deflt="xyz") == "xyz"
 
 
 def test_monitoring_user_permissions(
-    mocker: MockerFixture, monkeypatch: MonkeyPatch, monitoring_user: LoggedInUser
+    mocker: MockerFixture,
+    monkeypatch: MonkeyPatch,
+    request_context: None,
+    monitoring_user: LoggedInUser,
 ) -> None:
     mocker.patch.object(permissions, "permission_registry")
     with monkeypatch.context() as m:
@@ -353,16 +344,16 @@ def test_monitoring_user_permissions(
             monitoring_user.need_permission("unknown_permission")
 
 
-@pytest.mark.usefixtures("monitoring_user")
+@pytest.mark.usefixtures("request_context", "monitoring_user")
 @pytest.mark.parametrize(
     "varname",
     [
         "custom_checks",
         "datasource_programs",
-        "agent_config:mrpe",
-        "agent_config:agent_paths",
-        "agent_config:runas",
-        "agent_config:only_from",
+        RuleGroup.AgentConfig("mrpe"),
+        RuleGroup.AgentConfig("agent_paths"),
+        RuleGroup.AgentConfig("runas"),
+        RuleGroup.AgentConfig("only_from"),
     ],
 )
 def test_ruleset_permissions_with_commandline_access(varname: str) -> None:

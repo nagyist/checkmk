@@ -1,0 +1,223 @@
+#!/bin/bash
+# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+set -e
+
+JOBS=6
+readonly BAZEL_CMD=${BAZEL_CMD:-bazel}
+
+PYTHON_DESTINATION=../../cmk/shared_typing
+
+failure() {
+    test ${#@} -eq 0 || echo "$(basename "$0"):" "$@" >&2
+    exit 1
+}
+
+usage() {
+    echo "usage: $(basename "$0") [OPTION]..."
+    echo "Run the CI pipeline or parts of it."
+    echo
+    echo "  -c, --clean             remove artifacts first"
+    echo "  -b, --build             build"
+    echo "  -F, --check-format      check for correct formatting"
+    echo "  -a, --all               shortcut for -c -b -F -f"
+    echo "  -f, --format            format sources"
+    echo "  -j N, --jobs=N          allow N jobs at once, default is ${JOBS}"
+    echo "  -h, --help              show this help"
+}
+
+parse_options() {
+    # Yes, all those option variables are global.
+    RUN_CLEAN=no
+    RUN_BUILD=no
+    RUN_CHECK_FORMAT=no
+    RUN_FORMAT=no
+
+    if ! OPTIONS=$(getopt --options 'cbFafj:h' --long 'clean,build,check-format,all,format,jobs:,help' --name "$(basename "$0")" -- "$@"); then
+        usage >&2
+        failure
+    fi
+    eval set -- "$OPTIONS"
+    unset OPTIONS
+
+    while true; do
+        case "$1" in
+            '-c' | '--clean')
+                RUN_CLEAN=yes
+                shift
+                continue
+                ;;
+            '-b' | '--build')
+                RUN_BUILD=yes
+                shift
+                continue
+                ;;
+            '-F' | '--check-format')
+                RUN_CHECK_FORMAT=yes
+                shift
+                continue
+                ;;
+            '-a' | '--all')
+                RUN_CLEAN=yes
+                RUN_BUILD=yes
+                RUN_CHECK_FORMAT=yes
+                RUN_FORMAT=yes
+                shift
+                continue
+                ;;
+            '-f' | '--format')
+                RUN_FORMAT=yes
+                shift
+                continue
+                ;;
+            '-j' | '--jobs')
+                JOBS="$2"
+                shift 2
+                continue
+                ;;
+            '-h' | '--help')
+                usage
+                exit 0
+                ;;
+            '--')
+                shift
+                test ${#@} -eq 0 || failure "extra arguments:" "$@"
+                break
+                ;;
+            *) failure "internal error" ;;
+        esac
+    done
+
+    readonly RUN_CLEAN RUN_BUILD RUN_CHECK_FORMAT RUN_FORMAT JOBS
+}
+
+setup_venv() {
+    test "${SETUP_VENV_RAN}" = "yes" && return
+    # TODO: Let rules_uv know about our toolchain... https://github.com/theoremlp/rules_uv/issues/163
+    # Further: uv seems to fall back to clang, see https://github.com/astral-sh/uv/issues/8036
+    CC="gcc" ${BAZEL_CMD} run //:create_venv
+    # shellcheck source=/dev/null
+    source "$(bazel info workspace)"/.venv/bin/activate
+    SETUP_VENV_RAN=yes
+}
+
+npm_install_dependencies() {
+    npm \
+        ci \
+        --yes \
+        --unsafe-perm \
+        --audit=false
+}
+
+npm_dependencies_installed() {
+    npm ls --all &>/dev/null
+}
+
+setup_npm() {
+    test "${SETUP_NPM_RAN}" = "yes" && return
+    npm_dependencies_installed || npm_install_dependencies
+    echo "npm version $(npm --version)"
+    echo "node version $(node --version)"
+    SETUP_NPM_RAN=yes
+}
+
+setup() {
+    setup_venv
+    setup_npm
+}
+
+run_clean() {
+    rm -rf .cache .mypy_cache .pytest_cache .venv ./*.egg-info build node_modules typescript
+}
+
+run_build() {
+    setup
+    rm -rf typescript
+    mkdir -p typescript
+    cwd=$(pwd)
+    export PYTHONPATH="$PYTHONPATH:$cwd"
+    for file in source/*.json; do
+        target_base=$(basename "${file}" .json)
+        echo "Processing $file"
+
+        if [[ "$file" == "source/graph_designer.json" ]]; then
+            datamodel-codegen --input "$file" \
+                --input-file-type jsonschema \
+                --output "${PYTHON_DESTINATION}/cee/${target_base}.py" \
+                --target-python-version 3.12 \
+                --output-model-type=pydantic.BaseModel \
+                --collapse-root-models \
+                --use-field-description \
+                --use-title-as-name \
+                --use-double-quotes \
+                --use-default \
+                --use-one-literal-as-default \
+                --custom-file-header-path header_cee_py.txt \
+                --custom-formatters "utils.format" \
+                --enum-field-as-literal all \
+                --use-generic-container-types \
+                --use-union-operator
+            npm run json2ts -- \
+                --additionalProperties=false \
+                --declareExternallyReferenced \
+                --bannerComment "$(cat header_cee_ts.txt)" \
+                --cwd source/ "${file}" \
+                -o "typescript/${target_base}.ts"
+        else
+            datamodel-codegen --input "$file" \
+                --input-file-type jsonschema \
+                --output "${PYTHON_DESTINATION}/${target_base}.py" \
+                --target-python-version 3.12 \
+                --output-model-type=dataclasses.dataclass \
+                --use-field-description \
+                --use-title-as-name \
+                --use-double-quotes \
+                --use-default \
+                --use-standard-collections \
+                --use-one-literal-as-default \
+                --use-subclass-enum \
+                --custom-file-header-path header_py.txt \
+                --custom-formatters "utils.format"
+            npm run json2ts -- \
+                --additionalProperties=false \
+                --declareExternallyReferenced \
+                --bannerComment "$(cat header_ts.txt)" \
+                --cwd source/ "${file}" \
+                -o "typescript/${target_base}.ts"
+        fi
+    done
+
+    if [ "$CI" == "true" ]; then
+        echo "Checking if the generated files are up-to-date..."
+        git diff --exit-code typescript
+        git diff --exit-code ${PYTHON_DESTINATION}
+    fi
+
+    echo "Done."
+}
+
+run_check_format() {
+    setup
+    npm run prettier -- -c source/
+}
+
+run_format() {
+    setup
+    npm run prettier -- -w source/
+}
+
+main() {
+    # Change to the directory where this script resides, it makes many things easier
+    # and we can call this script from everywhere.
+    cd -- "${BASH_SOURCE%/*}"
+    parse_options "$@"
+    test ${RUN_CLEAN} = yes && run_clean
+    test ${RUN_BUILD} = yes && run_build
+    test ${RUN_CHECK_FORMAT} = yes && run_check_format
+    test ${RUN_FORMAT} = yes && run_format
+    true
+}
+
+main "$@"

@@ -3,18 +3,25 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 from pytest import MonkeyPatch
 
-from tests.testlib.base import Scenario
+from tests.testlib.unit.base_configuration_scenario import Scenario
 
-import cmk.utils.version as cmk_version
+import cmk.ccc.version as cmk_version
+from cmk.ccc.version import Edition, edition
+
+from cmk.utils import paths
+from cmk.utils.hostaddress import HostName
+from cmk.utils.labels import LabelSource
 from cmk.utils.rulesets.ruleset_matcher import RuleSpec
-from cmk.utils.type_defs import HostName
 
 from cmk.automations.results import AnalyseHostResult, GetServicesLabelsResult
 
 import cmk.base.automations
 import cmk.base.automations.check_mk as automations
+from cmk.base.api.agent_based.register import AgentBasedPlugins
+from cmk.base.config import LoadedConfigFragment
 
 
 def test_registered_automations() -> None:
@@ -27,8 +34,11 @@ def test_registered_automations() -> None:
         "delete-hosts",
         "delete-hosts-known-remote",
         "diag-host",
+        "diag-special-agent",
+        "autodiscovery",
         "service-discovery",
         "service-discovery-preview",
+        "special-agent-discovery-preview",
         "get-agent-output",
         "get-check-information",
         "get-configuration",
@@ -37,17 +47,18 @@ def test_registered_automations() -> None:
         "notification-analyse",
         "notification-get-bulks",
         "notification-replay",
+        "notification-test",
         "reload",
         "rename-hosts",
         "restart",
         "scan-parents",
-        "set-autochecks",
-        "try-inventory",
+        "set-autochecks-v2",
         "update-dns-cache",
         "update-host-labels",
+        "update-passwords-merged-file",
     ]
 
-    if not cmk_version.is_raw_edition():
+    if cmk_version.edition(paths.omd_root) is not cmk_version.Edition.CRE:
         needed_automations += [
             "bake-agents",
         ]
@@ -58,6 +69,12 @@ def test_registered_automations() -> None:
 
 
 def test_analyse_host(monkeypatch: MonkeyPatch) -> None:
+    additional_labels: dict[str, str] = {}
+    additional_label_sources: dict[str, LabelSource] = {}
+    if edition(paths.omd_root) is Edition.CME:
+        additional_labels = {"cmk/customer": "provider"}
+        additional_label_sources = {"cmk/customer": "discovered"}
+
     automation = automations.AutomationAnalyseHost()
 
     ts = Scenario()
@@ -72,9 +89,19 @@ def test_analyse_host(monkeypatch: MonkeyPatch) -> None:
     )
     ts.apply(monkeypatch)
 
-    assert automation.execute(["test-host"]) == AnalyseHostResult(
-        label_sources={"cmk/site": "discovered", "explicit": "explicit"},
-        labels={"cmk/site": "NO_SITE", "explicit": "ding"},
+    label_sources: dict[str, LabelSource] = {
+        "cmk/site": "discovered",
+        "explicit": "explicit",
+    }
+    assert automation.execute(
+        ["test-host"], AgentBasedPlugins.empty(), LoadedConfigFragment(discovery_rules={})
+    ) == AnalyseHostResult(
+        label_sources=label_sources | additional_label_sources,
+        labels={
+            "cmk/site": "NO_SITE",
+            "explicit": "ding",
+        }
+        | additional_labels,
     )
 
 
@@ -89,14 +116,17 @@ def test_service_labels(monkeypatch):
             [
                 {
                     "condition": {"service_description": [{"$regex": "CPU load"}]},
+                    "id": "01",
                     "value": {"label1": "val1"},
                 },
                 {
                     "condition": {"service_description": [{"$regex": "CPU load"}]},
+                    "id": "02",
                     "value": {"label2": "val2"},
                 },
                 {
                     "condition": {"service_description": [{"$regex": "CPU temp"}]},
+                    "id": "03",
                     "value": {"label1": "val1"},
                 },
             ]
@@ -104,7 +134,11 @@ def test_service_labels(monkeypatch):
     )
     ts.apply(monkeypatch)
 
-    assert automation.execute(["test-host", "CPU load", "CPU temp"]) == GetServicesLabelsResult(
+    assert automation.execute(
+        ["test-host", "CPU load", "CPU temp"],
+        AgentBasedPlugins.empty(),
+        LoadedConfigFragment(discovery_rules={}),
+    ) == GetServicesLabelsResult(
         {
             "CPU load": {"label1": "val1", "label2": "val2"},
             "CPU temp": {"label1": "val1"},

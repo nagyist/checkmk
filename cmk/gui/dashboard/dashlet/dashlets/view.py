@@ -7,18 +7,24 @@ import copy
 from collections.abc import Callable, Sequence
 from typing import cast, Literal, TypeVar
 
-from cmk.utils.exceptions import MKGeneralException
-from cmk.utils.type_defs import UserId
+from cmk.ccc.exceptions import MKGeneralException
+
+from cmk.utils.user import UserId
 
 from cmk.gui import visuals
+from cmk.gui.dashboard.dashlet.base import IFrameDashlet
+from cmk.gui.dashboard.type_defs import DashletConfig, DashletId, DashletSize
+from cmk.gui.data_source import data_source_registry
 from cmk.gui.display_options import display_options
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.htmllib.html import html
 from cmk.gui.http import request
 from cmk.gui.i18n import _
+from cmk.gui.painter_options import PainterOptions
 from cmk.gui.type_defs import (
     ColumnSpec,
     HTTPVariables,
+    InventoryJoinMacrosSpec,
     SingleInfos,
     SorterSpec,
     ViewSpec,
@@ -28,14 +34,11 @@ from cmk.gui.utils.urls import makeuri, makeuri_contextless, requested_file_name
 from cmk.gui.valuespec import DictionaryEntry, DropdownChoice
 from cmk.gui.view import View
 from cmk.gui.view_renderer import GUIViewRenderer
-from cmk.gui.views.data_source import data_source_registry
 from cmk.gui.views.page_edit_view import create_view_from_valuespec, render_view_config
 from cmk.gui.views.page_show_view import get_limit, get_user_sorters, process_view
-from cmk.gui.views.painter_options import PainterOptions
 from cmk.gui.views.store import get_all_views, get_permitted_views
 from cmk.gui.views.view_choices import view_choices
-
-from ..base import DashletConfig, DashletId, DashletSize, IFrameDashlet
+from cmk.gui.visuals import get_only_sites_from_context
 
 
 class ABCViewDashletConfig(DashletConfig):
@@ -45,8 +48,7 @@ class ABCViewDashletConfig(DashletConfig):
 VT = TypeVar("VT", bound=ABCViewDashletConfig)
 
 
-class LinkedViewDashletConfig(ABCViewDashletConfig):
-    ...
+class LinkedViewDashletConfig(ABCViewDashletConfig): ...
 
 
 class _ViewDashletConfigMandatory(ABCViewDashletConfig):
@@ -72,13 +74,14 @@ class _ViewDashletConfigMandatory(ABCViewDashletConfig):
 class ViewDashletConfig(_ViewDashletConfigMandatory, total=False):
     # From: ViewSpec
     add_headers: str
-    # View editor only adds them in case they are truish. In our builtin specs these flags are also
+    # View editor only adds them in case they are truish. In our built-in specs these flags are also
     # partially set in case they are falsy
     mobile: bool
     mustsearch: bool
     force_checkboxes: bool
     play_sounds: bool
     user_sortable: bool
+    inventory_join_macros: InventoryJoinMacrosSpec
 
 
 def copy_view_into_dashlet(
@@ -107,7 +110,7 @@ def copy_view_into_dashlet(
         if not view:
             raise MKGeneralException(
                 _(
-                    "Failed to convert a builtin dashboard which is referencing "
+                    "Failed to convert a built-in dashboard which is referencing "
                     'the view "%s". You will have to migrate it to the new '
                     "dashboard format on your own to work properly."
                 )
@@ -142,9 +145,10 @@ def copy_view_into_dashlet(
             ).items()
         ),
     )
+    dashletcontext_vars = visuals.context_to_uri_vars(dashlet["context"])
     dashlet["title_url"] = makeuri_contextless(
         request,
-        name_part + singlecontext_vars,
+        name_part + singlecontext_vars + dashletcontext_vars,
         filename="view.py",
     )
 
@@ -216,10 +220,14 @@ class ABCViewDashlet(IFrameDashlet[VT]):
         # it
         view = View(self._dashlet_spec["name"], view_spec, context)  # type: ignore[arg-type]
         view.row_limit = get_limit()
-        view.only_sites = visuals.get_only_sites_from_context(context)
+        view.only_sites = get_only_sites_from_context(context)
         view.user_sorters = get_user_sorters(view.spec["sorters"], view.row_cells)
 
-        process_view(GUIViewRenderer(view, show_buttons=False))
+        process_view(
+            GUIViewRenderer(
+                view, show_buttons=False, page_menu_dropdowns_callback=lambda x, y, z: None
+            )
+        )
 
         html.close_div()
 
@@ -315,7 +323,7 @@ class ViewDashlet(ABCViewDashlet[ViewDashletConfig]):
 def view_spec_from_view_dashlet(dashlet: ViewDashletConfig) -> ViewSpec:
     """Should be aligned with copy_view_into_dashlet"""
     # Sadly there is currently no less verbose way of doing this
-    return ViewSpec(
+    view_spec = ViewSpec(
         {
             "datasource": dashlet["datasource"],
             "group_painters": dashlet["group_painters"],
@@ -332,6 +340,13 @@ def view_spec_from_view_dashlet(dashlet: ViewDashletConfig) -> ViewSpec:
             "sort_index": dashlet["sort_index"],
             "add_context_to_title": dashlet["add_context_to_title"],
             "is_show_more": dashlet["is_show_more"],
+            # Add the following NotRequired ViewSpec values here, so they are correctly displayed
+            # when editing a builtin dashboard's view dashlet
+            "mobile": dashlet.get("mobile", False),
+            "mustsearch": dashlet.get("mustsearch", False),
+            "force_checkboxes": dashlet.get("force_checkboxes", False),
+            "user_sortable": dashlet.get("user_sortable", False),
+            "play_sounds": dashlet.get("play_sounds", False),
             # Just to satisfy ViewSpec, not saved to storage and not needed for
             # rendering in a ViewDashlet.
             "owner": UserId.builtin(),
@@ -343,8 +358,12 @@ def view_spec_from_view_dashlet(dashlet: ViewDashletConfig) -> ViewSpec:
             "public": False,
             "link_from": {},
             "packaged": False,
+            "megamenu_search_terms": [],
         }
     )
+    if inventory_join_macros := dashlet.get("inventory_join_macros"):
+        view_spec["inventory_join_macros"] = inventory_join_macros
+    return view_spec
 
 
 class LinkedViewDashlet(ABCViewDashlet[LinkedViewDashletConfig]):

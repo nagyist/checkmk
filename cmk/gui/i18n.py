@@ -38,13 +38,24 @@ translation = request_local_attr("translation", Translation)
 
 
 @request_memoize()
+def translate_to_current_language(message: str) -> str:
+    # Avoid localizing the empty string. The empty string is reserved for header data in PO files:
+    # https://www.gnu.org/software/gettext/manual/html_node/PO-Files.html
+    # "An empty untranslated-string is reserved to contain the header entry with the meta
+    # information". Hence, the localization of the empty string is the header data, which we
+    # certainly do not want to display.
+    if not message:
+        return ""
+    if translation:
+        return translation.translation.gettext(message)
+    return str(message)
+
+
 def _(message: str, /) -> str:
     """
     Positional-only argument to simplify additional linting of localized strings.
     """
-    if translation:
-        return translation.translation.gettext(message)
-    return str(message)
+    return translate_to_current_language(message)
 
 
 def _l(string: str, /) -> LazyString:
@@ -84,7 +95,7 @@ def _get_package_language_dirs() -> list[Path]:
 
     It's possible for extension packages to provide custom localization files
     which are meant for localizing extension specific texts. These localizations
-    are then used in addition to the builtin and local localization files.
+    are then used in addition to the built-in and local localization files.
     """
     package_locale_dir = cmk.utils.paths.local_locale_dir / "packages"
     if not package_locale_dir.exists():
@@ -126,7 +137,7 @@ def get_languages() -> list[tuple[str, str]]:
             # directory:" when directory not exists
             pass
 
-    return sorted(list(languages), key=lambda x: x[1])
+    return sorted(list(languages), key=lambda x: (x[0] not in ["en", "de"], x[1]))
 
 
 def _unlocalize() -> None:
@@ -134,7 +145,7 @@ def _unlocalize() -> None:
 
 
 def localize(lang: str) -> None:
-    _.cache_clear()  # type: ignore[attr-defined]
+    translate_to_current_language.cache_clear()  # type: ignore[attr-defined]
     if lang == "en":
         _unlocalize()
         return None
@@ -150,7 +161,7 @@ def localize(lang: str) -> None:
 
 def _init_language(lang: str) -> gettext_module.NullTranslations | None:
     """Load all available "multisite" translation files. All are loaded first.
-    The builtin ones are used as "fallback" for the local files which means that
+    The built-in ones are used as "fallback" for the local files which means that
     the texts in the local files have precedence.
     """
     translations: list[gettext_module.NullTranslations] = []
@@ -203,9 +214,8 @@ def _u(text: str) -> str:
         if current_language == "en":
             return text
         return ldict.get(current_language, text)
-    if translation:
-        return translation.translation.gettext(text)
-    return text
+
+    return translate_to_current_language(text)
 
 
 def set_user_localizations(localizations: dict[str, dict[str, str]]) -> None:

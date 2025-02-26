@@ -7,6 +7,7 @@ import os
 import platform
 import re
 import shutil
+from collections.abc import Sequence
 
 import pytest
 
@@ -86,7 +87,7 @@ def testconfig_engine(request, testconfig_drive):
         testconfig_drive["global"]["sections"] = [Globals.section, "systemtime"]
 
     path_array = []
-    if request.param[0] != Globals.paths.tempdir1:  # pylint: disable=comparison-with-callable
+    if request.param[0] != Globals.paths.tempdir1:
         path_array.append(Globals.paths.tempfile1())
         path_array.append(
             os.path.join(
@@ -148,7 +149,7 @@ def use_testfiles():
 
 @pytest.mark.usefixtures("use_testfiles")
 def test_section_fileinfo(  # type: ignore[no-untyped-def]
-    request, testconfig, expected_output, actual_output, testfile
+    request, testconfig, expected_output: Sequence[str] | None, actual_output, testfile
 ) -> None:
     # request.node.name gives test name
     local_test(expected_output, actual_output, testfile, request.node.name)

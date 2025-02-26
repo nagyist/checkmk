@@ -3,8 +3,10 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from collections.abc import Iterator
@@ -12,8 +14,6 @@ from contextlib import contextmanager, nullcontext
 from enum import auto, Enum
 from typing import Any, ContextManager, Final, Literal, NamedTuple
 
-import cmk.gui.utils.escaping as escaping
-import cmk.gui.weblib as weblib
 from cmk.gui.config import active_config
 from cmk.gui.htmllib.foldable_container import foldable_container
 from cmk.gui.htmllib.generator import HTMLWriter
@@ -24,9 +24,12 @@ from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
 from cmk.gui.num_split import key_num_split
 from cmk.gui.type_defs import CSSSpec
+from cmk.gui.utils import escaping
 from cmk.gui.utils.escaping import escape_to_html_permissive
 from cmk.gui.utils.html import HTML
 from cmk.gui.utils.output_funnel import output_funnel
+from cmk.gui.utils.rendering import set_inpage_search_result_info
+from cmk.gui.utils.selection_id import SelectionId
 from cmk.gui.utils.transaction_manager import transactions
 from cmk.gui.utils.urls import makeactionuri, makeuri, requested_file_name
 
@@ -85,7 +88,7 @@ def table_element(
     omit_headers: bool = False,
     omit_update_header: bool = False,
     empty_text: str | None = None,
-    help: str | None = None,  # pylint: disable=redefined-builtin
+    help: str | None = None,
     css: str | None = None,
     isopen: bool = True,
 ) -> Iterator[Table]:
@@ -148,7 +151,7 @@ class Table:
         omit_headers: bool = False,
         omit_update_header: bool = False,
         empty_text: str | None = None,
-        help: str | None = None,  # pylint: disable=redefined-builtin
+        help: str | None = None,
         css: str | None = None,
         isopen: bool = True,
     ):
@@ -277,7 +280,7 @@ class Table:
                 str(text) if not isinstance(text, str) else text, escape_links=False
             )
 
-        htmlcode: HTML = content + HTML(output_funnel.drain())
+        htmlcode: HTML = content + HTML.without_escaping(output_funnel.drain())
 
         if isinstance(title, HTML):
             header_title = title
@@ -307,7 +310,7 @@ class Table:
         """
         self.next_header = title
 
-    def _end(self) -> None:  # pylint: disable=too-many-branches
+    def _end(self) -> None:
         if not self.rows and self.options["omit_if_empty"]:
             return
 
@@ -440,7 +443,7 @@ class Table:
     def _get_sort_column(self, table_opts: dict[str, Any]) -> str | None:
         return request.get_ascii_input("_%s_sort" % self.id, table_opts.get("sort"))
 
-    def _write_table(  # pylint: disable=too-many-branches
+    def _write_table(
         self,
         rows: TableRows,
         num_rows_unlimited: int,
@@ -451,6 +454,9 @@ class Table:
         if not self.options["omit_update_header"]:
             row_info = _("1 row") if len(rows) == 1 else _("%d rows") % num_rows_unlimited
             html.javascript("cmk.utils.update_row_info(%s);" % json.dumps(row_info))
+
+        if request.var("search") is not None:
+            set_inpage_search_result_info(len(rows))
 
         table_id = self.id
 
@@ -473,36 +479,40 @@ class Table:
         if actions_enabled and actions_visible:
             html.open_tr(class_=["data", "even0", "actions"])
             html.open_td(colspan=num_cols)
-            if not html.in_form():
-                html.begin_form("%s_actions" % table_id)
-
-            if request.has_var("_%s_sort" % table_id):
-                html.open_div(class_=["sort"])
-                html.button("_%s_reset_sorting" % table_id, _("Reset sorting"))
-                html.close_div()
-
-            if not html.in_form():
-                html.begin_form("%s_actions" % table_id)
-
-            html.hidden_fields()
-            html.end_form()
+            with (
+                html.form_context("%s_actions" % table_id)
+                if not html.in_form()
+                else contextlib.nullcontext()
+            ):
+                if request.has_var("_%s_sort" % table_id):
+                    html.open_div(class_=["sort"])
+                    html.button("_%s_reset_sorting" % table_id, _("Reset sorting"))
+                    html.close_div()
+                html.hidden_fields()
             html.close_tr()
 
+        oddeven_name = "even"
         for nr, row in enumerate(rows):
             # Intermediate header
             if isinstance(row, GroupHeader):
                 # Show the header only, if at least one (non-header) row follows
                 if nr < len(rows) - 1 and not isinstance(rows[nr + 1], GroupHeader):
                     html.open_tr(class_="groupheader")
-                    html.open_td(colspan=num_cols)
-                    html.h3(row.title)
+                    html.open_td(class_="groupheader", colspan=num_cols)
+                    html.open_table(
+                        class_="groupheader", cellspacing="0", cellpadding="0", border="0"
+                    )
+                    html.open_tr()
+                    html.td(row.title)
+                    html.close_tr()
+                    html.close_table()
                     html.close_td()
                     html.close_tr()
 
                     self._render_headers(actions_enabled, actions_visible, empty_columns)
+                    oddeven_name = "even"
                 continue
 
-            oddeven_name = "even" if nr % 2 == 0 else "odd"
             class_ = ["data", "%s%d" % (oddeven_name, row.state)]
 
             if isinstance(row.css, list):
@@ -519,6 +529,7 @@ class Table:
 
                 html.td(cell.content, class_=cell.css, colspan=cell.colspan)
             html.close_tr()
+            oddeven_name = "even" if oddeven_name == "odd" else "odd"
 
         if not rows and search_term:
             html.open_tr(class_=["data", "odd0", "no_match"])
@@ -578,7 +589,7 @@ class Table:
 
         response.set_data("".join(resp))
 
-    def _render_headers(  # pylint: disable=too-many-branches
+    def _render_headers(
         self, actions_enabled: bool, actions_visible: bool, empty_columns: list[bool]
     ) -> None:
         if self.options["omit_headers"]:
@@ -630,7 +641,9 @@ class Table:
                 first_col = False
                 if actions_enabled:
                     if not header_title:
-                        header_title = HTML("&nbsp;")  # Fixes layout problem with white triangle
+                        header_title = (
+                            HTMLWriter.render_nbsp()
+                        )  # Fixes layout problem with white triangle
 
                     if actions_visible:
                         state = "0"
@@ -651,9 +664,9 @@ class Table:
                     html.span(header_title)
                     html.close_div()
                 else:
-                    html.write_text(header_title)
+                    html.write_text_permissive(header_title)
             else:
-                html.write_text(header_title)
+                html.write_text_permissive(header_title)
 
             html.close_th()
         html.close_tr()
@@ -713,10 +726,11 @@ def _sort_rows(rows: TableRows, sort_col: int, sort_reverse: int) -> TableRows:
 
 
 def init_rowselect(selection_key: str) -> None:
-    selected = user.get_rowselection(weblib.selection_id(), selection_key)
+    selection_id = SelectionId.from_request(request)
+    selected = user.get_rowselection(selection_id, selection_key)
     selection_properties = {
         "page_id": selection_key,
-        "selection_id": weblib.selection_id(),
+        "selection_id": selection_id,
         "selected_rows": selected,
     }
     html.javascript("cmk.selection.init_rowselect(%s);" % (json.dumps(selection_properties)))
