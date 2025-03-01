@@ -5,6 +5,7 @@
 
 #include "livestatus/NullColumn.h"
 
+#include <memory>
 #include <stdexcept>
 
 #include "livestatus/Renderer.h"
@@ -18,6 +19,10 @@ void NullColumn::output(Row /*row*/, RowRenderer &r, const User & /*user*/,
 std::unique_ptr<Filter> NullColumn::createFilter(
     Filter::Kind /*unused*/, RelationalOperator /*unused*/,
     const std::string & /*unused*/) const {
+    throw std::runtime_error("filtering on null column not supported");
+}
+
+std::unique_ptr<Sorter> NullColumn::createSorter() const {
     throw std::runtime_error("filtering on null column not supported");
 }
 

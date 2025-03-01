@@ -9,6 +9,7 @@ https://help.ivanti.com/mi/help/en_us/cld/76/api/Content/MobileIronCloudCustomer
 
 api call url parameters: "https://" + $tenantURL + "/api/v1/device?q=&rows=" + $interval + "&start=" + $start + "&dmPartitionId=" + $spaceId + "&fq=" + $filterCriteria + ""
 """
+
 from __future__ import annotations
 
 import enum
@@ -24,15 +25,14 @@ from urllib.parse import urljoin
 import requests
 
 from cmk.utils.http_proxy_config import deserialize_http_proxy_config
-from cmk.utils.misc import typeshed_issue_7724
 from cmk.utils.regex import regex, REGEX_HOST_NAME_CHARS
 
-from cmk.special_agents.utils.agent_common import (
+from cmk.special_agents.v0_unstable.agent_common import (
     ConditionalPiggybackSection,
     SectionWriter,
     special_agent_main,
 )
-from cmk.special_agents.utils.argument_parsing import Args, create_default_argument_parser
+from cmk.special_agents.v0_unstable.argument_parsing import Args, create_default_argument_parser
 
 LOGGER = logging.getLogger("agent_mobileiron")
 
@@ -81,7 +81,7 @@ class HostnameDict(UserDict):
     def __setitem__(self, key: str, value: Mapping) -> None:
         key = _sanitize_hostname(key)
         if (current_count := next(self._keys_seen[key])) >= 1:
-            key = f"{key}_{current_count+1}"
+            key = f"{key}_{current_count + 1}"
         super().__setitem__(key, value)
 
 
@@ -93,7 +93,7 @@ def parse_arguments(argv: Sequence[str] | None) -> Args:
     parser = create_default_argument_parser(description=__doc__)
     parser.add_argument("--username", "-u", type=str, help="username for connection")
     parser.add_argument("--password", "-p", type=str, help="password for connection")
-    parser.add_argument("--key-fields", action="append", help="field for hostname generation")
+    parser.add_argument("--key-fields", action="append", help="field for host name generation")
     parser.add_argument(
         "--partition",
         nargs="+",
@@ -146,15 +146,14 @@ class MobileironAPI:
         self._devices_per_request = 200
         self.regex_patterns = regex_patterns
         self._proxy = deserialize_http_proxy_config(proxy)
-        if _requests_proxy := typeshed_issue_7724(self._proxy.to_requests_proxies()):
+        if _requests_proxy := self._proxy.to_requests_proxies():
             self._session.proxies = _requests_proxy
 
     def __enter__(self) -> MobileironAPI:
         return self
 
     def __exit__(self, *exc_info: tuple) -> None:
-        if self._session:
-            self._session.close()
+        self._session.close()
 
     def _get_devices(self, data_raw: Sequence[Mapping]) -> None:
         """
@@ -295,9 +294,10 @@ def agent_mobileiron_main(args: Args) -> int:
                 with SectionWriter("mobileiron_statistics") as writer:
                     writer.append_json(all_devices[device])
             else:
-                with ConditionalPiggybackSection(device), SectionWriter(
-                    "mobileiron_section"
-                ) as writer:
+                with (
+                    ConditionalPiggybackSection(device),
+                    SectionWriter("mobileiron_section") as writer,
+                ):
                     writer.append_json(all_devices[device])
                 if uptime := all_devices[device]["uptime"]:
                     with ConditionalPiggybackSection(device), SectionWriter("uptime") as writer:

@@ -5,16 +5,14 @@
 
 from typing import Protocol
 
-from cmk.utils.plugin_registry import Registry
+from cmk.ccc.plugin_registry import Registry
 
 
 class ModePermissionsEnsurance(Protocol):
     @classmethod
-    def name(cls) -> str:
-        ...
+    def name(cls) -> str: ...
 
-    def ensure_permissions(self) -> None:
-        ...
+    def ensure_permissions(self) -> None: ...
 
 
 class ModePermissionsEnsuranceRegistry(Registry[type[ModePermissionsEnsurance]]):

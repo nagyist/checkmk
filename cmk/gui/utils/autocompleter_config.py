@@ -20,12 +20,13 @@ AutocompleterConfigJson = Mapping[
     str, str | int | float | bool | Collection[str] | AutocompleterParams
 ]
 DynamicParamsCallbackName = Literal[
-    # see dynamicParamsCallbacks object in web/htdocs/js/modules/valuespecs.js
+    # see dynamicParamsCallbacks object in packages/frontend-vue/js/modules/valuespecs.js
     "nop",
     "tag_group_options_autocompleter",
     "host_and_service_hinted_autocompleter",
     "host_hinted_autocompleter",
     "label_autocompleter",
+    "check_types_autocompleter",
 ]
 
 
@@ -37,10 +38,12 @@ class AutocompleterConfig:
         # TODO: rename ident to endpoint!
         strict: bool = False,
         dynamic_params_callback_name: DynamicParamsCallbackName | None = None,
+        escape_regex: bool = False,
     ):
         self._ident = ident
         self._strict = strict
         self._dynamic_params_callback_name = dynamic_params_callback_name
+        self._escape_regex = escape_regex
 
     @property
     def ident(self) -> str:
@@ -48,7 +51,7 @@ class AutocompleterConfig:
 
     @property
     def params(self) -> AutocompleterParams:
-        return {"strict": self._strict}
+        return {"strict": self._strict, "escape_regex": self._escape_regex}
 
     @property
     def config(self) -> AutocompleterConfigJson:

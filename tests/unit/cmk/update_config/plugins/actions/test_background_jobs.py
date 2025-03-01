@@ -1,81 +1,68 @@
 #!/usr/bin/env python3
-# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# Copyright (C) 2023 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
 
-from cmk.gui.background_job import BackgroundJobDefines
+from tests.unit.cmk.gui.test_background_job import job_base_dir  # noqa: F401
 
-from cmk.update_config.plugins.actions.background_jobs import (
-    JobStatusStore,
-    migrate_job_status_spec,
-    update_job_status,
-    UpdateBackgroundJobStatusSpec,
+from cmk.update_config.plugins.actions.background_jobs import UpdateBackgroundJobs
+
+
+@pytest.mark.parametrize(
+    ["host_name_list", "host_hash_list", "migrated_host_names"],
+    [
+        pytest.param(
+            [
+                "host",
+                "horst",
+                "hans",
+                "wurst-72befc4a7ce090cc58d0a95e7b5f7f7845168a68210f23aa2b763c51403b10c1",
+                "hannes-host",
+                "veryverylonghanswursthost",
+            ],
+            [
+                "host-4740ae6347b0172c01254ff55bae5aff5199f4446e7f6d643d40185b3f475145",
+                "horst-edab786c5277a54f468f5d433ce0ede9c6bfdd5e2248b28421e62b2f36a3a202",
+                "hans-6428a8fbbb0e120528bb604a66787102280e1b5e26db76633ce37c8a4526e445",
+                "hannes-host-3344d27c3b407564e4b45a8f5d3dc5b2dc2a1d518ef97b2a864ce871bd29f808",
+                "veryverylonghanswurs-5e920124c8ad9b5f81cf2029d800d20227af9c1402250a2ad403fac6a49dca7d",
+            ],
+            [
+                "service_discovery-wurst-72befc4a7ce090cc58d0a95e7b5f7f7845168a68210f23aa2b763c51403b10c1",
+            ],
+            id="Builtin tags without negate",
+        ),
+    ],
 )
+def test_background_jobs(
+    host_name_list: list[str],
+    host_hash_list: list[str],
+    migrated_host_names: list[str],
+    job_base_dir: Path,  # noqa: F811
+) -> None:
+    with open(
+        os.path.join(job_base_dir, ".migrated_service_discovery_directories.json"), "w"
+    ) as migrated_file:
+        json.dump(migrated_host_names, migrated_file)
 
+    job_name = "service_discovery"
+    for host in host_name_list:
+        background_job_path = os.path.join(job_base_dir, f"{job_name}-{host}")
+        os.makedirs(background_job_path, exist_ok=True)
 
-@pytest.fixture(name="plugin", scope="module")
-def fixture_plugin() -> UpdateBackgroundJobStatusSpec:
-    return UpdateBackgroundJobStatusSpec(
-        name="background_job_status_specs",
-        title="Background jobs",
-        sort_index=60,
-    )
+    UpdateBackgroundJobs(
+        name="background_jobs",
+        title="Update background jobs",
+        sort_index=41,
+    )(logging.getLogger())
 
-
-def test_cleanup_nothing_to_be_done(plugin: UpdateBackgroundJobStatusSpec) -> None:
-    plugin(logging.getLogger(), {})
-
-
-def test_migrate_job_status_spec_add_missing_mandatory_fields() -> None:
-    clean_state = migrate_job_status_spec({}, jobstatus_ctime=12.3)
-    assert clean_state == {
-        "is_active": True,
-        "loginfo": {"JobException": [], "JobProgressUpdate": [], "JobResult": []},
-        "pid": None,
-        "started": 12.3,
-        "state": "initialized",
-    }
-
-
-def test_update_job_status_cleanup_empty_dict_job(tmp_path: Path) -> None:
-    job_status = tmp_path / "job1" / BackgroundJobDefines.jobstatus_filename
-    job_status.parent.mkdir(parents=True)
-    job_status.write_text(repr({}))
-    assert job_status.exists()
-
-    update_job_status(logging.getLogger(), job_status.parent)
-    assert not job_status.exists()
-
-
-def test_update_job_status_cleanup_empty_file(tmp_path: Path) -> None:
-    job_status = tmp_path / "job1" / BackgroundJobDefines.jobstatus_filename
-    job_status.parent.mkdir(parents=True)
-    job_status.touch()
-    assert job_status.exists()
-
-    update_job_status(logging.getLogger(), job_status.parent)
-    assert not job_status.exists()
-
-
-def test_update_job_status_add_missing_pid(tmp_path: Path) -> None:
-    job_status = tmp_path / "job1" / BackgroundJobDefines.jobstatus_filename
-    job_status.parent.mkdir(parents=True)
-    job_status.touch()
-    job_status.write_text(
-        repr(
-            {
-                "is_active": True,
-                "loginfo": {"JobException": [], "JobProgressUpdate": [], "JobResult": []},
-                "started": 12.3,
-                "state": "initialized",
-            }
-        )
-    )
-
-    update_job_status(logging.getLogger(), job_status.parent)
-    assert JobStatusStore(str(job_status.parent)).read().pid is None
+    for hash_ in host_hash_list:
+        new_background_job_path = os.path.join(job_base_dir, f"{job_name}-{hash_}")
+        assert os.path.exists(new_background_job_path)

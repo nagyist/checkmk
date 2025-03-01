@@ -14,9 +14,10 @@ from livestatus import (
     SiteConfiguration,
     SiteConfigurations,
     SiteId,
+    TLSParams,
 )
 
-from cmk.gui.watolib.sites import SiteManagementFactory
+from cmk.gui.watolib.sites import site_management_registry
 
 from cmk.post_rename_site.logger import logger
 from cmk.post_rename_site.plugins.actions.sites import update_site_config
@@ -61,8 +62,7 @@ def test_update_basic_site_config(site_config_file: Path) -> None:
 
     update_site_config(SiteId("heute"), SiteId("haha"), logger)
 
-    site_mgmt = SiteManagementFactory().factory()
-    all_sites = site_mgmt.load_sites()
+    all_sites = site_management_registry["site_management"].load_sites()
 
     # Site entry has been renamed
     assert "heute" not in all_sites
@@ -100,7 +100,7 @@ def test_update_remote_site_status_host_config(site_config_file: Path) -> None:
                     socket=(
                         "tcp",
                         NetworkSocketDetails(
-                            address=("127.0.0.1", 6810), tls=("encrypted", {"verify": True})
+                            address=("127.0.0.1", 6810), tls=("encrypted", TLSParams(verify=True))
                         ),
                     ),
                     proxy=ProxyConfig(params=None),
@@ -125,8 +125,7 @@ def test_update_remote_site_status_host_config(site_config_file: Path) -> None:
 
     update_site_config(SiteId("stable"), SiteId("dingdong"), logger)
 
-    site_mgmt = SiteManagementFactory().factory()
-    all_sites = site_mgmt.load_sites()
+    all_sites = site_management_registry["site_management"].load_sites()
 
     # Site entry has been renamed
     assert "stable" not in all_sites

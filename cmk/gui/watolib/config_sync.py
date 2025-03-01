@@ -5,47 +5,46 @@
 """Preparing the site configuration in distributed setups for synchronization"""
 
 import abc
-import ast
 import hashlib
-import io
 import itertools
 import multiprocessing
 import os
-import shutil
 import subprocess
 import tarfile
 import time
 import traceback
 from pathlib import Path
-from tarfile import TarFile, TarInfo
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
-from livestatus import SiteConfiguration, SiteId
+from livestatus import SiteConfiguration, SiteGlobals, SiteId
+
+import cmk.ccc.version as cmk_version
+from cmk.ccc import store
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.ccc.plugin_registry import Registry
 
 import cmk.utils.paths
-import cmk.utils.store as store
-import cmk.utils.version as cmk_version
-from cmk.utils.exceptions import MKGeneralException
 
 from cmk.gui.i18n import _
 from cmk.gui.log import logger
-from cmk.gui.plugins.userdb.utils import user_sync_default_config
-from cmk.gui.plugins.watolib.utils import wato_fileheader
+from cmk.gui.userdb import user_sync_default_config
+from cmk.gui.watolib.config_domain_name import wato_fileheader
+
+from cmk.messaging import rabbitmq
 
 Command = list[str]
 
 
-class ReplicationPath(
-    NamedTuple(  # pylint: disable=typing-namedtuple-call
-        "ReplicationPath",
-        [
-            ("ty", str),
-            ("ident", str),
-            ("site_path", str),
-            ("excludes", list[str]),
-        ],
-    )
-):
+class _BaseReplicationPath(NamedTuple):
+    """Needed for the ReplicationPath class to call __new__ method."""
+
+    ty: str
+    ident: str
+    site_path: str
+    excludes: list[str]
+
+
+class ReplicationPath(_BaseReplicationPath):
     def __new__(cls, ty: str, ident: str, site_path: str, excludes: list[str]) -> "ReplicationPath":
         if site_path.startswith("/"):
             raise Exception("ReplicationPath.path must be a path relative to the site root")
@@ -66,6 +65,14 @@ class ReplicationPath(
         )
 
 
+class ReplicationPathRegistry(Registry[ReplicationPath]):
+    def plugin_name(self, instance: ReplicationPath) -> str:
+        return instance.ident
+
+
+replication_path_registry = ReplicationPathRegistry()
+
+
 class SnapshotSettings(NamedTuple):
     # TODO: Refactor to Path
     snapshot_path: str
@@ -75,6 +82,7 @@ class SnapshotSettings(NamedTuple):
     snapshot_components: list[ReplicationPath]
     component_names: set[str]
     site_config: SiteConfiguration
+    rabbitmq_definition: rabbitmq.Definitions
 
 
 class ABCSnapshotDataCollector(abc.ABC):
@@ -335,13 +343,15 @@ class SnapshotCreationBase:
 
         # Simply compute the checksum of the sitespecific.mk
         source_path = os.path.join(snapshot_work_dir, custom_components[0].site_path)
-        return hashlib.md5(  # pylint: disable=unexpected-keyword-arg
+        return hashlib.md5(
             open(source_path, "rb").read(),
             usedforsecurity=False,
         ).hexdigest()
 
 
 class SnapshotCreator(SnapshotCreationBase):
+    """Packe the snapshots into snapshot archives"""
+
     def __init__(
         self, activation_work_dir: str, all_generic_components: list[ReplicationPath]
     ) -> None:
@@ -457,190 +467,12 @@ class SnapshotCreator(SnapshotCreationBase):
         )
 
 
-def extract_from_buffer(buffer_: bytes, base_dir: Path, elements: list[ReplicationPath]) -> None:
-    """Called during activate changes on the remote site to apply the received configuration"""
-    if not isinstance(elements, list):
-        raise NotImplementedError()
-
-    stream = io.BytesIO()
-    stream.write(buffer_)
-    stream.seek(0)
-
-    with tarfile.open(None, "r", stream) as tar:
-        _extract(tar, base_dir, elements)
-
-
-def _extract(tar: tarfile.TarFile, base_dir: Path, components: list[ReplicationPath]) -> None:
-    """Extract a tar archive with the new site configuration received from a central site"""
-    for component in components:
-        try:
-            try:
-                subtarstream = tar.extractfile(component.ident + ".tar")
-            except Exception:
-                continue  # may be missing, e.g. sites.tar is only present
-                # if some sites have been created.
-
-            component_path = str(base_dir.joinpath(component.site_path))
-
-            if component.ty == "dir":
-                target_dir = component_path
-            else:
-                target_dir = os.path.dirname(component_path)
-
-            # Extract without use of temporary files
-            with tarfile.open(fileobj=subtarstream) as subtar:
-                # Remove old stuff
-                if os.path.exists(component_path):
-                    if component.ident == "usersettings":
-                        _update_usersettings(component_path, subtar)
-                        continue
-                    if component.ident == "check_mk":
-                        _update_check_mk(target_dir, subtar)
-                        continue
-                    if component.ty == "dir":
-                        _wipe_directory(component_path)
-                    else:
-                        os.remove(component_path)
-                elif component.ty == "dir":
-                    os.makedirs(component_path)
-
-                subtar.extractall(target_dir)  # nosec B202
-        except Exception:
-            raise MKGeneralException(
-                f"Failed to extract subtar {component.ident}: {traceback.format_exc()}"
-            )
-
-
-def _wipe_directory(path: str) -> None:
-    for entry in os.listdir(path):
-        p = path + "/" + entry
-        if os.path.isdir(p):
-            shutil.rmtree(p, ignore_errors=True)
-        else:
-            try:
-                os.remove(p)
-            except FileNotFoundError:
-                pass
-
-
-def _get_local_users(tar_file) -> dict[str, str | None]:  # type: ignore[no-untyped-def]
-    """The tar_file should contain var/check_mk/web/
-
-    From there on inspect every user's cached_profile.mk to recognize if they are a users
-    belonging to a certain customer in the CME."""
-    return {
-        os.path.normpath(os.path.dirname(entry)): ast.literal_eval(
-            tar_file.extractfile(entry).read().decode("utf-8")
-        ).get("customer", None)
-        for entry in tar_file.getnames()
-        if os.path.basename(entry) == "cached_profile.mk"
-    }
-
-
-def _update_usersettings(path, subtar):
-    local_users = _get_local_users(subtar)
-    all_user_tars: dict[str, list[TarInfo]] = {}
-    for tarinfo in subtar.getmembers():
-        tokens = tarinfo.name.split("/")
-        # tokens example
-        # ['.']
-        # ['.', 'automation']
-        # ['.', 'automation', 'automation.secret']
-        # ['.', 'automation', 'enforce_pw_change.mk']
-        if len(tokens) < 2:
-            continue
-        all_user_tars.setdefault(tokens[1], []).append(tarinfo)
-
-    for user in os.listdir(path):
-        p = path + "/" + user
-        if os.path.isdir(p):
-            _update_settings_of_user(p, subtar, all_user_tars.get(user, []), user, local_users)
-
-
-def _update_settings_of_user(
-    path: str,
-    tar_file: TarFile,
-    user_tars: list[TarInfo],
-    user: str,
-    local_users: dict[str, str | None],
-) -> None:
-    """Update files within user directory
-
-    A user can be split in two tiers.
-
-    Customer-Users belong to a customer when working on the CME. They only
-    work on the GUI of their corresponding remote site. They are allowed to
-    customize their bookmarks, views, dashboards, reports, etc. These user
-    local configurations are retained when receiving files from master as
-    changes are activated.
-
-        This means all "user_*" files are retained during sync.
-
-    Non-customer-users (e.g. GLOBAL users) normally work on the central
-    site and thus they should be able to use their customizations when they
-    log into remote sites. Thus all files are synced in their case.
-
-
-    No backup of the remote site dir happens during sync, data is removed,
-    added, skipped in place to avoid collisions."""
-
-    is_customer_user = local_users.get(user) is not None
-    _cleanup_user_dir(path, is_customer_user)
-    if is_customer_user:
-        user_tars = [m for m in user_tars if not is_user_file(m.name)]
-
-    d = os.path.dirname(path)
-    tar_file.extractall(d, members=user_tars)  # nosec B202
-
-
-def _cleanup_user_dir(path, is_customer_user) -> None:  # type: ignore[no-untyped-def]
-    for entry in os.listdir(path):
-        p = path + "/" + entry
-        if os.path.isdir(p):
-            _cleanup_user_dir(p, is_customer_user)
-        elif is_customer_user and is_user_file(entry):
-            continue
-        else:
-            os.remove(p)
-
-
-def is_user_file(filepath) -> bool:  # type: ignore[no-untyped-def]
+def is_user_file(filepath: str) -> bool:
     entry = os.path.basename(filepath)
     return entry.startswith("user_") or entry in ["tableoptions.mk", "treestates.mk", "sidebar.mk"]
 
 
-def _update_check_mk(target_dir, tar_file):
-    """extract check_mk/conf.d/wato folder, but keep information in contacts.mk
-    (need to retain user notification rules)"""
-    site_vars: dict[str, Any] = {"contacts": {}}
-    with Path(target_dir).joinpath("contacts.mk").open(encoding="utf-8") as f:
-        exec(f.read(), {}, site_vars)
-
-    _wipe_directory(target_dir)
-    tar_file.extractall(target_dir)  # nosec B202
-
-    master_vars: dict[str, Any] = {"contacts": {}}
-    exec(tar_file.extractfile("./contacts.mk").read(), {}, master_vars)
-
-    site_contacts = _update_contacts_dict(master_vars["contacts"], site_vars["contacts"])
-    store.save_to_mk_file(os.path.join(target_dir, "contacts.mk"), "contacts", site_contacts)
-
-
-def _update_contacts_dict(master: dict, site: dict) -> dict:
-    site_contacts = {}
-
-    for user_id, settings in master.items():
-        user_notifications = site.get(user_id, {}).get("notification_rules")
-
-        if user_notifications and settings.get("customer") is not None:
-            settings["notification_rules"] = user_notifications
-
-        site_contacts.update({user_id: settings})
-
-    return site_contacts
-
-
-def get_site_globals(site_id: SiteId, site_config: SiteConfiguration) -> dict[str, Any]:
+def get_site_globals(site_id: SiteId, site_config: SiteConfiguration) -> SiteGlobals:
     site_globals = site_config.get("globals", {}).copy()
     site_globals.update(
         {
@@ -657,6 +489,7 @@ def get_site_globals(site_id: SiteId, site_config: SiteConfiguration) -> dict[st
 def create_distributed_wato_files(base_dir: Path, site_id: SiteId, is_remote: bool) -> None:
     _create_distributed_wato_file_for_base(base_dir, site_id, is_remote)
     _create_distributed_wato_file_for_dcd(base_dir, is_remote)
+    _create_distributed_wato_file_for_omd(base_dir, is_remote)
 
 
 def _create_distributed_wato_file_for_base(
@@ -675,10 +508,20 @@ def _create_distributed_wato_file_for_base(
 
 
 def _create_distributed_wato_file_for_dcd(base_dir: Path, is_remote: bool) -> None:
-    if cmk_version.is_raw_edition():
+    if cmk_version.edition(cmk.utils.paths.omd_root) is cmk_version.Edition.CRE:
         return
 
     output = wato_fileheader()
     output += "dcd_is_wato_remote_site = %r\n" % is_remote
 
     store.save_text_to_file(base_dir.joinpath("etc/check_mk/dcd.d/wato/distributed.mk"), output)
+
+
+def _create_distributed_wato_file_for_omd(base_dir: Path, is_remote: bool) -> None:
+    output = wato_fileheader()
+    output += f"is_wato_remote_site = {is_remote}\n"
+    store.save_text_to_file(base_dir / "etc/omd/distributed.mk", output)
+
+
+def create_rabbitmq_new_definitions_file(base_dir: Path, definition: rabbitmq.Definitions) -> None:
+    store.save_text_to_file(base_dir / rabbitmq.NEW_DEFINITIONS_FILE_PATH, definition.dumps())

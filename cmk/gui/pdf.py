@@ -3,6 +3,7 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 # Coords:
 # 0,0 is at the *bottom* left of the page. When you specify
 # left and top, then a larger top is nearer to the top of the
@@ -22,22 +23,21 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from textwrap import wrap
-from typing import Literal, overload, Protocol, TypedDict, Union
+from typing import Literal, NewType, overload, Protocol, TypedDict
 
-from PIL import PngImagePlugin
-from PIL.Image import Image
-from reportlab.lib.units import mm  # type: ignore[import]
-from reportlab.lib.utils import ImageReader  # type: ignore[import]
+from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
 
 # Import software from reportlab (thanks to them!)
-from reportlab.pdfgen import canvas  # type: ignore[import]
-from six import ensure_str
+from reportlab.pdfgen import canvas
 
 import cmk.utils.paths
+from cmk.utils.images import CMKImage, ImageType
 
 from cmk.gui.exceptions import MKInternalError
-from cmk.gui.http import response
+from cmk.gui.http import ContentDispositionType, response
 from cmk.gui.i18n import _
 from cmk.gui.type_defs import RGBColor, RowShading, SizeMM, SizePT
 
@@ -47,25 +47,23 @@ RawTableColumn = tuple[Sequence[str], str | RawIconColumn | RawRendererColumn]
 RawTableRow = list[RawTableColumn]
 RawTableRows = list[RawTableRow]
 SizeInternal = float
-SizeDPI = int
+SizeDPI = NewType("SizeDPI", int)
 Align = Literal["left", "right", "center"]
 VerticalAlign = Literal["bottom", "middle"]
 OddEven = Literal["even", "odd", "heading"]
-Position = Union[
-    tuple[Literal["n", "s", "w", "e"], SizeMM],
-    tuple[Literal["nw", "ne", "sw", "se"], tuple[SizeMM, SizeMM]],
-    Literal["c"],
-]
+Position = (
+    tuple[Literal["n", "s", "w", "e"], SizeMM]
+    | tuple[Literal["nw", "ne", "sw", "se"], tuple[SizeMM, SizeMM]]
+    | Literal["c"]
+)
 
 
 @overload
-def from_mm(dim: float) -> float:
-    ...
+def from_mm(dim: float) -> float: ...
 
 
 @overload
-def from_mm(dim: Sequence[float]) -> Sequence[float]:
-    ...
+def from_mm(dim: Sequence[float]) -> Sequence[float]: ...
 
 
 def from_mm(dim: float | Sequence[float]) -> float | Sequence[float]:
@@ -224,13 +222,8 @@ class Document:
 
     @classmethod
     def send(cls, pdf_source: bytes, sendas: str) -> None:
-        # ? sendas seems to be used with type str
         response.set_content_type("application/pdf")
-        response.headers[
-            "Content-Disposition"
-        ] = "inline; filename=" + ensure_str(  # pylint: disable= six-ensure-str-bin-call
-            sendas
-        )
+        response.set_content_disposition(ContentDispositionType.INLINE, sendas)
         response.set_data(pdf_source)
 
     # Methods dealing with manipulating the graphics state (font size, etc.)
@@ -379,7 +372,7 @@ class Document:
 
         anchor = position[0]
         if anchor in ("s", "n", "w", "e"):
-            offset = position[1] * mm
+            offset = position[1] * mm  # type: ignore[operator]
             if anchor == "n":
                 return h_center, self._top - offset
             if anchor == "s":
@@ -444,17 +437,17 @@ class Document:
         self._canvas.rect(self._left, self._bottom, self._inner_width, self._inner_height, fill=0)
         self.restore_state()
 
-    def place_pil_image(
+    def place_image(
         self,
         position: Position,
-        pil: Image,
+        image: CMKImage,
         width_mm: SizeMM | None,
         height_mm: SizeMM | None,
-        resolution: int | None,
+        resolution: SizeDPI | None,
     ) -> None:
-        width, height = self.get_image_dimensions(pil, width_mm, height_mm, resolution)
+        width, height = self.get_image_dimensions(image, width_mm, height_mm, resolution)
         x, y = self.convert_position(position, width, height)
-        ir = ImageReader(pil)
+        ir = ImageReader(image.pil())
         self._canvas.drawImage(ir, x, y - height, width, height, mask="auto")
 
     # Functions for adding floating text
@@ -502,7 +495,7 @@ class Document:
         self.set_font_zoom(zoom)
         self.set_font_bold()
         self.advance(self.lineskip())
-        self._canvas.drawString(self._left, self._linepos, heading)
+        self.add_paragraph(heading)
         self._heading_entries.append((heading, self.page_number()))
         self.advance(self.lineskip() / 2.0)
         self.restore_state()
@@ -537,21 +530,20 @@ class Document:
         self._linepos -= margin * mm
         self.restore_state()
 
-    def add_pil_image(
+    def add_image(
         self,
-        pil: Image,
+        image: CMKImage,
         width: SizeMM | None,
         height: SizeMM | None,
         resolution: SizeDPI | None = None,
         border: bool = True,
     ) -> None:
-        width, height = self.get_image_dimensions(pil, width, height, resolution)
+        width, height = self.get_image_dimensions(image, width, height, resolution)
 
         self.advance(height)
         x = self._left + (self._inner_width - width) / 2.0  # center
         y = self._linepos
-        ir = ImageReader(pil)
-        self._canvas.drawImage(ir, x, y, width, height, mask="auto")
+        self._canvas.drawImage(ImageReader(image.pil()), x, y, width, height, mask="auto")
         if border:
             self._canvas.rect(x, y, width, height, fill=0)
 
@@ -723,8 +715,8 @@ class Document:
     def render_image(
         self, left_mm: SizeMM, top_mm: SizeMM, width_mm: SizeMM, height_mm: SizeMM, path: str
     ) -> None:
-        pil = PngImagePlugin.PngImageFile(fp=path)
-        ir = ImageReader(pil)
+        image = CMKImage.from_path(Path(path), ImageType.PNG)
+        ir = ImageReader(image.pil())
         try:
             self._canvas.drawImage(
                 ir, left_mm * mm, top_mm * mm, width_mm * mm, height_mm * mm, mask="auto"
@@ -735,7 +727,7 @@ class Document:
     def get_line_skip(self) -> SizeMM:
         return self.lineskip() / mm  # fixed: true-division
 
-    def text_width(self, text) -> SizeMM:  # type: ignore[no-untyped-def]
+    def text_width(self, text: str) -> SizeMM:
         return self._canvas.stringWidth(text) / mm  # fixed: true-division
 
     # TODO: unify with render_text()
@@ -764,6 +756,7 @@ class Document:
         top = top_mm * mm + (height_mm * mm - ex_height) / 2.0
         if valign == "middle":
             top -= ex_height * 0.5  # estimate
+
         if align == "center":
             self._canvas.drawCentredString((left_mm + width_mm / 2.0) * mm, top, text)
         elif align == "left":
@@ -842,30 +835,10 @@ class Document:
     def close_path(self) -> None:
         self._path.close()
 
-    def fill_path(self, color: RGBColor, gradient=None) -> None:  # type: ignore[no-untyped-def]
+    def fill_path(self, color: RGBColor) -> None:
         self.save_state()
-
-        # The gradient is dramatically increasing the size of the PDFs. For example a PDF with
-        # 10 graphs has a size of 6 MB with gradients compared to 260 KB without gradients!
-        # It may look better, but that's not worth it.
-        #
-        # Older versions of reportlab do not support gradients
-        # try:
-        #    self._canvas.linearGradient
-        # except:
-        #    gradient = None
-
-        # if gradient:
-        #    grad_left, grad_top, grad_width, grad_height, color_range, switch_points = gradient
-        #    self._canvas.saveState()
-        #    self._canvas.clipPath(self._path, stroke=0)
-        #    self._canvas.linearGradient(grad_left * mm, grad_top * mm, grad_width * mm, grad_height * mm,
-        #                                color_range, switch_points, extend=False)
-        #    self._canvas.restoreState()
-        # else:
         self.set_fill_color(color)
         self._canvas.drawPath(self._path, stroke=0, fill=1)
-
         self.restore_state()
 
     def stroke_path(self, color: RGBColor = black, width: SizeMM = 0.05) -> None:
@@ -949,17 +922,16 @@ class Document:
     # is set, then width and height are being ignored.
     def get_image_dimensions(
         self,
-        pil: Image,
+        image: CMKImage,
         width_mm: SizeMM | None,
         height_mm: SizeMM | None,
-        resolution_dpi: SizeDPI | None = None,
+        resolution: SizeDPI | None = None,
     ) -> tuple[SizeInternal, SizeInternal]:
         # Get bounding box of image in order to get aspect (width / height)
-        bbox = pil.getbbox()
-        assert bbox is not None  # TODO: Why is this the case here?
+        bbox = image.get_bounding_box()
         pix_width, pix_height = bbox[2], bbox[3]
-        if resolution_dpi is not None:
-            resolution_mm = resolution_dpi / 2.45
+        if resolution is not None:
+            resolution_mm = resolution / 2.45
             resolution_pt = resolution_mm / mm  # now we have pixels / pt # fixed: true-division
             width = pix_width / resolution_pt  # fixed: true-division
             height = pix_height / resolution_pt  # fixed: true-division
@@ -994,28 +966,21 @@ class CellRenderer(Protocol):
         x_padding: SizeMM,
         y_padding: SizeMM,
         row_oddeven: OddEven | None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     def get_render_steps(
         self, pdfdoc: Document, headers: Sequence[CellRenderer], y_padding: SizeMM
-    ) -> Sequence[CellRenderer]:
-        ...
+    ) -> Sequence[CellRenderer]: ...
 
-    def maximal_width(self, pdfdoc: Document) -> SizeMM:
-        ...
+    def maximal_width(self, pdfdoc: Document) -> SizeMM: ...
 
-    def minimal_width(self, pdfdoc: Document) -> SizeMM:
-        ...
+    def minimal_width(self, pdfdoc: Document) -> SizeMM: ...
 
-    def can_add_dynamic_width(self) -> bool:
-        ...
+    def can_add_dynamic_width(self) -> bool: ...
 
-    def set_width(self, pdfdoc: Document, width: SizeMM) -> None:
-        ...
+    def set_width(self, pdfdoc: Document, width: SizeMM) -> None: ...
 
-    def height(self, pdfdoc: Document) -> SizeMM:
-        ...
+    def height(self, pdfdoc: Document) -> SizeMM: ...
 
 
 @dataclass
@@ -1035,11 +1000,11 @@ class TableRenderer:
         super().__init__()
         self.pdf = pdf
 
-    def add_table(  # pylint: disable=too-many-branches
+    def add_table(
         self,
         header_texts: Sequence[str],
         raw_rows: RawTableRows,
-        font_size: SizeMM,
+        font_size: SizePT,
         show_headings: bool,
         padding: tuple[SizeMM, SizeMM],
         spacing: tuple[SizeMM, SizeMM],
@@ -1082,7 +1047,8 @@ class TableRenderer:
         # ( "number", "0.75" ), or ("", ("icon", "/bar/foo.png") )
         # The headers come *without* the css field and are always texts.
         headers: list[CellRenderer] = [
-            TitleCell(["heading"], header_text) for header_text in header_texts  #
+            TitleCell(["heading"], header_text)
+            for header_text in header_texts  #
         ]
 
         rows: list[list[CellRenderer]] = []

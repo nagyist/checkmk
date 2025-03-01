@@ -14,7 +14,7 @@ following soon.
 H2: Agent setup
 This agent does not run out of the box, because it depends on some files
 from the <i>Netapp Manageability SDK</i> from NetApp. You can download it
-<a href="http://mysupport.netapp.com/NOW/cgi-bin/software/?product=NetApp+Manageability+SDK&platform=All+Platforms">here (customer/partner login required)</a>
+<a href="http://mysupport.netapp.com/NOW/cgi-bin/software/?product=NetApp+Manageability+SDK&amp;platform=All+Platforms">here (customer/partner login required)</a>
 In this package you will find a python API binding. The agent_netapp requires
 the two python files (<tt>NaElement.py</tt> / <tt>NaServer.py</tt>) to be put into
 the sites local directory <tt>~/local/lib/python</tt>.
@@ -59,7 +59,7 @@ are ready to process the data:
 <tr><td>netapp_api_vf_stats.cpu_util</td><td>vFiler CPU utilization</td></tr>
 <tr><td>netapp_api_vf_status</td><td>vFiler status</td></tr>
 <tr><td>netapp_api_psu</td><td>Power supplies summary which are relevant to that filer. Reports broken units</td></tr>
-<tr><td>netapp_api_fan</td><td>Fans summary which are relevant to that filer. Reports broken units</td><tr>
+<tr><td>netapp_api_fan</td><td>Fans summary which are relevant to that filer. Reports broken units</td></tr>
 <tr><td>netapp_api_temp</td><td>Temperature sensor summary for internal and ambient sensors relevant to that filer. Reports broken units</td></tr>
 </table>
 

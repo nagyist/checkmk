@@ -17,7 +17,7 @@ import urllib3
 
 from cmk.utils import password_store
 
-from cmk.special_agents.utils import vcrtrace
+from cmk.special_agents.v0_unstable.misc import vcrtrace
 
 API_PATH = "webacs/api/v1/data/"
 REQUESTS = {
@@ -94,8 +94,7 @@ def write_section_from_get_request(argv: Sequence[str]) -> None:
             #    raise OurCustomException("Nice message") [from exc]
             # as soon as we have proper exception handling
             raise RuntimeError(
-                "Server dit not return valid JSON (%s). Reply with %r"
-                % (exc.msg, response.text[:30])
+                f"Server dit not return valid JSON ({exc.msg}). Reply with {response.text[:30]!r}"
             )
 
     args = parse_arguments(argv)
@@ -109,19 +108,19 @@ def write_section_from_get_request(argv: Sequence[str]) -> None:
             API_PATH,
         )
         for service, request_string in REQUESTS.items():
-            print(
-                "<<<cisco_prime_%s:sep(0)>>>\n%s"
+            sys.stdout.write(
+                "<<<cisco_prime_%s:sep(0)>>>\n%s\n"
                 % (
                     service,
                     fetch_json_data(url_prefix + request_string, args),
                 )
             )
 
-    except Exception as exc:  # pylint: disable=broad-except
+    except Exception as exc:
         if args.debug:
             raise
         # In the non-debug case the first (and only) line on stderr should tell what happended
-        print(str(exc), file=sys.stderr)
+        sys.stderr.write(f"{exc}\n")
         raise SystemExit(-1)
 
 

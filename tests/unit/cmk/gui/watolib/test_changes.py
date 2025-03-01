@@ -3,29 +3,23 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 import ast
+import datetime
 import time
 from collections.abc import Iterable
+from zoneinfo import ZoneInfo
 
 import pytest
+import time_machine
 from pytest_mock import MockerFixture
-
-from tests.testlib import on_time
-
-from tests.unit.cmk.gui.test_i18n import (  # pylint: disable=unused-import  # noqa: F401
-    compile_builtin_po_files,
-    locale_base_dir,
-    locale_paths,
-)
 
 from livestatus import SiteId
 
 from cmk.utils.object_diff import make_diff_text
-from cmk.utils.type_defs import UserId
+from cmk.utils.user import UserId
 
-import cmk.gui.i18n as i18n
 from cmk.gui.utils.html import HTML
-from cmk.gui.utils.script_helpers import application_and_request_context
 from cmk.gui.watolib.audit_log import AuditLogStore, log_audit
 from cmk.gui.watolib.changes import ActivateChangesWriter, add_change
 from cmk.gui.watolib.objref import ObjectRef, ObjectRefType
@@ -81,7 +75,7 @@ class TestAuditLogStore:
 
     def test_read_not_existing(self, store: AuditLogStore) -> None:
         assert not store.exists()
-        assert list(store.read()) == []
+        assert not list(store.read())
 
     def test_clear_not_existing(self, store: AuditLogStore) -> None:
         assert not store.exists()
@@ -101,7 +95,12 @@ class TestAuditLogStore:
     @pytest.mark.usefixtures("request_context")
     def test_transport_html(self, store: AuditLogStore) -> None:
         entry = AuditLogStore.Entry(
-            int(time.time()), None, "user", "action", HTML("Mäss<b>ädsch</b>"), None
+            int(time.time()),
+            None,
+            "user",
+            "action",
+            HTML.without_escaping("Mäss<b>ädsch</b>"),
+            None,
         )
         store.append(entry)
         assert list(store.read()) == [entry]
@@ -112,7 +111,7 @@ class TestAuditLogStore:
         assert list(store.read()) == [entry]
 
         store.clear()
-        assert list(store.read()) == []
+        assert not list(store.read())
 
         archive_path = store._path.with_name(store._path.name + time.strftime(".%Y-%m-%d"))
         assert archive_path.exists()
@@ -125,7 +124,7 @@ class TestAuditLogStore:
             assert list(store.read()) == [entry]
 
             store.clear()
-            assert list(store.read()) == []
+            assert not list(store.read())
 
             for archive_num in range(n + 1):
                 archive_path = store._path.with_name(store._path.name + time.strftime(".%Y-%m-%d"))
@@ -162,7 +161,7 @@ class TestSiteChanges:
 
     def test_read_not_existing(self, store: SiteChanges) -> None:
         assert not store.exists()
-        assert list(store.read()) == []
+        assert not list(store.read())
 
     def test_clear_not_existing(self, store: SiteChanges) -> None:
         assert not store.exists()
@@ -187,39 +186,7 @@ class TestSiteChanges:
         assert list(store.read()) == [entry]
 
         store.clear()
-        assert list(store.read()) == []
-
-    @pytest.mark.parametrize(
-        "old_type,ref_type",
-        [
-            ("CREHost", ObjectRefType.Host),
-            ("CMEHost", ObjectRefType.Host),
-            ("CREFolder", ObjectRefType.Folder),
-            ("CMEFolder", ObjectRefType.Folder),
-        ],
-    )
-    def test_read_pre_20_host_change(
-        self, store: SiteChanges, old_type: str, ref_type: ObjectRefType
-    ) -> None:
-        with store._path.open("wb") as f:
-            f.write(
-                repr(
-                    {
-                        "id": "d60ca3d4-7201-4a89-b66f-2f156192cad2",
-                        "action_name": "create-host",
-                        "text": "Created new host node1.",
-                        "object": (old_type, "node1"),
-                        "user_id": "cmkadmin",
-                        "domains": ["check_mk"],
-                        "time": 1605461248.786142,
-                        "need_sync": True,
-                        "need_restart": True,
-                    }
-                ).encode("utf-8")
-                + b"\0"
-            )
-
-        assert store.read()[0]["object"] == ObjectRef(ref_type, "node1")
+        assert not list(store.read())
 
 
 @pytest.mark.usefixtures("request_context")
@@ -232,7 +199,7 @@ def test_log_audit_with_object_diff() -> None:
         "b": "c",
     }
 
-    with on_time("2018-04-15 16:50", "CET"):
+    with time_machine.travel(datetime.datetime(2018, 4, 15, 16, 50, tzinfo=ZoneInfo("UTC"))):
         log_audit(
             object_ref=None,
             action="bla",
@@ -256,12 +223,12 @@ def test_log_audit_with_object_diff() -> None:
 
 @pytest.mark.usefixtures("request_context")
 def test_log_audit_with_html_message() -> None:
-    with on_time("2018-04-15 16:50", "CET"):
+    with time_machine.travel(datetime.datetime(2018, 4, 15, 16, 50, tzinfo=ZoneInfo("UTC"))):
         log_audit(
             object_ref=None,
             user_id=UserId("calvin"),
             action="bla",
-            message=HTML("Message <b>bla</b>"),
+            message=HTML.without_escaping("Message <b>bla</b>"),
         )
 
     store = AuditLogStore()
@@ -271,46 +238,13 @@ def test_log_audit_with_html_message() -> None:
             object_ref=None,
             user_id="calvin",
             action="bla",
-            text=HTML("Message <b>bla</b>"),
+            text=HTML.without_escaping("Message <b>bla</b>"),
             diff_text=None,
         ),
     ]
 
 
-@pytest.mark.usefixtures("request_context")
-def test_log_audit_with_lazystring() -> None:
-    with application_and_request_context():
-        lazy_str = i18n._l("Edit foreign %s") % "zeugs"
-        assert lazy_str == "Edit foreign zeugs"
-
-    # use localized lazy_str as input for log_audit and make sure that it is
-    # written unlocalized to audit log
-    with application_and_request_context():
-        i18n.localize("de")
-        assert lazy_str == "Fremde(n) zeugs editieren"
-
-        with on_time("2018-04-15 16:50", "CET"):
-            log_audit(
-                object_ref=None,
-                user_id=UserId("calvin"),
-                action="bla",
-                message=lazy_str,
-            )
-
-    store = AuditLogStore()
-    assert store.read() == [
-        AuditLogStore.Entry(
-            time=1523811000,
-            object_ref=None,
-            user_id="calvin",
-            action="bla",
-            text="Edit foreign zeugs",
-            diff_text=None,
-        ),
-    ]
-
-
-def test_disable_activate_changes_writer(mocker: MockerFixture) -> None:
+def test_disable_activate_changes_writer(mocker: MockerFixture, request_context: None) -> None:
     add_to_site_mock = mocker.patch.object(ActivateChangesWriter, "_add_change_to_site")
 
     add_change("ding", "dong", sites=[SiteId("a")])

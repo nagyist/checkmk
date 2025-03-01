@@ -3,6 +3,7 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 """Fetcher config path manipulation."""
+
 from __future__ import annotations
 
 import abc
@@ -13,8 +14,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final
 
+from cmk.ccc import store
+
 import cmk.utils.paths
-import cmk.utils.store as store
 
 __all__ = ["ConfigPath", "VersionedConfigPath", "LATEST_CONFIG"]
 
@@ -35,9 +37,7 @@ class ConfigPath(abc.ABC):
         return self._path_elem
 
     def __eq__(self, other: Any) -> bool:
-        if not isinstance(other, os.PathLike):
-            return False
-        return Path(self) == Path(other)
+        return Path(self) == Path(other) if isinstance(other, os.PathLike) else False
 
     def __hash__(self) -> int:
         return hash(type(self)) ^ hash(self._path_elem)

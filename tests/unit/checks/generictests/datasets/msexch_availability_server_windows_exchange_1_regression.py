@@ -8,6 +8,12 @@
 
 checkname = "msexch_availability"
 
+mock_item_state = {
+    "": {
+        "AvailabilityRequestssec_": (0, 0),
+    },
+}
+
 info = [
     [
         "AvailabilityRequestssec",
@@ -125,7 +131,7 @@ info = [
     ],
 ]
 
-discovery = {"": [(None, None)]}
+discovery = {"": [(None, {})]}
 
 checks = {
     "": [

@@ -3,46 +3,46 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 import pytest
 from fakeredis import FakeRedis
 from pytest import MonkeyPatch
+from pytest_mock import MockerFixture
 from redis import Redis
 
+from cmk.utils.hostaddress import HostName
 from cmk.utils.livestatus_helpers.testing import MockLiveStatusConnection
-from cmk.utils.type_defs import HostName
 
 from cmk.automations.results import GetConfigurationResult
 
+from cmk.gui.i18n import localize
 from cmk.gui.logged_in import LoggedInNobody, user
-from cmk.gui.plugins.wato.omd_configuration import (
+from cmk.gui.session import _UserContext
+from cmk.gui.type_defs import SearchResult, SearchResultsByTopic
+from cmk.gui.wato._omd_configuration import (
     ConfigDomainApache,
     ConfigDomainDiskspace,
     ConfigDomainRRDCached,
 )
-from cmk.gui.session import _UserContext
-from cmk.gui.type_defs import SearchResult, SearchResultsByTopic
 from cmk.gui.watolib import search
 from cmk.gui.watolib.config_domains import ConfigDomainOMD
-from cmk.gui.watolib.hosts_and_folders import Folder
+from cmk.gui.watolib.hosts_and_folders import folder_tree
 from cmk.gui.watolib.search import (
     ABCMatchItemGenerator,
     IndexBuilder,
     IndexNotFoundException,
     IndexSearcher,
     is_url_permitted,
-    localize,
-)
-from cmk.gui.watolib.search import (
-    match_item_generator_registry as real_match_item_generator_registry,
-)
-from cmk.gui.watolib.search import (
     MatchItem,
     MatchItemGeneratorRegistry,
     MatchItems,
     PermissionsHandler,
+)
+from cmk.gui.watolib.search import (
+    match_item_generator_registry as real_match_item_generator_registry,
 )
 
 
@@ -316,7 +316,7 @@ class TestIndexBuilderAndSearcher:
 
 @pytest.fixture(name="created_host_url")
 def fixture_created_host_url() -> str:
-    folder = Folder.root_folder()
+    folder = folder_tree().root_folder()
     folder.create_hosts([(HostName("host"), {}, [])])
     return "wato.py?folder=&host=host&mode=edit_host"
 
@@ -354,10 +354,15 @@ class TestPermissionHandler:
 
 
 class TestIndexSearcher:
-    @pytest.mark.usefixtures("with_admin_login")
-    def test_search_no_index(self, clean_redis_client: "Redis[str]") -> None:
+    @pytest.mark.usefixtures("with_admin_login", "inline_background_jobs")
+    def test_search_no_index(self, clean_redis_client: "Redis[str]", mocker: MockerFixture) -> None:
+        get_config = mocker.patch(
+            "cmk.gui.wato.pages.global_settings.ABCConfigDomain.get_all_default_globals"
+        )
+
         with pytest.raises(IndexNotFoundException):
             list(IndexSearcher(clean_redis_client, PermissionsHandler()).search("change_dep"))
+        get_config.assert_called()
 
     def test_sort_search_results(self) -> None:
         def fake_permissions_check(_url: str) -> bool:

@@ -9,9 +9,9 @@ from collections.abc import Sequence
 
 from requests.auth import HTTPBasicAuth
 
-from cmk.special_agents.utils.agent_common import special_agent_main
-from cmk.special_agents.utils.argument_parsing import Args, create_default_argument_parser
-from cmk.special_agents.utils.request_helper import create_api_connect_session, parse_api_url
+from cmk.special_agents.v0_unstable.agent_common import special_agent_main
+from cmk.special_agents.v0_unstable.argument_parsing import Args, create_default_argument_parser
+from cmk.special_agents.v0_unstable.request_helper import ApiSession, parse_api_url
 
 
 def parse_arguments(args: Sequence[str] | None) -> Args:
@@ -68,7 +68,7 @@ def agent_activemq_main(args: Args) -> int:
     if args.username:
         auth = HTTPBasicAuth(args.username, args.password)
 
-    session = create_api_connect_session(api_url, auth=auth)
+    session = ApiSession(api_url, auth=auth)
 
     try:
         response = session.get("queues.jsp")
@@ -108,7 +108,7 @@ def agent_activemq_main(args: Args) -> int:
         sys.stderr.write("Unable to process data. Returned data might be incorrect: %r" % e)
         return 1
 
-    print("\n".join(output_lines))
+    sys.stdout.write("\n".join(output_lines) + "\n")
     return 0
 
 

@@ -3,6 +3,7 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 import abc
 import functools
 import http.client as http_client
@@ -10,8 +11,8 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-import cmk.utils.plugin_registry
-from cmk.utils.exceptions import MKException
+import cmk.ccc.plugin_registry
+from cmk.ccc.exceptions import MKException
 
 from cmk.gui.config import active_config
 from cmk.gui.crash_handler import handle_exception_as_gui_crash_report
@@ -76,13 +77,12 @@ class AjaxPage(Page, abc.ABC):
         """Override this to implement the page functionality"""
         raise NotImplementedError()
 
-    def _handle_exc(self, method) -> None:  # type: ignore[no-untyped-def]
+    def _handle_exc(self, method: Callable[[], PageResult]) -> None:
         try:
-            # FIXME: These methods write to the response themselves. This needs to be refactored.
             method()
         except MKException as e:
             response.status_code = http_client.BAD_REQUEST
-            html.write_text(str(e))
+            html.write_text_permissive(str(e))
         except Exception as e:
             response.status_code = http_client.INTERNAL_SERVER_ERROR
             if active_config.debug:
@@ -92,7 +92,7 @@ class AjaxPage(Page, abc.ABC):
                 plain_error=True,
                 show_crash_link=getattr(g, "may_see_crash_reports", False),
             )
-            html.write_text(str(e))
+            html.write_text_permissive(str(e))
 
     def handle_page(self) -> None:
         """The page handler, called by the page registry"""
@@ -118,7 +118,7 @@ class AjaxPage(Page, abc.ABC):
         response.set_data(json.dumps(resp))
 
 
-class PageRegistry(cmk.utils.plugin_registry.Registry[type[Page]]):
+class PageRegistry(cmk.ccc.plugin_registry.Registry[type[Page]]):
     def plugin_name(self, instance: type[Page]) -> str:
         return instance.ident()
 
@@ -151,25 +151,6 @@ class PageRegistry(cmk.utils.plugin_registry.Registry[type[Page]]):
 
 
 page_registry = PageRegistry()
-
-
-# TODO: Refactor all call sites to sub classes of Page() and change the
-# registration to page_registry.register("path")
-def register(path: str) -> Callable[[PageHandlerFunc], PageHandlerFunc]:
-    """Register a function to be called when the given URL is called.
-
-    In case you need to register some callable like staticmethods or
-    classmethods, you will have to use register_page_handler() directly
-    because this decorator can not deal with them.
-
-    It is essentially a decorator that calls register_page_handler().
-    """
-
-    def wrap(wrapped_callable: PageHandlerFunc) -> PageHandlerFunc:
-        cls = page_registry.register_page_handler(path, wrapped_callable)
-        return lambda: cls().handle_page()
-
-    return wrap
 
 
 def get_page_handler(name: str, dflt: PageHandlerFunc | None = None) -> PageHandlerFunc | None:

@@ -7,16 +7,18 @@ from __future__ import annotations
 
 import enum
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Literal, NamedTuple
 
 from livestatus import LivestatusResponse, lqencode, quote_dict, SiteId
 
-import cmk.gui.sites as sites
+from cmk.utils.labels import AndOrNotLiteral, LabelGroups, single_label_group_from_labels
+
+from cmk.gui import sites
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
-from cmk.gui.type_defs import FilterHTTPVariables, Sequence
+from cmk.gui.type_defs import FilterHTTPVariables
 
 
 class Label(NamedTuple):
@@ -32,11 +34,6 @@ class LabelType(enum.StrEnum):
 
 
 Labels = Iterable[Label]
-
-# Label group specific types
-AndOrNotLiteral = Literal["and", "or", "not"]
-LabelGroup = Sequence[tuple[AndOrNotLiteral, str]]
-LabelGroups = Sequence[tuple[AndOrNotLiteral, LabelGroup]]
 
 # Labels need to be in the format "<key>:<value>", e.g. "os:windows"
 LABEL_REGEX = r"^[^:]+:[^:]+$"
@@ -64,10 +61,7 @@ def parse_labels_value(value: str) -> Labels:
         if label_id in seen:
             raise MKUserError(
                 None,
-                _(
-                    "A label key can be used only once per object. "
-                    'The Label key "%s" is used twice.'
-                )
+                _('A label key can be used only once per object. The Label key "%s" is used twice.')
                 % label_id,
             )
         yield Label(label_id, label_value, False)
@@ -168,7 +162,7 @@ def _operator_filter_str(operator: AndOrNotLiteral, is_first: bool) -> str:
 
 
 def encode_labels_for_tagify(
-    labels: Labels | Iterable[tuple[str, str]]
+    labels: Labels | Iterable[tuple[str, str]],
 ) -> Iterable[Mapping[str, str]]:
     """
     >>> encode_labels_for_tagify({"key": "value", "x": "y"}.items()) ==  encode_labels_for_tagify([Label("key", "value", False), Label("x", "y", False)])
@@ -249,6 +243,7 @@ def _parse_label_groups_to_http_vars(
             {
                 f"{prefix}_{i}_vs_count": "%d" % len(group),
                 f"{prefix}_{i}_bool": group_operator,
+                f"{prefix}_indexof_{i}": str(i),
             }
         )
 
@@ -257,21 +252,11 @@ def _parse_label_groups_to_http_vars(
                 {
                     f"{prefix}_{i}_vs_{j}_bool": label_operator,
                     f"{prefix}_{i}_vs_{j}_vs": label,
+                    f"{prefix}_{i}_vs_indexof_{j}": str(j),
                 }
             )
 
     return filter_vars
-
-
-def _single_label_group_from_labels(
-    labels: Sequence[str], operator: AndOrNotLiteral = "and"
-) -> LabelGroups:
-    return [
-        (
-            "and",
-            [(operator, label) for label in labels],
-        )
-    ]
 
 
 def filter_http_vars_for_simple_label_group(
@@ -283,9 +268,9 @@ def filter_http_vars_for_simple_label_group(
     connecting all of them by the same logical <operator>.
 
     >>> filter_http_vars_for_simple_label_group(["foo:bar", "check:mk"], "host")
-    {'host_labels_count': '1', 'host_labels_1_vs_count': '2', 'host_labels_1_bool': 'and', 'host_labels_1_vs_1_bool': 'and', 'host_labels_1_vs_1_vs': 'foo:bar', 'host_labels_1_vs_2_bool': 'and', 'host_labels_1_vs_2_vs': 'check:mk'}
+    {'host_labels_count': '1', 'host_labels_1_vs_count': '2', 'host_labels_1_bool': 'and', 'host_labels_indexof_1': '1', 'host_labels_1_vs_1_bool': 'and', 'host_labels_1_vs_1_vs': 'foo:bar', 'host_labels_1_vs_indexof_1': '1', 'host_labels_1_vs_2_bool': 'and', 'host_labels_1_vs_2_vs': 'check:mk', 'host_labels_1_vs_indexof_2': '2'}
     """
     return _parse_label_groups_to_http_vars(
-        _single_label_group_from_labels(labels, operator),
+        single_label_group_from_labels(labels, operator),
         object_type,
     )

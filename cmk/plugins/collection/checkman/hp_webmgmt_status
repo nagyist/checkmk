@@ -1,0 +1,20 @@
+title: HPE Web Management: Status
+agents: snmp
+catalog: hw/network/hp
+license: GPLv2
+distribution: check_mk
+description:
+ This check monitors the overall health status of various HPE devices.
+
+ The check status is directly relayed from the device, with both "critical"
+ and "non-recoverable" device statuses translating to {CRIT}
+
+ It's not entirely clear which devices are covered by the check but it does
+ support some switches and tape libraries of the storever series.
+ It's possible support for the used mib is configurable in the device.
+
+item:
+ The unique device identification.
+
+discovery:
+ One service is created for each management object which is usually one.

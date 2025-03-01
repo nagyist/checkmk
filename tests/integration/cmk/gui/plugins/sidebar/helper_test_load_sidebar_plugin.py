@@ -3,9 +3,10 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+import sys
+
 from cmk.gui import main_modules
+from cmk.gui.sidebar import snapin_registry
 
 main_modules.load_plugins()
-from cmk.gui.plugins.sidebar.utils import snapin_registry
-
-print("test" in snapin_registry)
+sys.stdout.write(f"{'test' in snapin_registry}\n")

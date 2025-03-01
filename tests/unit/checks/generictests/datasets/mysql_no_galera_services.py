@@ -7,6 +7,18 @@
 # mypy: disable-error-code=var-annotated
 checkname = "mysql"
 
+
+mock_item_state = {
+    "sessions": {
+        "mysql.sessions": (0, 499742),
+    },
+    "innodb_io": {
+        "read": (0.0, 39781 * 512),
+        "write": (0.0, 4969542733 * 512),
+    }
+}
+
+
 info = [
     ["Aborted_clients", "7098"],
     ["Aborted_connects", "0"],
@@ -1243,7 +1255,17 @@ checks = {
             [
                 (
                     0,
-                    "read: 0.00 B/s, write: 0.00 B/s",
+                    "Read: 0.00 B/s",
+                    [],
+                ),
+                (
+                    0,
+                    "Write: 0.00 B/s",
+                    [],
+                ),
+                (
+                    0,
+                    "",
                     [("read", 0.0, None, None, None, None), ("write", 0.0, None, None, None, None)],
                 )
             ],

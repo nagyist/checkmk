@@ -5,21 +5,9 @@
 
 from collections.abc import Sequence
 
-import cmk.utils.version as cmk_version
-from cmk.utils.type_defs import HostName
-
-from cmk.gui.background_job import BackgroundJobAlreadyRunning
+from cmk.utils.hostaddress import HostName
 
 
-def has_agent_bakery() -> bool:
-    return not cmk_version.is_raw_edition()
-
-
+# Get's replaced by the actual implementation in non CRE editions
 def try_bake_agents_for_hosts(hosts: Sequence[HostName]) -> None:
-    if has_agent_bakery():
-        import cmk.gui.cee.plugins.wato.agent_bakery.misc as agent_bakery  # pylint: disable=import-error,no-name-in-module
-
-        try:
-            agent_bakery.start_bake_agents(host_names=hosts, signing_credentials=None)
-        except BackgroundJobAlreadyRunning:
-            pass
+    pass

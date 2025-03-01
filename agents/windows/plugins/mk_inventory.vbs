@@ -4,7 +4,7 @@ If UCase(Right(Wscript.FullName, 11)) = "WSCRIPT.EXE" Then
     Wscript.Quit
 End If
 
-Const CMK_VERSION = "2.3.0b1"
+Const CMK_VERSION = "2.5.0b1"
 CONST HKLM = &H80000002
 
 Dim delay
@@ -249,7 +249,7 @@ Sub SoftwareFromInstaller(fields)
                 idx = idx + 1
             Next
 
-            outPut(Join(values, "|"))
+            outPut(Join(values, Chr(0)))
         else
             'Products function
             Err.clear()
@@ -262,7 +262,7 @@ Sub SoftwareFromInstaller(fields)
                 idx = idx + 1
             Next
 
-            outPut(Join(values, "|"))
+            outPut(Join(values, Chr(0)))
         end if
     Next
 End Sub
@@ -296,6 +296,11 @@ Call startSection("win_computersystem",58,timeUntil)
 systemVars = Array( "Manufacturer","Name","Model","InstallDate" )
 Call getWMIObject("Win32_ComputerSystem",systemVars)
 
+' ComputerSystemProduct
+Call startSection("win_computersystemproduct",58,timeUntil)
+computerSystemProductVars = Array( "UUID" )
+Call getWMIObject("Win32_ComputerSystemProduct",computerSystemProductVars)
+
 ' Hard-Disk
 Call startSection("win_disks",58,timeUntil)
 diskVars = Array( "Manufacturer","InterfaceType","Model","Name","SerialNumber","Size","MediaType","Signature" )
@@ -316,7 +321,7 @@ Call startSection("win_ip_r",124,timeUntil)
 Call getRouteTable()
 
 ' Installed Software
-Call startSection("win_wmi_software",124,timeUntil)
+Call startSection("win_wmi_software",0,timeUntil)
 swVars = Array( "ProductName", "Publisher", "VersionString", "InstallDate", "Language")
 Call SoftwareFromInstaller(swVars)
 
@@ -330,7 +335,7 @@ Do While Not objExecObject.StdOut.AtEndOfStream
 Loop
 
 ' Search Registry
-Call startSection("win_reg_uninstall",124,timeUntil)
+Call startSection("win_reg_uninstall",0,timeUntil)
 Set rego = GetObject("WinMgmts:{impersonationLevel=impersonate}!\\.\root\default:StdRegProv")
 regVars = Array("DisplayName", "Publisher", "InstallLocation", "PSChildName", "DisplayVersion", "EstimatedSize", "InstallDate", "Language")
 
@@ -354,13 +359,13 @@ For Each path in regPaths
                 End If
                 ' Only allow vartypes which can be represented as a string
                 If VarType(value) <= 8 and VarType(value) > 1 Then
-                    strOut = strOut & "|" & CStr(value)
+                    strOut = strOut & Chr(0) & CStr(value)
                     ' Only print a line when more than only PSChildName is present
                     If var <> "PSChildName" Then
                         boleanContent = True
                     End If
                 Else
-                    strOut = strOut & "|"
+                    strOut = strOut & Chr(0)
                 End If
             Next
             If boleanContent Then

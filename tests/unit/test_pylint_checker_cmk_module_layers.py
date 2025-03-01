@@ -3,15 +3,14 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-import pytest
-from pylint.lint import PyLinter  # type: ignore[import]
 
-from tests.testlib.pylint_checker_cmk_module_layers import (
+import pytest
+from pylint.lint import PyLinter
+
+from tests.pylint.checker_cmk_module_layers import (
     _COMPONENTS,
-    _get_absolute_importee,
-    _in_component,
     CMKModuleLayerChecker,
-    Component,
+    get_absolute_importee,
     ModuleName,
     ModulePath,
 )
@@ -24,40 +23,20 @@ COMPONENT_LIST = [c for c, _ in _COMPONENTS]
 @pytest.mark.parametrize(
     "root_name, modname, level, is_package, abs_module",
     [
-        ("cmk.checkers.agent", "_base", 1, False, "cmk.checkers._base"),
+        ("cmk.checkengine.agent", "_base", 1, False, "cmk.checkengine._base"),
         # relative import in __init__
-        ("cmk.checkers", "agent", 1, True, "cmk.checkers.agent"),
+        ("cmk.checkengine", "agent", 1, True, "cmk.checkengine.agent"),
     ],
 )
-def test__get_absolute_importee(
+def test_get_absolute_importee(
     root_name: str, modname: str, level: int, is_package: bool, abs_module: str
 ) -> None:
-    assert (
-        _get_absolute_importee(
-            root_name=root_name,
-            modname=modname,
-            level=level,
-            is_package=is_package,
-        )
-        == abs_module
-    )
-
-
-@pytest.mark.parametrize("component", COMPONENT_LIST)
-def test_allowed_import_ok(component: Component) -> None:
-    for importee in (
-        "cmk",
-        "cmk.utils",
-        "cmk.utils.anything",
-        "cmk.automations",
-        "cmk.automations.whatever",
-    ):
-        is_ok = not _in_component(ModuleName(component), Component("cmk.base.plugins.agent_based"))
-        assert is_ok is CHECKER._is_import_allowed(
-            ModulePath("_not/relevant_"),
-            ModuleName(f"{component}.foo"),
-            ModuleName(importee),
-        )
+    assert get_absolute_importee(
+        root_name=root_name,
+        modname=modname,
+        level=level,
+        is_package=is_package,
+    ) == ModuleName(abs_module)
 
 
 @pytest.mark.parametrize(
@@ -67,22 +46,12 @@ def test_allowed_import_ok(component: Component) -> None:
         ("cmk/base", "cmk.base", "cmk.gui", False),
         # allow component internal imprt
         ("cmk/gui", "cmk.gui.foo", "cmk.gui.bar", True),
-        # utils not ok in agent based plugins
-        ("_nevermind_", "cmk.base.plugins.agent_based.utils.foo", "cmk.utils.debug", False),
         # `checkers` in `utils` is wrong but anywhere else is OK
-        ("cmk/checkers", "cmk.checkers.snmp", "cmk.utils", True),
-        ("cmk/utils", "cmk.utils.foo", "cmk.checkers", False),
-        ("cmk/base", "cmk.base.sources", "cmk.checkers", True),
+        ("cmk/checkers", "cmk.checkengine.snmp", "cmk.utils", True),
+        ("cmk/base", "cmk.base.sources", "cmk.checkengine", True),
         # disallow import of `snmplib` in `utils`
         ("cmk/utils", "cmk.utils.foo", "cmk.snmplib", False),
         ("cmk/base", "cmk.base.data_sources", "cmk.snmplib", True),
-        # disallow import of one plugin in another
-        (
-            "cmk/base/plugins/agent_based",
-            "cmk.base.plugins.agent_based.foo",
-            "cmk.base.plugins.agent_based.bar",
-            False,
-        ),
         # disallow import of `base` / `gui` in `automations`
         ("cmk/automations", "cmk.automations.x", "cmk.base.a", False),
         ("cmk/automations", "cmk.automations.y", "cmk.gui.b", False),
