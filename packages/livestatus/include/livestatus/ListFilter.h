@@ -6,22 +6,22 @@
 #ifndef ListFilter_h
 #define ListFilter_h
 
-#include <algorithm>
+// NOTE: IWYU oscillates regarding <algorithm>.
+#include <algorithm>  // IWYU pragma: keep
 #include <chrono>
 #include <functional>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <variant>
 #include <vector>
 
 #include "livestatus/ColumnFilter.h"
-#include "livestatus/Filter.h"
 #include "livestatus/Row.h"
-#include "livestatus/opids.h"
-class RegExp;
+
 class Logger;
+class RegExp;
+enum class RelationalOperator;
 class User;
 
 class ListFilter : public ColumnFilter {

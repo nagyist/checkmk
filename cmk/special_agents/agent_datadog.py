@@ -25,17 +25,15 @@ import pydantic
 import requests
 from dateutil import parser as dateutil_parser
 
-from cmk.utils import paths, store
+from cmk.ccc import store
+
+from cmk.utils import paths
 from cmk.utils.http_proxy_config import deserialize_http_proxy_config
-from cmk.utils.misc import typeshed_issue_7724
 
-from cmk.ec.export import (  # pylint: disable=cmk-module-layer-violation
-    SyslogForwarderUnixSocket,
-    SyslogMessage,
-)
+import cmk.ec.export as ec  # pylint: disable=cmk-module-layer-violation
 
-from cmk.special_agents.utils.agent_common import SectionWriter, special_agent_main
-from cmk.special_agents.utils.argument_parsing import Args, create_default_argument_parser
+from cmk.special_agents.v0_unstable.agent_common import SectionWriter, special_agent_main
+from cmk.special_agents.v0_unstable.argument_parsing import Args, create_default_argument_parser
 
 Tags = Sequence[str]
 
@@ -68,7 +66,7 @@ def parse_arguments(argv: Sequence[str] | None) -> Args:
         "api_key",
         type=str,
         metavar="KEY",
-        help="Datatog API Key",
+        help="Datatog API key",
     )
     parser.add_argument(
         "app_key",
@@ -211,21 +209,26 @@ def parse_arguments(argv: Sequence[str] | None) -> Args:
 
 
 class DatadogAPI(Protocol):
+    """
+    Notes:
+        * The DatadogAPI in rare occurrences can report a 503 which they described as follows:
+        'Service Unavailable, the server is not ready to handle the request probably because
+        it is overloaded, request should be retried after some time'
+    """
+
     def get_request(
         self,
         api_endpoint: str,
         params: Mapping[str, str | int],
         version: str = "v1",
-    ) -> requests.Response:
-        ...
+    ) -> requests.Response: ...
 
     def post_request(
         self,
         api_endpoint: str,
         body: Mapping[str, str | int],
         version: str = "v1",
-    ) -> requests.Response:
-        ...
+    ) -> requests.Response: ...
 
 
 class ImplDatadogAPI:
@@ -249,11 +252,11 @@ class ImplDatadogAPI:
         params: Mapping[str, str | int],
         version: str = "v1",
     ) -> requests.Response:
-        return requests.get(  # nosec B113ü
+        return requests.get(  # nosec B113 # BNS:0b0eac
             f"{self._api_url}/{version}/{api_endpoint}",
             headers=self._query_heads,
             params=params,
-            proxies=typeshed_issue_7724(self._proxy.to_requests_proxies()),
+            proxies=self._proxy.to_requests_proxies(),
         )
 
     def post_request(
@@ -262,11 +265,11 @@ class ImplDatadogAPI:
         body: Mapping[str, Any],
         version: str = "v1",
     ) -> requests.Response:
-        return requests.post(  # nosec B113
+        return requests.post(  # nosec B113 # BNS:0b0eac
             f"{self._api_url}/{version}/{api_endpoint}",
             headers=self._query_heads,
             json=body,
-            proxies=typeshed_issue_7724(self._proxy.to_requests_proxies()),
+            proxies=self._proxy.to_requests_proxies(),
         )
 
 
@@ -360,7 +363,7 @@ class Event(pydantic.BaseModel, frozen=True):
     text: str
     date_happened: int
     # None should not happen according to docs, but reality says something different ...
-    host: str | None
+    host: str | None = None
     title: str
     source: str
 
@@ -405,7 +408,7 @@ class EventsQuerier:
                 current_page,
                 tags,
             ):
-                yield from (Event.parse_obj(raw_event) for raw_event in raw_events_in_page)
+                yield from (Event.model_validate(raw_event) for raw_event in raw_events_in_page)
                 current_page += 1
                 continue
 
@@ -454,14 +457,14 @@ def _event_to_syslog_message(
     severity: int,
     service_level: int,
     add_text: bool,
-) -> SyslogMessage:
+) -> ec.SyslogMessage:
     LOGGER.debug(event)
     matching_tags = ", ".join(
         tag for tag in event.tags if any(re.match(tag_regex, tag) for tag_regex in tag_regexes)
     )
     tags_text = f", Tags: {matching_tags}" if matching_tags else ""
     details_text = f", Text: {event.text}" if add_text else ""
-    return SyslogMessage(
+    return ec.SyslogMessage(
         facility=facility,
         severity=severity,
         timestamp=event.date_happened,
@@ -480,7 +483,7 @@ def _forward_events_to_ec(
     service_level: int,
     add_text: bool,
 ) -> None:
-    SyslogForwarderUnixSocket().forward(
+    ec.forward_to_unix_socket(
         _event_to_syslog_message(
             event,
             tag_regexes,
@@ -555,7 +558,7 @@ class LogsQuerier:
                 self.indexes,
                 cursor,
             )
-            yield from (Log.parse_obj(raw_log) for raw_log in response["data"])
+            yield from (Log.model_validate(raw_log) for raw_log in response["data"])
             if (meta := response.get("meta")) is None:
                 break
 
@@ -636,14 +639,14 @@ def _log_to_syslog_message(
     facility: int,
     service_level: int,
     translator: Sequence[LogMessageElement],
-) -> SyslogMessage:
+) -> ec.SyslogMessage:
     LOGGER.debug(log)
     attributes = dict(log.attributes)
     text_elements = {el.name: _get_nested(attributes, el.key) for el in translator}
     for name, value in text_elements.items():
         if value is None:
             LOGGER.debug("Did not find value for message element: %s", name)
-    return SyslogMessage(
+    return ec.SyslogMessage(
         facility=facility,
         service_level=service_level,
         severity=_SEVERITY_MAPPER[log.attributes.status],
@@ -666,7 +669,7 @@ def _forward_logs_to_ec(
     service_level: int,
     translator: Sequence[LogMessageElement],
 ) -> None:
-    SyslogForwarderUnixSocket().forward(
+    ec.forward_to_unix_socket(
         _log_to_syslog_message(
             log,
             facility,

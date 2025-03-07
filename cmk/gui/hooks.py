@@ -4,12 +4,17 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 import functools
 import sys
+import threading
 import traceback
 import typing
 from collections.abc import Callable
 from typing import Any, Literal, NamedTuple
 
-from cmk.utils.exceptions import MKGeneralException
+from cmk.ccc.exceptions import MKGeneralException
+
+from cmk import trace
+
+tracer = trace.get_tracer()
 
 
 class Hook(NamedTuple):
@@ -21,8 +26,8 @@ hooks: dict[str, list[Hook]] = {}
 
 
 def load_plugins() -> None:
-    """Plugin initialization hook (Called by cmk.gui.main_modules.load_plugins())"""
-    # Cleanup all plugin hooks. They need to be renewed by load_plugins()
+    """Plug-in initialization hook (Called by cmk.gui.main_modules.load_plugins())"""
+    # Cleanup all plug-in hooks. They need to be renewed by load_plugins()
     # of the other modules
     unregister_plugin_hooks()
 
@@ -41,11 +46,16 @@ def register_builtin(name: str, func: Callable) -> None:
     register(name, func, is_builtin=True)
 
 
+# TODO: Kept for compatibility with pre-1.6 Setup plugins
+def register_hook(name: str, func: Callable) -> None:
+    register_from_plugin(name, func)
+
+
 def register_from_plugin(name: str, func: Callable) -> None:
     register(name, func, is_builtin=False)
 
 
-# Kept public for compatibility with pre 1.6 plugins (is_builtin needs to be optional for pre 1.6)
+# Kept public for compatibility with pre 1.6 plug-ins (is_builtin needs to be optional for pre 1.6)
 def register(name: str, func: Callable, is_builtin: bool = False) -> None:
     hooks.setdefault(name, []).append(Hook(handler=func, is_builtin=is_builtin))
 
@@ -67,15 +77,20 @@ def registered(name: str) -> bool:
 
 
 def call(name: str, *args: Any) -> None:
-    n = 0
-    for hook in hooks.get(name, []):
-        n += 1
-        try:
-            hook.handler(*args)
-        except Exception as e:
-            t, v, tb = sys.exc_info()
-            msg = "".join(traceback.format_exception(t, v, tb, None))
-            raise MKGeneralException(msg) from e
+    if not (registered_hooks := hooks.get(name, [])):
+        return
+
+    with tracer.span(f"hook_call[{name}]"):
+        for hook in registered_hooks:
+            try:
+                hook.handler(*args)
+            except Exception as e:
+                # for builtin hooks do not change exception handling
+                if hook.is_builtin:
+                    raise
+                t, v, tb = sys.exc_info()
+                msg = "".join(traceback.format_exception(t, v, tb, None))
+                raise MKGeneralException(msg) from e
 
 
 ClearEvent = Literal[
@@ -93,78 +108,82 @@ ClearEvent = Literal[
     "users-saved",
 ]
 
-ClearEvents = list[ClearEvent] | ClearEvent
-
-R = typing.TypeVar("R")
 P = typing.ParamSpec("P")
+R = typing.TypeVar("R")
 
 
-# NOTE
-# We can't make a type alias like Foo = Callable[P, R] right now, because of a bug in mypy. We
-# therefore need to duplicate the Callable[P, R] part in every site of use. It seems to work, but
-# the declaration itself raises an error.
-# For more detailed information see: https://github.com/python/mypy/issues/11855
+class ThreadLocalLRUCache:
+    def __init__(self) -> None:
+        self._local_storage = threading.local()
+        self._local_storage.caches = {}
+
+    def _get_cached_func(self, func: Callable[P, R], maxsize: int | None) -> Callable[P, R]:
+        if not hasattr(self._local_storage, "caches"):
+            self._local_storage.caches = {}
+        if func not in self._local_storage.caches:
+            self._local_storage.caches[func] = functools.lru_cache(maxsize=maxsize)(func)
+        return self._local_storage.caches[func]
+
+    def cache_function(
+        self, maxsize: int | None = 128
+    ) -> Callable[[Callable[P, R]], Callable[P, R]]:
+        """Create a decorator to cache a function with a thread-local LRU cache."""
+
+        def decorator(func: Callable[P, R]) -> Callable[P, R]:
+            def wrapper(*args: object, **kwargs: object) -> R:
+                cached_func = self._get_cached_func(func, maxsize)
+                return cached_func(*args, **kwargs)  # type: ignore[arg-type]
+
+            return wrapper
+
+        return decorator
+
+    def cache_clear_all(self) -> None:
+        """Clear all caches in the current thread"""
+        if hasattr(self._local_storage, "caches"):
+            self._local_storage.caches.clear()
+
+    def cache_clear(self, func: Callable[P, R]) -> None:
+        """Clear the cache of a function."""
+        if hasattr(self._local_storage, "caches"):
+            self._local_storage.caches.pop(func, None)
+
+    def cache_info(self, func: Callable[P, R]) -> object | None:
+        """Shows the cache statistics of a function"""
+        if hasattr(self._local_storage, "caches") and func in self._local_storage.caches:
+            return self._local_storage.caches[func].cache_info()
+        return None
 
 
-def _scoped_memoize(
-    clear_events: ClearEvents,
-    maxsize: int | None = 128,
-    typed: bool = False,
-) -> Callable[[Callable[P, R]], Callable[P, R]]:
-    """A scoped memoization decorator.
-
-    This caches the decorated function with a `functools.lru_cache`, however the cache will be
-    explicitly cleared whenever a
-
-    Args:
-        clear_events:
-            A list of hook events, which shall trigger a clearing of the cache.
-
-        maxsize:
-            As documented in @functools.lru_cache
-
-        typed:
-            As documented in @functools.lru_cache
-
-    Returns:
-        A wrapped function which caches through `functools.lru_cache`, and clears the cache
-        according to `clear_events`.
-
-    Raises:
-        ValueError - When no or unknown clear events are supplied.
-
-    """
-    if isinstance(clear_events, str):
-        clear_events = [clear_events]
-    if not clear_events:
-        raise ValueError(f"No clear-events specified. Use one of: {ClearEvent!r}")
-
-    def _decorator(func: Callable[P, R]) -> Callable[P, R]:
-        cached_func = functools.lru_cache(maxsize=maxsize, typed=typed)(func)
-        for clear_event in clear_events:
-            register_builtin(clear_event, cached_func.cache_clear)  # hooks.register_builtin
-        # TODO: mypy does more complex type overloads depending on arity
-        return typing.cast(Callable[P, R], cached_func)
-
-    return _decorator
+_thread_cache = ThreadLocalLRUCache()
 
 
-def request_memoize(
-    maxsize: int | None = 128, typed: bool = False
-) -> Callable[[Callable[P, R]], Callable[P, R]]:
+def register_thread_cache_cleanup() -> None:
+    for clear_event in ["request-end", "request-context-exit"]:
+        # Note: This only clears the main thread cache. other caches are cleared on termination
+        register_builtin(clear_event, _thread_cache.cache_clear_all)
+
+
+def request_memoize(maxsize: int | None = 128) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """A cache decorator which only has a scope for one request.
 
+    This one uses the ThreadLocalLRUCache as the caching-scope, hereby creating a separate
+    cache for each thread.
+
     Args:
         maxsize:
             See `functools.lru_cache`
 
-        typed:
-            See `functools.lru_cache`
-
     Returns:
-        A `_scoped_memoize` decorator which clears on every request-start.
-
+        A decorator which clears on every request-end and request-context-exit.
+        The main thread cache is cleared on every request-end and request-context-exit.
+        Worker thread caches are automatically cleared when the thread is terminated.
     """
-    return _scoped_memoize(
-        clear_events=["request-end", "request-context-exit"], maxsize=maxsize, typed=typed
-    )
+
+    def _memoize_decorator(func: Callable[P, R]) -> Callable[P, R]:
+        cached_function = _thread_cache.cache_function(maxsize)(func)
+        cached_function.cache_clear = lambda: _thread_cache.cache_clear(func)  # type: ignore[attr-defined]
+        cached_function.cache_info = lambda: _thread_cache.cache_info(func)  # type: ignore[attr-defined]
+        return cached_function
+
+    return _memoize_decorator

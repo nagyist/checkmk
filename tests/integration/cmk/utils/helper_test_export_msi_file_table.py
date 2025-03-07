@@ -3,6 +3,7 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 import ast
 import shutil
 import sys
@@ -25,6 +26,6 @@ try:
     )
     f = out_dir / f"{name}.idt"
 
-    print(f.stat().st_size)
+    sys.stdout.write(f"{f.stat().st_size}\n")
 finally:
     shutil.rmtree(str(out_dir))

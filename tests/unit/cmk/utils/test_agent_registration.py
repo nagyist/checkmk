@@ -9,7 +9,13 @@ from uuid import UUID
 
 import pytest
 
-from cmk.utils.agent_registration import get_r4r_filepath, UUIDLink, UUIDLinkManager
+from cmk.utils.agent_registration import (
+    _UUIDLink,
+    get_r4r_filepath,
+    HostAgentConnectionMode,
+    UUIDLinkManager,
+)
+from cmk.utils.hostaddress import HostName
 from cmk.utils.paths import (
     data_source_push_agent_dir,
     r4r_declined_dir,
@@ -18,18 +24,20 @@ from cmk.utils.paths import (
     r4r_pending_dir,
     received_outputs_dir,
 )
-from cmk.utils.type_defs import HostAgentConnectionMode, HostName
 
 
 class TestUUIDLink:
     @pytest.fixture
-    def link(self, tmp_path: Path) -> UUIDLink:
-        return UUIDLink(tmp_path / "59e631e9-de89-40d6-9662-ba54569a24fb", tmp_path / "hostname")
+    def link(self, tmp_path: Path) -> _UUIDLink:
+        return _UUIDLink(
+            source=tmp_path / "59e631e9-de89-40d6-9662-ba54569a24fb",
+            target=tmp_path / "hostname",
+        )
 
-    def test_uuid(self, link: UUIDLink) -> None:
+    def test_uuid(self, link: _UUIDLink) -> None:
         assert isinstance(link.uuid, UUID)
 
-    def test_unlink_nonexisiting(self, link: UUIDLink) -> None:
+    def test_unlink_nonexisiting(self, link: _UUIDLink) -> None:
         assert not link.source.exists()
         link.unlink()
 
@@ -212,7 +220,7 @@ def test_uuid_link_manager_update_links_no_host_but_ready_or_discoverable(
     if has_link:
         assert len(list(received_outputs_dir.iterdir())) == 1
     else:
-        assert list(received_outputs_dir.iterdir()) == []
+        assert not list(received_outputs_dir.iterdir())
 
 
 def test_uuid_link_manager_unlink_sources() -> None:

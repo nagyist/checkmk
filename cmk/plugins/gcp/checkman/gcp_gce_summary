@@ -1,0 +1,10 @@
+title: GCP GCE: Summary
+agents: gcp
+catalog: cloud/gcp
+license: GPLv2
+distribution: check_mk
+description:
+ This check counts number of virtual machines.
+
+discovery:
+ One service is created for all virtual machines.

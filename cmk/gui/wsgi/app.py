@@ -5,8 +5,7 @@
 from __future__ import annotations
 
 import logging
-import pathlib
-import typing as t
+import warnings
 
 import werkzeug
 from flask import Flask, redirect
@@ -15,28 +14,20 @@ from werkzeug.exceptions import BadRequest
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import safe_join
 
-from cmk.utils import paths
+from cmk.ccc.version import Edition
 
-from cmk.gui import http
+from cmk.gui.features import features_registry
+from cmk.gui.flask_app import CheckmkFlaskApp
 from cmk.gui.session import FileBasedSession
 from cmk.gui.wsgi.blueprints.checkmk import checkmk
 from cmk.gui.wsgi.blueprints.rest_api import rest_api
-from cmk.gui.wsgi.profiling import ProfileSwitcher
 
-if t.TYPE_CHECKING:
-    # Here due to cyclical imports
-    Environments = t.Literal["production", "testing", "development"]
+from .trace import instrument_app_dependencies
 
 logger = logging.getLogger(__name__)
 
 
-class CheckmkFlaskApp(Flask):
-    request_class = http.Request
-    response_class = http.Response
-    session_interface = FileBasedSession()
-
-
-def make_wsgi_app(debug: bool = False, testing: bool = False) -> Flask:
+def make_wsgi_app(edition: Edition, debug: bool = False, testing: bool = False) -> Flask:
     """Create the Checkmk WSGI application.
 
     Args:
@@ -50,13 +41,29 @@ def make_wsgi_app(debug: bool = False, testing: bool = False) -> Flask:
     Returns:
         The WSGI application
     """
+    try:
+        features = features_registry[str(edition)]
+    except KeyError:
+        raise ValueError(f"Invalid edition: {edition}")
 
-    app = CheckmkFlaskApp(__name__)
+    app = CheckmkFlaskApp(__name__, FileBasedSession(), features)
     app.debug = debug
     app.testing = testing
     # Config needs a request context to work. :(
     # Until this can work, we need to do it at runtime in `FileBasedSession`.
-    # app.config["PERMANENT_SESSION_LIFETIME"] = active_config.user_idle_timeout
+    # app.config["PERMANENT_SESSION_LIFETIME"] = active_config.session_mgmt["user_idle_timeout"]
+
+    instrument_app_dependencies()
+
+    # NOTE: some schemas are generically generated. On default, for duplicate schema names, we
+    # get name+increment which we have deemed fine. We can therefore suppress those warnings.
+    # https://github.com/marshmallow-code/apispec/issues/444
+    warnings.filterwarnings("ignore", message="Multiple schemas resolved to the name")
+    warnings.filterwarnings(
+        "ignore",
+        ".* has already been added to the spec",
+        category=UserWarning,
+    )
 
     # NOTE: The ordering of the blueprints is important, due to routing precedence, i.e. Rule
     # instances which are evaluated later but have the same URL will be ignored. The first Rule
@@ -66,15 +73,11 @@ def make_wsgi_app(debug: bool = False, testing: bool = False) -> Flask:
 
     # Some middlewares we want to have available in all environments
     app.wsgi_app = ProxyFix(app.wsgi_app)  # type: ignore[method-assign]
-    app.wsgi_app = ProfileSwitcher(  # type: ignore[method-assign]
-        app.wsgi_app,
-        profile_file=pathlib.Path(paths.var_dir) / "multisite.profile",
-    ).wsgi_app
 
     if debug:
         app.wsgi_app = DebuggedApplication(  # type: ignore[method-assign]
             app.wsgi_app,
-            evalex=True,
+            evalex=not testing,  # sets werkzeug.debug.preserve_context, which changes the flask globals behaviour
             pin_logging=False,
             pin_security=False,
         )
@@ -93,4 +96,4 @@ def make_wsgi_app(debug: bool = False, testing: bool = False) -> Flask:
     return app
 
 
-__all__ = ["make_wsgi_app", "CheckmkFlaskApp"]
+__all__ = ["make_wsgi_app"]

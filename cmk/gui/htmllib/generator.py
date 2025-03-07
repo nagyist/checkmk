@@ -27,12 +27,14 @@
 from __future__ import annotations
 
 import json
-from typing import Final, final, Literal
+import typing
+from typing import Any, assert_never, Final, final
 
-from cmk.utils.exceptions import MKGeneralException
+from cmk.ccc.exceptions import MKGeneralException
 
-import cmk.gui.utils.escaping as escaping
 from cmk.gui.i18n import _
+from cmk.gui.utils import escaping
+from cmk.gui.utils.flashed_messages import MsgType
 from cmk.gui.utils.html import HTML
 from cmk.gui.utils.output_funnel import OutputFunnel
 
@@ -43,6 +45,32 @@ from .tag_rendering import (
     render_end_tag,
     render_start_tag,
 )
+
+FinalJavaScript = typing.Callable[[], str] | str
+
+
+# See packages/cmk-frontend/src/js/index.ts:callable_functions
+KnownTSFunction = typing.Literal[
+    "render_qr_code",
+    "render_stats_table",
+    "insert_before",
+    "lock_and_redirect",
+]
+
+
+def maybecall(entry: FinalJavaScript) -> str:
+    if callable(entry):
+        return entry()
+    return entry
+
+
+def _dump_standard_compliant_json(data: object) -> str:
+    # default json.dumps produces non standard compliant output: NaN, Infinity, -Infinity are not
+    # part of the JSON spec. in case you still serialize such a value with pythons default
+    # json.dumps you see very confusing parsing errors in the frontend.
+    # this function will make sure that a backend error is thrown if one of the three values is
+    # serialized, which makes it more obvious whats going wrong.
+    return json.dumps(data, allow_nan=False)
 
 
 class HTMLWriter:
@@ -87,11 +115,26 @@ class HTMLWriter:
         self.render_headfoot = True
         self.link_target: str | None = None
         self.browser_reload = 0.0
-        self._final_javascript: list[str] = []
+        self._final_javascript: list[FinalJavaScript] = []
+
+    def write_text_permissive(self, text: HTMLContent) -> None:
+        """Write text. Highlighting tags such as h2|b|tt|i|br|pre|a|sup|p|li|ul|ol are not escaped."""
+        self.write_html(HTML.without_escaping(escaping.escape_text(text)))
 
     def write_text(self, text: HTMLContent) -> None:
-        """Write text. Highlighting tags such as h2|b|tt|i|br|pre|a|sup|p|li|ul|ol are not escaped."""
-        self.write_html(HTML(escaping.escape_text(text)))
+        """Write text, with strict escaping"""
+
+        match text:
+            case None:
+                self.write_html(HTML.empty())
+            case int():
+                self.write_html(HTML.with_escaping(str(text)))
+            case HTML():
+                self.write_html(text)
+            case str():
+                self.write_html(HTML.with_escaping(text))
+            case _ as unreachable:
+                assert_never(unreachable)
 
     def write_html(self, content: HTML) -> None:
         """Write HTML code directly, without escaping."""
@@ -142,13 +185,13 @@ class HTMLWriter:
 
     @staticmethod
     def render_javascript(code: str, **attrs: HTMLTagAttributeValue) -> HTML:
-        return render_element("script", HTML(code), **attrs)
+        return render_element("script", HTML.without_escaping(code), **attrs)
 
-    def final_javascript(self, code: str) -> None:
+    def final_javascript(self, code: FinalJavaScript) -> None:
         self._final_javascript.append(code)
 
     def final_javascript_code(self) -> str:
-        return "\n".join(self._final_javascript)
+        return "\n".join(maybecall(entry) for entry in self._final_javascript)
 
     def write_final_javascript(self) -> None:
         if not self._final_javascript:
@@ -158,16 +201,23 @@ class HTMLWriter:
     def javascript(self, code: str, **attrs: HTMLTagAttributeValue) -> None:
         self.write_html(HTMLWriter.render_javascript(code, **attrs))
 
-    def javascript_file(self, src: str) -> None:
+    def js_entrypoint(self, data: str, *, type_: str, **attrs: HTMLTagAttributeValue) -> None:
+        """generic way to transport data from the backend to the frontend,
+        without the need to directly invoke javascript code"""
+        attrs_type: dict[str, HTMLTagAttributeValue] = {"type": type_}
+        self.write_html(HTMLWriter.render_javascript(data, **(attrs_type | attrs)))
+
+    def javascript_file(self, src: str, *, type_: str = "text/javascript") -> None:
         """<script type="text/javascript" src="%(name)"/>\n"""
-        self.write_html(render_element("script", "", type_="text/javascript", src=src))
+        self.write_html(render_element("script", "", type_=type_, src=src))
 
     def show_message_by_msg_type(
         self,
         msg: HTML | str,
-        msg_type: Literal["message", "warning", "error"],
+        msg_type: MsgType,
+        flashed: bool = False,
     ) -> None:
-        self._write(self._render_message(msg, msg_type))
+        self._write(self._render_message(msg, msg_type, flashed))
 
     def show_message(self, msg: HTML | str) -> None:
         self._write(self._render_message(msg, "message"))
@@ -178,34 +228,48 @@ class HTMLWriter:
     def show_warning(self, msg: HTML | str) -> None:
         self._write(self._render_message(msg, "warning"))
 
-    def render_message(self, msg: HTML | str) -> HTML:
+    def render_message(
+        self,
+        msg: HTML | str,
+        flashed: bool = False,
+    ) -> HTML:
         return self._render_message(msg, "message")
 
-    def render_error(self, msg: HTML | str) -> HTML:
+    def render_error(
+        self,
+        msg: HTML | str,
+        flashed: bool = False,
+    ) -> HTML:
         return self._render_message(msg, "error")
 
-    def render_warning(self, msg: HTML | str) -> HTML:
+    def render_warning(
+        self,
+        msg: HTML | str,
+        flashed: bool = False,
+    ) -> HTML:
         return self._render_message(msg, "warning")
 
     def _render_message(
         self,
         msg: HTML | str,
-        msg_type: Literal["message", "warning", "error"] = "message",
+        msg_type: MsgType = "message",
+        flashed: bool = False,
     ) -> HTML:
-        if msg_type == "message":
-            cls = "success"
-            prefix = _("MESSAGE")
-        elif msg_type == "warning":
-            cls = "warning"
-            prefix = _("WARNING")
-        elif msg_type == "error":
-            cls = "error"
-            prefix = _("ERROR")
-        else:
-            raise TypeError(msg_type)
+        match msg_type:
+            case "message":
+                cls = "success"
+                prefix = _("MESSAGE")
+            case "warning":
+                cls = "warning"
+                prefix = _("WARNING")
+            case "error":
+                cls = "error"
+                prefix = _("ERROR")
+            case other:
+                assert_never(other)
 
         if self.output_format == "html":
-            code = HTMLWriter.render_div(msg, class_=cls)
+            code = HTMLWriter.render_div(msg, class_=[cls, "flashed"] if flashed else cls)
             if self.mobile:
                 return HTMLWriter.render_center(code)
             return code
@@ -245,7 +309,7 @@ class HTMLWriter:
 
     @staticmethod
     def render_br() -> HTML:
-        return HTML("<br />")
+        return HTML.without_escaping("<br />")
 
     def br(self) -> None:
         self.write_html(HTMLWriter.render_br())
@@ -262,7 +326,7 @@ class HTMLWriter:
 
     @staticmethod
     def render_nbsp() -> HTML:
-        return HTML("&nbsp;")
+        return HTML.without_escaping("&nbsp;")
 
     def nbsp(self) -> None:
         self.write_html(HTMLWriter.render_nbsp())
@@ -338,6 +402,16 @@ class HTMLWriter:
 
     def div(self, content: HTMLContent, **kwargs: HTMLTagAttributeValue) -> None:
         self.write_html(render_element("div", content, **kwargs))
+
+    def vue_app(self, app_name: str, data: dict[str, Any]) -> None:
+        self.write_html(
+            render_element(
+                "div",
+                None,
+                data_cmk_vue_app_name=app_name,
+                data_cmk_vue_app_data=_dump_standard_compliant_json(data),
+            )
+        )
 
     def legend(self, content: HTMLContent, **kwargs: HTMLTagAttributeValue) -> None:
         self.write_html(render_element("legend", content, **kwargs))
@@ -597,6 +671,38 @@ class HTMLWriter:
     @staticmethod
     def render_x(content: HTMLContent, **kwargs: HTMLTagAttributeValue) -> HTML:
         return render_element("x", content, **kwargs)
+
+    def call_ts_function(
+        self,
+        *,
+        container: str,
+        function_name: KnownTSFunction,
+        arguments: dict[str, str] | None = None,
+    ) -> None:
+        self.open_ts_container(
+            container=container, function_name=function_name, arguments=arguments
+        )
+        self.write_html(render_end_tag(container))
+
+    def open_ts_container(
+        self,
+        *,
+        container: str,
+        function_name: KnownTSFunction,
+        arguments: dict[str, str] | None = None,
+    ) -> None:
+        json_arguments: str
+        if arguments is None:
+            json_arguments = "{}"
+        else:
+            json_arguments = _dump_standard_compliant_json(arguments)
+        self.write_html(
+            render_start_tag(
+                container,
+                data_cmk_call_ts_function=function_name,
+                data_cmk_call_ts_arguments=json_arguments,
+            )
+        )
 
     def open_div(self, **kwargs: HTMLTagAttributeValue) -> None:
         self.write_html(render_start_tag("div", close_tag=False, **kwargs))

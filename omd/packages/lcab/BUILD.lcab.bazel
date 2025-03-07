@@ -1,0 +1,31 @@
+load("@rules_foreign_cc//foreign_cc:defs.bzl", "configure_make")
+
+filegroup(
+    name = "all_srcs",
+    srcs = glob(
+        ["**/*"],
+        exclude = ["bazel-*"],
+    ),
+)
+
+configure_make(
+    name = "lcab",
+    args = ["-j4"],
+    env = {
+        "PKG_CONFIG_PATH": ":".join([
+            "/usr/lib/pkgconfig",
+            "/usr/lib64/pkgconfig",
+            "/usr/lib/x86_64-linux-gnu/pkgconfig",
+        ]),
+        "DESTDIR": "/",
+    },
+    install_prefix = "lcab_dir",
+    lib_source = ":all_srcs",
+    out_bin_dir = "bin",
+    out_binaries = [
+        "lcab",
+    ],
+    out_shared_libs = [
+    ],
+    visibility = ["//visibility:public"],
+)

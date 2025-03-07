@@ -88,7 +88,7 @@ def _transform_level_names(conjunctions):
 
 def _valuespec_fileinfo_groups() -> Dictionary:
     return Dictionary(
-        title=_("Group patterns"),
+        title=_("File grouping patterns"),
         elements=[
             (
                 "group_patterns",
@@ -112,7 +112,7 @@ def _valuespec_fileinfo_groups() -> Dictionary:
                             ),
                         ],
                     ),
-                    title=_("File Grouping Patterns"),
+                    title=_("Group patterns"),
                     help=_get_fileinfo_groups_help(),
                     add_label=_("Add pattern group"),
                 ),
@@ -325,7 +325,7 @@ def _parameter_valuespec_fileinfo_groups() -> Dictionary:
 
 rulespec_registry.register(
     CheckParameterRulespecWithItem(
-        check_group_name="fileinfo-groups",
+        check_group_name="fileinfo_groups_checking",
         group=RulespecGroupCheckParametersStorage,
         item_spec=_item_spec_fileinfo_groups,
         match_type="dict",
@@ -363,7 +363,7 @@ def _manual_parameter_valuespec_fileinfo_groups() -> Dictionary:
 
 rulespec_registry.register(
     ManualCheckParameterRulespec(
-        check_group_name="fileinfo-groups",
+        check_group_name="fileinfo_groups_checking",
         group=RulespecGroupEnforcedServicesStorage,
         item_spec=_item_spec_fileinfo_groups,
         parameter_valuespec=_manual_parameter_valuespec_fileinfo_groups,

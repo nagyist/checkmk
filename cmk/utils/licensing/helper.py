@@ -10,7 +10,12 @@ from uuid import UUID
 
 import livestatus
 
-from cmk.utils.paths import log_dir, omd_root
+from cmk.utils import paths
+from cmk.utils.paths import log_dir
+
+
+def get_licensing_logger() -> logging.Logger:
+    return logging.getLogger("cmk.licensing")
 
 
 def init_logging() -> logging.Logger:
@@ -21,7 +26,7 @@ def init_logging() -> logging.Logger:
     handler = logging.FileHandler(filename=Path(log_dir, "licensing.log"), encoding="utf-8")
     handler.setFormatter(formatter)
 
-    logger = logging.getLogger("licensing")
+    logger = get_licensing_logger()
     del logger.handlers[:]  # Remove all previously existing handlers
     logger.addHandler(handler)
     logger.propagate = False
@@ -29,13 +34,19 @@ def init_logging() -> logging.Logger:
     return logger
 
 
-def _get_instance_id_filepath() -> Path:
-    return Path(omd_root, "etc/omd/instance_id")
+def get_instance_id_file_path(omd_root: Path) -> Path:
+    return omd_root / "etc/omd/instance_id"
 
 
-def load_instance_id() -> UUID | None:
+def save_instance_id(*, file_path: Path, instance_id: UUID) -> None:
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with file_path.open("w", encoding="utf-8") as fp:
+        fp.write(str(instance_id))
+
+
+def load_instance_id(file_path: Path) -> UUID | None:
     try:
-        with _get_instance_id_filepath().open("r", encoding="utf-8") as fp:
+        with file_path.open("r", encoding="utf-8") as fp:
             return UUID(fp.read())
     except (FileNotFoundError, ValueError):
         return None
@@ -56,3 +67,15 @@ def rot47(input_str: str) -> str:
 def _rot47_char(c: str) -> str:
     ord_c = ord(c)
     return chr(33 + ((ord_c + 14) % 94)) if 33 <= ord_c <= 126 else c
+
+
+def get_licensed_state_file_path() -> Path:
+    return paths.licensing_dir / "licensed_state"
+
+
+def get_state_file_created_file_path() -> Path:
+    return paths.licensing_dir / "state_file_created"
+
+
+def get_state_change_path() -> Path:
+    return paths.licensing_dir / "state_change"

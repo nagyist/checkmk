@@ -1,0 +1,16 @@
+title: Check Point VSID: Connections
+agents: snmp
+catalog: hw/network/checkpoint
+license: GPLv2
+distribution: check_mk
+
+description:
+ This check monitors connection usage of Check Point virtual system IDs.
+ The output gives information about the total number of used connections and
+ the percentual usage in relation to the table limit.
+
+item:
+ Number of VSID.
+
+discovery:
+ One service {VS VSID-NAME VSID-NR Connections} is created for each VSID.

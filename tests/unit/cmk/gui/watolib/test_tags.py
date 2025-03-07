@@ -3,7 +3,6 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-# pylint: disable=redefined-outer-name
 
 from collections.abc import Iterator
 from pathlib import Path
@@ -11,7 +10,7 @@ from pathlib import Path
 import pytest
 from pytest_mock import MockerFixture
 
-import cmk.utils.tags as tags
+from cmk.utils import tags
 from cmk.utils.tags import TagGroupID, TagID
 
 import cmk.gui.watolib.tags
@@ -85,12 +84,12 @@ wato_tags = %s
         tags_mk.unlink()
 
 
-def test_tag_config_load(test_cfg: tags.TagConfig) -> None:
+def test_tag_config_load(request_context: None, test_cfg: tags.TagConfig) -> None:
     assert len(test_cfg.tag_groups) == 2
     assert len(test_cfg.aux_tag_list.get_tags()) == 1
 
 
-@pytest.mark.usefixtures("test_cfg")
+@pytest.mark.usefixtures("request_context", "test_cfg")
 def test_tag_config_save(mocker: MockerFixture) -> None:
     export_mock = mocker.patch.object(cmk.gui.watolib.tags, "_export_hosttags_to_php")
 

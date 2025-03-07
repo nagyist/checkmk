@@ -4,6 +4,38 @@ log() {
     echo "+++ $1"
 }
 
+failure() {
+    echo "$(basename "$0"):" "$@" >&2
+    exit 1
+}
+
+# some style settings defined here
+txtRed=$'\e[41m'
+txtGreen=$'\e[32m'
+txtBlue=$'\e[34m'
+resetColor=$'\e[0m'
+
+print_red() {
+    printf "%s%s%s\n" "${txtRed}" "$1" "${resetColor}"
+}
+
+print_green() {
+    printf "%s%s%s\n" "${txtGreen}" "$1" "${resetColor}"
+}
+
+print_blue() {
+    printf "%s%s%s\n" "${txtBlue}" "$1" "${resetColor}"
+}
+
+print_debug() {
+    print_blue "    $1"
+}
+
+get_desired_python_version() {
+    # to use "make print-PYTHON_VERISON" the git repo with "Makefile" and "artifacts.make" would be necessary at a known location
+    sed -n 's|^PYTHON_VERSION = \"\(\S*\)\"$|\1|p' "${1}"/package_versions.bzl
+}
+
 _artifact_name() {
     local DIR_NAME="$1"
     local DISTRO="$2"
@@ -183,7 +215,6 @@ find_defines_make() {
     while [ ! -e defines.make ]; do
         if [ "$PWD" = / ]; then
             failure "could not find defines.make"
-            break
         fi
         cd ..
     done
@@ -194,4 +225,13 @@ get_version() {
     local SEARCH_PATH="$1"
     local NAME="$2"
     make --no-print-directory --file="$(find_defines_make "$SEARCH_PATH")" print-"$NAME"
+}
+
+test_package() {
+    log "Testing for ${1% *} in \$PATH"
+    CMD_OUTPUT="$($1 2>&1 || true)"
+    echo "$CMD_OUTPUT" | grep "$2" >/dev/null || (
+        echo "Invalid output of \"$1\": \"$($1)\" was expected to match with grep \"$2\""
+        exit 1
+    )
 }

@@ -8,9 +8,10 @@
 
 #include <iosfwd>
 #include <string>
-#include <vector>
 
 #include "livestatus/Renderer.h"
+
+enum class Encoding;
 class Logger;
 
 // Note: The CSV format is a bit underspecified, but the most "authoritative"

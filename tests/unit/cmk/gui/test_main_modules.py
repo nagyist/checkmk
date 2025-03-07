@@ -3,6 +3,7 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 import importlib
 import sys
 from pathlib import Path
@@ -21,9 +22,7 @@ def _plugin_path(main_module_name: str) -> Path:
 @pytest.fixture(
     name="main_module_name",
     params=[
-        "cron",
         "dashboard",
-        "metrics",
         "sidebar",
         "userdb",
         "views",
@@ -50,12 +49,14 @@ def test_load_local_plugin(main_module_name: str) -> None:
     assert "ding" not in main_module.__dict__
 
     try:
-        # Special case: watolib plugin loading is triggered by wato main module
+        # Special case: watolib plug-in loading is triggered by wato main module
         main_modules._call_load_plugins_hooks(
             [
-                main_module
-                if main_module_name != "watolib"
-                else importlib.import_module("cmk.gui.wato")
+                (
+                    main_module
+                    if main_module_name != "watolib"
+                    else importlib.import_module("cmk.gui.wato")
+                )
             ]
         )
         assert main_module.ding == "dong"
@@ -74,14 +75,10 @@ def test_load_local_plugin(main_module_name: str) -> None:
         "main_modules",
         "dashboard",
         "visuals",
-        "cron",
         "config",
         "bi",
-        "openapi",
-        "openapi/endpoints",
         "views",
         "views/icons",
-        "metrics",
     ],
 )
 def fixture_plugin_module_dir(request):
@@ -90,19 +87,16 @@ def fixture_plugin_module_dir(request):
 
 def test_plugins_loaded(plugin_module_dir: str) -> None:
     if plugin_module_dir == "bi":
-        raise pytest.skip("No plugin at the moment")
+        raise pytest.skip("No plug-in at the moment")
 
     loaded_module_names = [
-        name  #
-        for name, module in sys.modules.items()
+        module_name
+        for module_name in sys.modules
         # None entries are only an import optimization of cPython and can be removed:
         # https://www.python.org/dev/peps/pep-0328/#relative-imports-and-indirection-entries-in-sys-modules
-        if module is not None
-        and (
-            name.startswith("cmk.gui.plugins.")
-            or name.startswith("cmk.gui.cee.plugins.")  #
-            or name.startswith("cmk.gui.cme.plugins.")  #
-        )
+        if module_name.startswith("cmk.gui.plugins.")
+        or module_name.startswith("cmk.gui.cee.plugins.")
+        or module_name.startswith("cmk.gui.cme.plugins.")
     ]
 
     plugin_module_name = plugin_module_dir.replace("/", ".")

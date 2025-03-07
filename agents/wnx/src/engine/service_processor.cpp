@@ -1,9 +1,8 @@
 
 #include "stdafx.h"
 
-#include "service_processor.h"
+#include "wnx/service_processor.h"
 
-#include <cfg_details.h>
 #include <fcntl.h>
 #include <io.h>
 #include <sensapi.h>
@@ -12,22 +11,24 @@
 #include <chrono>
 #include <cstdint>  // wchar_t when compiler options set weird
 
-#include "agent_controller.h"
-#include "cap.h"
-#include "commander.h"
 #include "common/cma_yml.h"
 #include "common/mailslot_transport.h"
 #include "common/wtools.h"
 #include "common/wtools_service.h"
 #include "common/yaml.h"
-#include "external_port.h"
-#include "firewall.h"
-#include "install_api.h"
 #include "providers/perf_counters_cl.h"
-#include "realtime.h"
 #include "tools/_process.h"
-#include "upgrade.h"
-#include "windows_service_api.h"
+#include "wnx/agent_controller.h"
+#include "wnx/cap.h"
+#include "wnx/cfg_details.h"
+#include "wnx/commander.h"
+#include "wnx/extensions.h"
+#include "wnx/external_port.h"
+#include "wnx/firewall.h"
+#include "wnx/install_api.h"
+#include "wnx/realtime.h"
+#include "wnx/upgrade.h"
+#include "wnx/windows_service_api.h"
 
 using namespace std::chrono_literals;
 using namespace std::string_literals;
@@ -70,18 +71,32 @@ void ServiceProcessor::startService() {
         return;
     }
 
-    auto installed = cfg::cap::Install();
-    cfg::upgrade::UpgradeLegacy(cfg::upgrade::Force::no);
-
-    // service must reload config, because service may reconfigure itself
-    ReloadConfig();
-
+    const auto results = executeOptionalTasks();
     rm_lwa_thread_ = std::thread(&cfg::rm_lwa::Execute);
-
     thread_ = std::thread(&ServiceProcessor::mainThread, this, &external_port_,
-                          installed);
+                          results.cap_installed);
 
     XLOG::l.t("Successful start of thread");
+}
+
+ServiceProcessor::OptionalTasksResults
+ServiceProcessor::executeOptionalTasks() {
+    switch (GetModus()) {
+        case Modus::service: {
+            const bool installed = cfg::cap::Install();
+            cfg::upgrade::UpgradeLegacy(cfg::upgrade::Force::no);
+            // service must reload config: service may reconfigure itself
+            ReloadConfig();
+            return {.cap_installed = installed};
+        }
+        case Modus::integration:
+            [[fallthrough]];
+        case Modus::app:
+            [[fallthrough]];
+        case Modus::test:
+            break;
+    }
+    return {};
 }
 
 void ServiceProcessor::startServiceAsLegacyTest() {
@@ -162,7 +177,6 @@ void ServiceProcessor::cleanupOnStop() {
     if (GetModus() != Modus::service) {
         XLOG::l("Invalid call!");
     }
-    KillAllInternalUsers();
 
     TryCleanOnExit();
 }
@@ -195,39 +209,35 @@ void ServiceProcessor::stopTestingMainThread() {
     thread_.join();
 }
 
-namespace {
-std::string FindWinPerfExe() {
-    auto exe_name = cfg::groups::g_winperf.exe();
-
-    if (tools::IsEqual(exe_name, "agent")) {
-        XLOG::t.i("Looking for default agent");
-        const fs::path f{cfg::GetRootDir()};
-        std::vector names{f / cfg::kDefaultAppFileName};
-
-        if constexpr (tgt::Is64bit()) {
-            names.emplace_back(f / "check_mk_service64.exe");
-        }
-
-        names.emplace_back(f / "check_mk_service32.exe");
-
-        exe_name.clear();
-        for (const auto &name : names) {
-            std::error_code ec;
-            if (fs::exists(name, ec)) {
-                XLOG::d.i("Using file '{}' for winperf", name);
-                break;
-            }
-        }
-        if (exe_name.empty()) {
-            XLOG::l.crit("In folder '{}' not found binaries to exec winperf");
-            return {};
-        }
-    } else {
+std::string FindWinPerfExe(std::string_view exe_name) {
+    if (!tools::IsEqual(exe_name, "agent")) {
         XLOG::d.i("Looking for agent '{}'", exe_name);
+        return std::string{exe_name};
     }
-    return exe_name;
+
+    XLOG::t.i("Looking for default agent");
+    const fs::path f{cfg::GetRootDir()};
+    std::vector names{f / cfg::kDefaultAppFileName};
+
+    if constexpr (tgt::Is64bit()) {
+        names.emplace_back(f / "check_mk_service64.exe");
+    }
+
+    names.emplace_back(f / "check_mk_service32.exe");
+
+    for (const auto &name : names) {
+        std::error_code ec;
+        if (fs::exists(name, ec)) {
+            XLOG::d.i("Using file '{}' for winperf", name);
+            return name.string();
+        }
+    }
+
+    XLOG::l.crit("In folder '{}' not found binaries to exec winperf");
+    return {};
 }
 
+namespace {
 std::wstring GetWinPerfLogFile() {
     return cfg::groups::g_winperf.isTrace()
                ? (fs::path{cfg::GetLogDir()} / "winperf.log").wstring()
@@ -243,7 +253,8 @@ void ServiceProcessor::kickWinPerf(AnswerId answer_id,
         cmd_line = L"ip:" + wtools::ConvertToUtf16(ip_addr) + L" " + cmd_line;
     }
 
-    auto exe_name = wtools::ConvertToUtf16(FindWinPerfExe());
+    auto exe_name =
+        wtools::ConvertToUtf16(FindWinPerfExe(cfg::groups::g_winperf.exe()));
     const auto timeout = cfg::groups::g_winperf.timeout();
     auto prefix = wtools::ConvertToUtf16(cfg::groups::g_winperf.prefix());
 
@@ -293,10 +304,11 @@ void ServiceProcessor::informDevice(rt::Device &rt_device,
         return;
     }
 
-    auto s_view = tools::ToView(sections);
+    const std::vector<std::string_view> s_view{sections.begin(),
+                                               sections.end()};
 
     const auto rt_port = cfg::groups::g_global.realtimePort();
-    auto password = cfg::groups::g_global.realtimePassword();
+    const auto password = cfg::groups::g_global.realtimePassword();
     const auto rt_timeout = cfg::groups::g_global.realtimeTimeout();
 
     rt_device.connectFrom(ip_addr, rt_port, s_view, password, rt_timeout);
@@ -364,7 +376,7 @@ void ServiceProcessor::resetOhm() noexcept {
     cmd_line += std::wstring(provider::ohm::kResetCommand);
     XLOG::l.i("I'm going to execute '{}'", wtools::ToUtf8(cmd_line));
 
-    tools::RunStdCommand(cmd_line, true);
+    tools::RunStdCommand(cmd_line, tools::WaitForEnd::yes);
 }
 
 bool ServiceProcessor::stopRunningOhmProcess() noexcept {
@@ -481,7 +493,7 @@ int ServiceProcessor::startProviders(AnswerId answer_id,
     return static_cast<int>(vf_.size()) + (started_sync ? 1 : 0);
 }
 
-/// \brief To be used, when no real connection, i.e. test
+/// To be used, when no real connection, i.e. test
 void ServiceProcessor::sendDebugData() {
     XLOG::l.i("Started without IO. Debug mode");
 
@@ -497,7 +509,7 @@ void ServiceProcessor::sendDebugData() {
     }
 }
 
-/// \brief called before every answer to execute routine tasks
+/// called before every answer to execute routine tasks
 void ServiceProcessor::prepareAnswer(const std::string &ip_from,
                                      rt::Device &rt_device) {
     const auto value = tools::win::GetEnv(env::auto_reload);
@@ -534,8 +546,9 @@ bool FindProcessByPid(uint32_t pid) {
     wtools::ScanProcessList([&found, pid](const PROCESSENTRY32 &entry) {
         if (entry.th32ProcessID == pid) {
             found = true;
+            return wtools::ScanAction::terminate;
         }
-        return true;
+        return wtools::ScanAction::advance;
     });
     return found;
 }
@@ -687,9 +700,26 @@ world::ExternalPort::IoParam AsIoParam(
     };
 }
 
+void PrepareTempFolder() {
+    try {
+        const auto path = wtools::MakeSafeTempFolder(wtools::safe_temp_sub_dir);
+        if (path.has_value()) {
+            for (const auto &entry :
+                 std::filesystem::directory_iterator(*path)) {
+                fs::remove_all(entry.path());
+            }
+            XLOG::l.i("Temp folder: {}", path);
+        } else {
+            XLOG::l("Failed to create temp folder");
+        }
+
+    } catch (const std::exception &e) {
+        XLOG::l("Failed to create temp folder: {}", e.what());
+    }
+}
 }  // namespace
 
-/// \brief <HOSTING THREAD>
+/// <HOSTING THREAD>
 /// ex_port may be nullptr(command line test, for example)
 /// cap_installed is signaled from the service thread about cap_installation
 /// makes a mail slot + starts IO on TCP
@@ -719,15 +749,22 @@ void ServiceProcessor::mainThread(world::ExternalPort *ex_port,
         if (cap_installed) {
             ac::CreateArtifacts(fs::path{tools::win::GetSomeSystemFolder(
                                     FOLDERID_ProgramData)} /
-                                    ac::kCmkAgentUnistall,
+                                    ac::kCmkAgentUninstall,
                                 controller_params.has_value());
         }
         if (is_service) {
             mc_.InstallDefault(cfg::modules::InstallMode::normal);
             install::ClearPostInstallFlag();
+            PrepareTempFolder();
         } else {
             mc_.LoadDefault();
         }
+
+        auto to_load = is_service
+                           ? cfg::extensions::GetAll(cfg::GetLoadedConfig())
+                           : std::vector<cfg::extensions::Extension>{};
+        cfg::extensions::ExtensionsManager em{
+            to_load, cfg::vars::kExtensionDefaultCheckPeriod};
 
         preStartBinaries();
 
@@ -929,7 +966,7 @@ bool TheMiniProcess::start(const std::wstring &exe_name) {
     return true;
 }
 
-/// \brief - stops process
+/// - stops process
 /// returns true if killing occurs
 bool TheMiniProcess::stop() {
     std::unique_lock lk(lock_);

@@ -1,4 +1,4 @@
-Title: Custom extensions might need adjustment due to refactorings in GUI code (<tt>Transform</tt>)
+Title: Custom extensions might need adjustment due to refactorings in GUI code (Transform)
 Class: feature
 Compatible: incomp
 Component: wato
@@ -8,8 +8,8 @@ Knowledge: undoc
 Level: 1
 Version: 2.2.0b1
 
-This werk only affects users of non-tribe29 custom extensions (single files and MKPs from non-
-tribe29 sources such as the Checkmk exchange).
+This werk only affects users of non-Checkmk custom extensions (single files and MKPs from non-
+Checkmk sources such as the Checkmk exchange).
 
 Before this werk, the Checkmk codebase offered the <tt>ValueSpec</tt> subclass <tt>Transform</tt>,
 which was used for two things:
@@ -21,7 +21,7 @@ As of this werk, the <tt>Transform</tt> class should only be used for the first 
 (changing the storage format). It now expects two arguments <tt>to_valuespec</tt> (previously
 <tt>forth</tt>) and <tt>from_valuespec</tt> (previously <tt>back</tt>). <tt>back</tt> and
 <tt>forth</tt> are still accepted as arguments and work as before. However, <tt>back</tt> and
-<tt>forth will be removed in a future version and <tt>to/from_valuespec</tt> will become mandatory.
+<tt>forth</tt> will be removed in a future version and <tt>to/from_valuespec</tt> will become mandatory.
 
 For updating legacy configurations, use the new <tt>Migrate</tt> class, which requires a mandatory
 <tt>migrate</tt> argument. This is the equivalent of specifying <tt>forth</tt> only in the

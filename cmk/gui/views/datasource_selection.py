@@ -3,8 +3,8 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-import cmk.gui.forms as forms
-import cmk.gui.visuals as visuals
+from cmk.gui import forms, visuals
+from cmk.gui.data_source import data_source_registry
 from cmk.gui.exceptions import HTTPRedirect, MKUserError
 from cmk.gui.htmllib.header import make_header
 from cmk.gui.htmllib.html import html
@@ -14,8 +14,6 @@ from cmk.gui.page_menu import make_simple_form_page_menu
 from cmk.gui.utils.transaction_manager import transactions
 from cmk.gui.utils.urls import makeuri
 from cmk.gui.valuespec import DropdownChoice
-
-from .data_source import data_source_registry
 
 
 def DatasourceSelection() -> DropdownChoice[str]:
@@ -69,15 +67,14 @@ def show_create_view_dialog(next_url: str | None = None) -> None:
         except MKUserError as e:
             html.user_error(e)
 
-    html.begin_form("create_view")
-    html.hidden_field("mode", "create")
+    with html.form_context("create_view"):
+        html.hidden_field("mode", "create")
 
-    forms.header(_("Select Datasource"))
-    forms.section(vs_ds.title())
-    vs_ds.render_input("ds", ds)
-    html.help(vs_ds.help())
-    forms.end()
+        forms.header(_("Select datasource"))
+        forms.section(vs_ds.title())
+        vs_ds.render_input("ds", ds)
+        html.help(vs_ds.help())
+        forms.end()
 
-    html.hidden_fields()
-    html.end_form()
+        html.hidden_fields()
     html.footer()

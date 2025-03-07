@@ -9,11 +9,9 @@ This page makes the user select the single info and data source.
 Then the user is redirected to the view editor dialog.
 """
 
-
 from cmk.gui import visuals
+from cmk.gui.data_source import data_source_registry
 from cmk.gui.http import request
-
-from .data_source import data_source_registry
 
 
 def page_create_view() -> None:

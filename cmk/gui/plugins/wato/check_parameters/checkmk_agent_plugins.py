@@ -3,7 +3,7 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-from cmk.utils.version import parse_check_mk_version
+from cmk.ccc.version import parse_check_mk_version
 
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.i18n import _
@@ -31,7 +31,7 @@ def _parameter_valuespec_checkmk_agent_plugins():
                     title=_("Required minimal versions"),
                     help=_(
                         "You can configure lower thresholds for the versions of the currently "
-                        "deployed agent plugins and local checks."
+                        "deployed agent plug-ins and local checks."
                     ),
                     elements=[
                         TextInput(title=_("Warning at"), validate=_validate_version),
@@ -42,10 +42,10 @@ def _parameter_valuespec_checkmk_agent_plugins():
             (
                 "exclude_pattern",
                 RegExp(
-                    title=_("Regular expression to exclude plugins"),
+                    title=_("Regular expression to exclude plug-ins"),
                     mode=RegExp.infix,
                     help=_(
-                        "Plugins or local checks matching this pattern will be excluded from the "
+                        "Plug-ins or local checks matching this pattern will be excluded from the "
                         "comparison with the specified required versions."
                     ),
                 ),
@@ -62,7 +62,7 @@ rulespec_registry.register(
         group=RulespecGroupCheckParametersApplications,
         match_type="dict",
         parameter_valuespec=_parameter_valuespec_checkmk_agent_plugins,
-        title=lambda: _("Checkmk agent plugins"),
+        title=lambda: _("Checkmk agent plug-ins"),
         # only present during 2.1.0b1. remove in 2.2!
         is_deprecated=True,
     )

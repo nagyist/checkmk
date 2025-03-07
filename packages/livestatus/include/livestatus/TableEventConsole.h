@@ -13,24 +13,22 @@
 #include <vector>
 
 #include "livestatus/IntColumn.h"
-#include "livestatus/Interface.h"
 #include "livestatus/ListColumn.h"
 #include "livestatus/Table.h"
 
 class ColumnOffsets;
-template <class T>
+template <typename T>
 class DoubleColumn;
-class MonitoringCore;
-class Query;
-template <class T>
+class ICore;
+class IHost;
+template <typename T>
 class StringColumn;
-template <class T>
+template <typename T>
 class TimeColumn;
-class User;
 
 class ECRow {
 public:
-    ECRow(MonitoringCore *mc, const std::vector<std::string> &headers,
+    ECRow(const ICore *mc, const std::vector<std::string> &headers,
           const std::vector<std::string> &columns);
 
     static std::unique_ptr<StringColumn<ECRow>> makeStringColumn(
@@ -57,7 +55,7 @@ public:
 
 private:
     std::map<std::string, std::string> map_;
-    std::unique_ptr<const IHost> host_;
+    const IHost *host_;
 
     [[nodiscard]] std::string get(const std::string &column_name,
                                   const std::string &default_value) const;
@@ -65,9 +63,8 @@ private:
 
 class TableEventConsole : public Table {
 public:
-    explicit TableEventConsole(MonitoringCore *mc);
-
-    void answerQuery(Query &query, const User &user) override;
+    void answerQuery(Query &query, const User &user,
+                     const ICore &core) override;
 };
 
 #endif  // TableEventConsole_h

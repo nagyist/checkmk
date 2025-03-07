@@ -1,5 +1,8 @@
+// Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+// This file is part of Checkmk (https://checkmk.com). It is subject to the
+// terms and conditions defined in the file COPYING, which is part of this
+// source code package.
 
-// provides basic api to start and stop service
 #include "stdafx.h"
 
 #include "providers/check_mk.h"
@@ -7,18 +10,28 @@
 #include <string>
 
 //
-#include "asio.h"
+#include "wnx/asio.h"
 //
 
-#include "agent_controller.h"
-#include "cfg.h"
 #include "common/version.h"
-#include "install_api.h"
-#include "onlyfrom.h"
+#include "wnx/agent_controller.h"
+#include "wnx/cfg.h"
+#include "wnx/install_api.h"
+#include "wnx/onlyfrom.h"
 
 using namespace std::string_literals;
 
 namespace cma::provider {
+
+// tested manually changing time
+std::string GetTimezoneOffset(
+    std::chrono::time_point<std::chrono::system_clock> tp) {
+    const auto tm = std::chrono::system_clock::to_time_t(tp);
+    const auto ret = std::put_time(std::localtime(&tm), "%z");
+    std::stringstream sss;
+    sss << ret;
+    return sss.str();
+}
 
 // function to provide format compatibility for monitoring site
 // probably, a bit to pedantic
@@ -63,16 +76,28 @@ std::string CheckMk::makeOnlyFrom() {
 
 namespace {
 std::string MakeInfo() {
-    const std::pair<std::string, std::string> infos[] = {
-        {"Version", CHECK_MK_VERSION},
-        {"BuildDate", __DATE__},
-        {"AgentOS", "windows"},
-        {"Hostname", cfg::GetHostName()},
-        {"Architecture", tgt::Is64bit() ? "64bit" : "32bit"},
+    const auto os = wtools::GetOsInfo();
+    const std::pair<std::string, std::optional<std::string>> infos[] = {
+        {"Version", {CHECK_MK_VERSION}},
+        {"BuildDate", {__DATE__}},
+        {"AgentOS", {"windows"}},
+        {"Hostname", {cfg::GetHostName()}},
+        {"Architecture", {tgt::Is64bit() ? "64bit" : "32bit"}},
+        {"OSName", os.has_value() ? std::optional{wtools::ToUtf8(os->name)}
+                                  : std::nullopt},
+        {"OSVersion", os.has_value()
+                          ? std::optional{wtools::ToUtf8(os->version)}
+                          : std::nullopt},
+        {"OSType", {"windows"}},
+        {"Time", {PrintIsoTime(std::chrono::system_clock::now())}},
     };
     std::string out;
     for (const auto &info : infos) {
-        out += fmt::format("{}: {}\n", info.first, info.second);
+        if (info.second.has_value()) {
+            out += fmt::format("{}: {}\n", info.first, info.second.value());
+        } else {
+            XLOG::l("Info '{}' is empty", info.first);
+        }
     }
 
     return out;
@@ -99,7 +124,22 @@ std::string MakeDirs() {
     return out;
 }
 
+std::tm ToLocalTime(std::chrono::time_point<std::chrono::system_clock> now) {
+    const std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time;
+    auto _ = localtime_s(&now_c, &local_time);
+    return local_time;
+}
+
 }  // namespace
+
+std::string PrintIsoTime(
+    std::chrono::time_point<std::chrono::system_clock> now) {
+    auto lt = ToLocalTime(now);
+    return fmt::format("{:4}-{:02}-{:02}T{:02}:{:02}:{:02}{}",
+                       lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour,
+                       lt.tm_min, lt.tm_sec, GetTimezoneOffset(now));
+}
 
 std::string CheckMk::makeBody() {
     auto out = MakeInfo();
