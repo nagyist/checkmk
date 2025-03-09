@@ -5,30 +5,54 @@
 
 """The user profile mega menu and related AJAX endpoints"""
 
+from collections.abc import Callable
 
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.http import request
 from cmk.gui.i18n import _, _l
 from cmk.gui.logged_in import user
-from cmk.gui.main_menu import mega_menu_registry
-from cmk.gui.pages import AjaxPage, page_registry, PageResult
-from cmk.gui.plugins.userdb.utils import validate_start_url
+from cmk.gui.main_menu import MegaMenuRegistry
+from cmk.gui.pages import AjaxPage, PageRegistry, PageResult
+from cmk.gui.theme.choices import theme_choices
+from cmk.gui.theme.current_theme import theme
 from cmk.gui.type_defs import MegaMenu, TopicMenuItem, TopicMenuTopic
-from cmk.gui.userdb import remove_custom_attr
+from cmk.gui.userdb import remove_custom_attr, validate_start_url
 from cmk.gui.userdb.store import load_custom_attr, save_custom_attr
 from cmk.gui.utils.csrf_token import check_csrf_token
-from cmk.gui.utils.theme import theme, theme_choices
 from cmk.gui.utils.urls import makeuri_contextless
 
 
+def register(
+    page_registry: PageRegistry,
+    mega_menu_registry: MegaMenuRegistry,
+    user_menu_topics: Callable[[], list[TopicMenuTopic]],
+) -> None:
+    page_registry.register_page("ajax_ui_theme")(ModeAjaxCycleThemes)
+    page_registry.register_page("ajax_sidebar_position")(ModeAjaxCycleSidebarPosition)
+    page_registry.register_page("ajax_set_dashboard_start_url")(ModeAjaxSetStartURL)
+
+    mega_menu_registry.register(
+        MegaMenu(
+            name="user",
+            title=_l("User"),
+            icon="main_user",
+            sort_index=20,
+            topics=user_menu_topics,
+            info_line=lambda: f"{user.id} ({'+'.join(user.role_ids)})",
+        )
+    )
+
+
 def _get_current_theme_title() -> str:
-    return [title for theme_id, title in theme.theme_choices if theme_id == theme.get()][0]
+    return [title for theme_id, title in theme.theme_choices.items() if theme_id == theme.get()][0]
 
 
 def _get_sidebar_position() -> str:
     assert user.id is not None
     sidebar_position = load_custom_attr(
-        user_id=user.id, key="ui_sidebar_position", parser=lambda x: None if x == "None" else "left"
+        user_id=user.id,
+        key="ui_sidebar_position",
+        parser=lambda x: None if x == "None" else "left",
     )
 
     return sidebar_position or "right"
@@ -42,7 +66,9 @@ def _sidebar_position_id(stored_value: str) -> str:
     return "left" if stored_value == "left" else "right"
 
 
-def _user_menu_topics() -> list[TopicMenuTopic]:
+def default_user_menu_topics(
+    add_change_password_menu_item: bool = True, add_two_factor_menu_item: bool = True
+) -> list[TopicMenuTopic]:
     quick_items = [
         TopicMenuItem(
             name="ui_theme",
@@ -72,28 +98,40 @@ def _user_menu_topics() -> list[TopicMenuTopic]:
             sort_index=10,
             icon="topic_profile",
         ),
-        TopicMenuItem(
-            name="change_password",
-            title=_("Change password"),
-            url="user_change_pw.py",
-            sort_index=30,
-            icon="topic_change_password",
-        ),
-        TopicMenuItem(
-            name="two_factor",
-            title=_("Two-factor authentication"),
-            url="user_two_factor_overview.py",
-            sort_index=30,
-            icon="topic_two_factor",
-        ),
+    ]
+
+    if add_change_password_menu_item:
+        items.append(
+            TopicMenuItem(
+                name="change_password",
+                title=_("Change password"),
+                url="user_change_pw.py",
+                sort_index=30,
+                icon="topic_change_password",
+            )
+        )
+
+    if add_two_factor_menu_item:
+        items.append(
+            TopicMenuItem(
+                name="two_factor",
+                title=_("Two-factor authentication"),
+                url="user_two_factor_overview.py",
+                sort_index=30,
+                icon="topic_two_factor",
+            ),
+        )
+
+    items.append(
         TopicMenuItem(
             name="logout",
             title=_("Logout"),
             url="logout.py",
             sort_index=40,
             icon="sidebar_logout",
-        ),
-    ]
+            target="_self",
+        )
+    )
 
     if user.may("general.edit_notifications"):
         items.insert(
@@ -109,13 +147,27 @@ def _user_menu_topics() -> list[TopicMenuTopic]:
 
     return [
         TopicMenuTopic(
-            name="user",
+            name="user_interface",
             title=_("User interface"),
             icon="topic_user_interface",
             items=quick_items,
         ),
         TopicMenuTopic(
-            name="user",
+            name="user_messages",
+            title=_("User messages"),
+            icon="topic_events",
+            items=[
+                TopicMenuItem(
+                    name="user_messages",
+                    title=_("Received messages"),
+                    url="user_message.py",
+                    sort_index=1,
+                    icon="topic_events",
+                )
+            ],
+        ),
+        TopicMenuTopic(
+            name="user_profile",
             title=_("User profile"),
             icon="topic_profile",
             items=items,
@@ -123,19 +175,6 @@ def _user_menu_topics() -> list[TopicMenuTopic]:
     ]
 
 
-mega_menu_registry.register(
-    MegaMenu(
-        name="user",
-        title=_l("User"),
-        icon="main_user",
-        sort_index=20,
-        topics=_user_menu_topics,
-        info_line=lambda: f"{user.id} ({'+'.join(user.role_ids)})",
-    )
-)
-
-
-@page_registry.register_page("ajax_ui_theme")
 class ModeAjaxCycleThemes(AjaxPage):
     """AJAX handler for quick access option 'Interface theme" in user menu"""
 
@@ -157,7 +196,6 @@ class ModeAjaxCycleThemes(AjaxPage):
         return {}
 
 
-@page_registry.register_page("ajax_sidebar_position")
 class ModeAjaxCycleSidebarPosition(AjaxPage):
     """AJAX handler for quick access option 'Sidebar position" in user menu"""
 
@@ -170,7 +208,6 @@ class ModeAjaxCycleSidebarPosition(AjaxPage):
         return {}
 
 
-@page_registry.register_page("ajax_set_dashboard_start_url")
 class ModeAjaxSetStartURL(AjaxPage):
     """AJAX handler to set the start URL of a user to a dashboard"""
 
@@ -186,7 +223,7 @@ class ModeAjaxSetStartURL(AjaxPage):
         return {}
 
 
-def _set_user_attribute(key: str, value: str | None):  # type: ignore[no-untyped-def]
+def _set_user_attribute(key: str, value: str | None) -> None:
     assert user.id is not None
     user_id = user.id
 

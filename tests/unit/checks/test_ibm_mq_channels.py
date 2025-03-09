@@ -7,11 +7,10 @@ from typing import Any
 
 import pytest
 
-from tests.testlib import Check
+from cmk.agent_based.v2 import IgnoreResultsError
+from cmk.plugins.collection.agent_based.ibm_mq_channels import parse_ibm_mq_channels
 
-from cmk.base.check_api import MKCounterWrapped
-from cmk.base.plugins.agent_based.ibm_mq_channels import parse_ibm_mq_channels
-
+from .checktestlib import Check
 from .test_ibm_mq_include import parse_info
 
 pytestmark = pytest.mark.checks
@@ -166,7 +165,7 @@ def test_stale_service_for_not_running_qmgr() -> None:
     check = Check(CHECK_NAME)
     params: dict[str, Any] = {}
     parsed = {"QM1": {"STATUS": "ENDED NORMALLY"}}
-    with pytest.raises(MKCounterWrapped, match=r"Stale because queue manager ENDED NORMALLY"):
+    with pytest.raises(IgnoreResultsError, match=r"Stale because queue manager ENDED NORMALLY"):
         list(check.run_check("QM1:CHAN2", params, parsed))
 
 

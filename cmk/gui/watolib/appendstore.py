@@ -11,9 +11,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Generic, TypeVar
 
-import cmk.utils.store as store
-from cmk.utils.exceptions import MKGeneralException
+from cmk.ccc import store
+from cmk.ccc.exceptions import MKGeneralException
 
+from cmk.gui.exceptions import MKUserError
 from cmk.gui.i18n import _
 
 _VT = TypeVar("_VT")
@@ -24,6 +25,8 @@ class ABCAppendStore(Generic[_VT], abc.ABC):
 
     The file holds basic python structures separated by "\\0".
     """
+
+    separator = b"\0"
 
     @staticmethod
     @abc.abstractmethod
@@ -61,11 +64,22 @@ class ABCAppendStore(Generic[_VT], abc.ABC):
             with self._path.open("rb") as f:
                 return [
                     self._deserialize(ast.literal_eval(entry.decode("utf-8")))
-                    for entry in f.read().split(b"\0")
+                    for entry in f.read().split(self.separator)
                     if entry
                 ]
         except FileNotFoundError:
             return []
+        except SyntaxError as e:
+            raise MKUserError(
+                None,
+                _(
+                    "The audit log can not be shown because of "
+                    "a syntax error in %s.<br><br>Please review and fix the file "
+                    "content or remove the file before you visit this page "
+                    "again.<br><br>The problematic entry is:<br>%s"
+                )
+                % (f.name, e.text),
+            )
 
     def read(self) -> Sequence[_VT]:
         with store.locked(self._path):
@@ -75,7 +89,7 @@ class ABCAppendStore(Generic[_VT], abc.ABC):
         with store.locked(self._path):
             try:
                 with self._path.open("ab+") as f:
-                    f.write(repr(self._serialize(entry)).encode("utf-8") + b"\0")
+                    f.write(repr(self._serialize(entry)).encode("utf-8") + self.separator)
                     f.flush()
                     os.fsync(f.fileno())
                 self._path.chmod(0o660)

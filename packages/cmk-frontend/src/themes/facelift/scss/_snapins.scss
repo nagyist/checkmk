@@ -1,0 +1,625 @@
+@use "sass:color";
+@charset "UTF-8";
+// Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+// This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+// conditions defined in the file COPYING, which is part of this source code package.
+
+/*
+ * Bookmarks snapin
+ */
+div.bookmark {
+  width: 230px;
+  max-width: 230px;
+  overflow: hidden;
+  color: $font-color;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  -o-text-overflow: ellipsis;
+}
+
+/*
+ * Custom links snapin
+ */
+#snapin_custom_links {
+  div.sublist {
+    padding-left: 10px;
+  }
+
+  img.icon {
+    width: 14px;
+    height: 14px;
+  }
+}
+
+/*
+ * Host matrix snapin
+ */
+table.hostmatrix {
+  border-collapse: collapse;
+  table-layout: fixed;
+
+  tr,
+  td {
+    padding: 0;
+  }
+
+  a {
+    display: block;
+    border-radius: 1px;
+  }
+}
+
+/*
+ * Hosts snapin
+ */
+.snapin table.allhosts {
+  width: 100%;
+
+  td {
+    width: 50%;
+    padding: 0;
+
+    div.statebullet {
+      margin-bottom: 2px;
+    }
+
+    a.link {
+      padding: 2px 2px 2px $spacing-half;
+    }
+  }
+}
+
+/*
+ * Master control snapin
+ */
+table.master_control {
+  width: 100%;
+  margin: 0;
+  border-spacing: 0;
+
+  td {
+    a.toggle_switch {
+      float: right;
+
+      a {
+        font-weight: $font-weight-bold;
+        text-transform: lowercase;
+      }
+      img.icon.iconbutton {
+        height: 14px;
+        width: 100%;
+      }
+    }
+
+    &.left {
+      display: inline-block;
+      font-weight: $font-weight-default;
+      letter-spacing: $letter-spacing-table;
+      text-align: left;
+
+      a {
+        font-weight: $font-weight-default;
+        text-align: left;
+      }
+    }
+  }
+}
+
+div#snapin_master_control div.foldable:not(:last-child) {
+  margin-bottom: 4px;
+}
+
+/* Styles shared/inherited by different performance tables */
+%performance-table-shared {
+  width: 100%;
+  padding: $performance-table-shared-padding;
+  box-sizing: border-box;
+
+  td {
+    font-weight: $font-weight-default;
+    letter-spacing: $letter-spacing-table;
+  }
+}
+
+/*
+ * Event console performance snapin (mkeventd)
+ */
+table.mkeventd_performance {
+  @extend %performance-table-shared;
+  border-radius: 2px;
+
+  td {
+    padding: 0;
+
+    &:nth-of-type(2) {
+      padding: 0;
+      padding-right: 1px;
+      font-weight: $font-weight-bold;
+      text-align: right;
+      white-space: nowrap;
+    }
+  }
+}
+
+/*
+ * Performance snapin
+ */
+table.performance {
+  @extend %performance-table-shared;
+  border-radius: 2px;
+
+  td {
+    padding: 0;
+
+    &.right {
+      padding: 0;
+      padding-right: 1px;
+      text-align: right;
+      white-space: nowrap;
+    }
+  }
+}
+
+/*
+ * Server time snapin
+ */
+#snapin_time div.time {
+  width: $theme-snapin-width - 2px;
+  padding: 4px 0 0;
+  margin: 0 auto;
+  font-size: 24px;
+  font-weight: $font-weight-bold;
+  letter-spacing: $letter-spacing-table;
+  color: $font-color;
+  background-color: $server-time-div-bg-color;
+  text-align: center;
+  border-spacing: 4px;
+  border-radius: $theme-border-radius;
+}
+
+/*
+ * Site status snapin
+ */
+table.sitestate {
+  width: $theme-snapin-width;
+
+  td {
+    padding: 1px 0;
+    text-align: right;
+
+    &.left {
+      text-align: left;
+
+      a {
+        font-weight: $font-weight-default;
+        text-align: left;
+      }
+    }
+
+    &.state {
+      width: 60px;
+      font-size: $font-size-small;
+    }
+  }
+}
+
+/*
+ * Speedometer snapin
+ */
+div.speedometer {
+  position: relative;
+  top: 0;
+  left: 0;
+  height: 170px;
+}
+
+img#speedometerbg {
+  width: $theme-snapin-width;
+  height: auto;
+}
+
+canvas#speedometer {
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+/*
+ * Tactical overview snapin
+ */
+div#snapin_tactical_overview {
+  width: 100%;
+}
+
+div.snapin.more table.tacticaloverview th span.more,
+div.snapin.less table.tacticaloverview th span.less {
+  display: inline;
+}
+
+table.tacticaloverview {
+  /* remove the border-spacing of the first and last element */
+  width: calc(100% + 2 * #{$spacing});
+  margin: 0 (-$spacing);
+  border-collapse: separate;
+  border-spacing: $spacing 0;
+  table-layout: fixed;
+
+  th {
+    font-size: $font-size-small;
+    font-weight: $font-weight-default;
+    line-height: 1.6;
+    letter-spacing: 0;
+    color: $font-color-dimmed;
+    text-align: left;
+
+    span {
+      display: none;
+    }
+  }
+
+  td {
+    height: $input-field-height;
+    text-align: right;
+    background: $tactical-overview-td-bg-color;
+    border-radius: $popup-filters-border-radius;
+
+    &.states {
+      box-shadow: none;
+
+      a.link {
+        color: $font-color-orange;
+      }
+    }
+
+    &.col3 {
+      width: 33%;
+    }
+
+    &.col4 {
+      width: 25%;
+    }
+  }
+
+  a,
+  span {
+    display: block;
+    margin-right: 2px;
+  }
+}
+
+table.tacticaloverview td a,
+table.tacticaloverview td a.link,
+table.tacticaloverview td a:hover,
+table.tacticaloverview td span {
+  padding: 4px;
+  font-weight: $font-weight-bold;
+  letter-spacing: 0;
+  color: $font-color;
+}
+
+div.tacticalalert,
+div.tacticalinfo {
+  height: 25px;
+  margin-top: 8px;
+  line-height: 25px;
+  text-align: center;
+  border-radius: $theme-border-radius;
+  box-shadow: none;
+}
+
+div.tacticalalert {
+  background-color: $color-state-2-background;
+}
+
+div.tacticalinfo {
+  background-color: $overview-info-bg;
+}
+
+div.spacertop {
+  padding-top: 5px;
+}
+
+#snapin_tactical_overview img {
+  position: relative;
+  top: -1px;
+  width: 15px;
+  height: auto;
+}
+
+/*
+ * Virtual host tree snapin
+ */
+#snapin_tag_tree {
+  position: relative;
+  top: 0;
+  left: 0;
+
+  select {
+    float: right;
+    margin-top: -2px;
+    margin-bottom: 2px;
+  }
+
+  form img.iconbutton {
+    display: inline-box;
+    float: right;
+    width: 16px;
+    height: 16px;
+  }
+
+  div.tag_tree {
+    clear: both;
+  }
+
+  ul > div.statebullet.leaf {
+    margin-left: 16px;
+  }
+
+  b {
+    font-weight: $font-weight-default;
+  }
+
+  p {
+    margin: 0;
+
+    a {
+      text-decoration: underline;
+
+      &:hover {
+        text-decoration: none;
+      }
+    }
+  }
+}
+
+/*
+ * Admin mini snapin (WATO)
+ */
+#snapin_container_admin_mini.more a.show_more_mode {
+  display: inline;
+}
+
+#snapin_admin_mini {
+  padding-top: 6px;
+  clear: right;
+
+  img.icon {
+    width: 14px;
+    height: 14px;
+    padding: 0;
+    margin-right: 5px;
+    margin-bottom: 10px;
+  }
+
+  img.emblem {
+    bottom: 3px;
+  }
+
+  div.footnotelink {
+    float: right;
+  }
+
+  div.clear {
+    clear: right;
+  }
+}
+
+#snapin_container_admin.less li.sidebar.show_more_mode {
+  display: none;
+}
+
+#snapin_admin {
+  li {
+    line-height: $menu-item-spacing;
+
+    img.icon {
+      width: 14px;
+      height: 14px;
+    }
+  }
+}
+
+/*
+ * WATO folder tree snapin
+ */
+#snapin_wato_foldertree {
+  select {
+    width: $theme-snapin-width;
+    margin-bottom: 10px;
+    clear: both;
+    box-sizing: border-box;
+  }
+  ul {
+    list-style-type: none;
+    padding: 0;
+  }
+}
+
+/* Styles shared/inherited by different search bars */
+%search-shared {
+  width: 100%;
+  padding: 0;
+
+  img {
+    display: none;
+  }
+
+  input {
+    margin: 0;
+    background-repeat: no-repeat;
+  }
+
+  input,
+  select,
+  textarea,
+  #mk_side_search_field {
+    box-sizing: border-box;
+  }
+}
+
+/*
+ * Wiki snapin
+ */
+#snapin_container_wiki div.content {
+  font-weight: $font-weight-bold;
+  color: $font-color;
+
+  p {
+    font-weight: $font-weight-default;
+  }
+}
+
+/*
+ * Quicksearch snapin
+ */
+#mk_side_search {
+  @extend %search-shared;
+
+  input {
+    width: 100%;
+    height: $input-field-height;
+    color: $font-color;
+    background-image: url("images/icon_quicksearch.png");
+    background-position: right $spacing bottom 4px;
+    background-size: 15px;
+  }
+
+  input::placeholder {
+    line-height: 16px;
+    letter-spacing: 0;
+    color: $font-color;
+  }
+
+  div.topic {
+    margin: 0 0 4px 4px;
+    font-size: $font-size-large;
+
+    &:not(:first-child) {
+      margin-top: $spacing;
+    }
+  }
+}
+
+#mk_search_results {
+  position: absolute;
+  z-index: 1;
+  width: 223px;
+  padding: 8px;
+  margin-top: 2px;
+  color: $font-color;
+  background-color: $input-background-color;
+
+  a {
+    display: block;
+    width: 217px;
+    padding-left: 5px;
+    color: $font-color;
+    text-align: left;
+    text-decoration: none;
+
+    &:hover,
+    &.active {
+      background-color: $snapin-bg-color;
+    }
+  }
+
+  div.error,
+  div.warning {
+    padding: 2px;
+  }
+}
+
+#mk_side_clear {
+  clear: both;
+}
+
+/*
+ * Micro Core Stats (CMC) snapin
+ */
+#snapin_cmc_stats {
+  color: $font-color;
+
+  table.cmc_stats {
+    width: 100%;
+    border-spacing: 0 4px;
+    box-sizing: border-box;
+
+    tr {
+      &.dark {
+        background-color: color.adjust($navbar-color, $lightness: 1%);
+      }
+
+      &.light {
+        background-color: color.adjust($navbar-color, $lightness: 3%);
+      }
+    }
+
+    td {
+      padding: 0 4px;
+      height: 20px;
+      font-weight: $font-weight-default;
+      font-size: $font-size-normal;
+      letter-spacing: $letter-spacing-table;
+
+      &.right {
+        padding: 0;
+        padding-right: 1px;
+        text-align: right;
+        white-space: nowrap;
+        font-weight: $font-weight-bold;
+      }
+    }
+  }
+}
+
+/*
+ * Reports snapin
+ */
+#snapin_reports {
+  i {
+    color: $font-color-black;
+  }
+
+  input {
+    padding: 3px 4px;
+    font-size: $font-size-small;
+    text-align: center;
+  }
+
+  div {
+    font-size: $font-size-small;
+  }
+
+  div.timerange {
+    margin-bottom: 10px;
+    color: $font-color;
+
+    table {
+      display: inline-block;
+
+      td {
+        &.tuple_td:nth-of-type(2) {
+          padding-left: 8px;
+        }
+
+        &.tuple_left {
+          padding-right: 4px;
+        }
+      }
+
+      span.title {
+        padding: 0;
+      }
+    }
+  }
+
+  select {
+    float: left;
+    margin-top: 3px;
+    margin-bottom: 5px;
+  }
+}
+
+div.snapin select {
+  background-image: url(images/select_arrow.png);
+}

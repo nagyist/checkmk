@@ -5,28 +5,25 @@
 
 import os
 from collections.abc import Iterator, Mapping, Sequence
-from enum import Enum
+from enum import auto, Enum
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, TypedDict, Union
+from typing import Any, Literal, NamedTuple, TypedDict
 
 from livestatus import SiteId
 
 import cmk.utils.paths
+from cmk.utils.structured_data import SDRawTree
 
 # This is an awful type, but just putting `Any` and hoping for the best is no solution.
-_JSONSerializable = Union[
-    str,
-    list[str],
-    list[tuple[str, bool]],
-    Mapping[str, str],
-    Mapping[str, list[str]],
-]
+_JSONSerializable = (
+    str | float | list[str] | list[tuple[str, bool]] | Mapping[str, str] | Mapping[str, list[str]]
+)
 
 DiagnosticsCLParameters = list[str]
 DiagnosticsModesParameters = dict[str, Any]
 DiagnosticsOptionalParameters = dict[str, Any]
 CheckmkFilesMap = dict[str, Path]
-DiagnosticsElementJSONResult = Mapping[str, _JSONSerializable]
+DiagnosticsElementJSONResult = Mapping[str, _JSONSerializable] | SDRawTree
 DiagnosticsElementCSVResult = str
 DiagnosticsElementFilepaths = Iterator[Path]
 
@@ -34,13 +31,16 @@ DiagnosticsElementFilepaths = Iterator[Path]
 class DiagnosticsParameters(TypedDict):
     site: SiteId
     general: Literal[True]
+    timeout: int
     opt_info: DiagnosticsOptionalParameters | None
     comp_specific: DiagnosticsOptionalParameters | None
+    checkmk_server_host: str
 
 
 OPT_LOCAL_FILES = "local-files"
 OPT_OMD_CONFIG = "omd-config"
 OPT_CHECKMK_OVERVIEW = "checkmk-overview"
+OPT_CHECKMK_CRASH_REPORTS = "checkmk-crashes"
 OPT_CHECKMK_CONFIG_FILES = "checkmk-config-files"
 OPT_CHECKMK_CORE_FILES = "checkmk-core-files"
 OPT_CHECKMK_LICENSING_FILES = "checkmk-licensing-files"
@@ -57,11 +57,15 @@ OPT_COMP_BUSINESS_INTELLIGENCE = "business-intelligence"
 OPT_COMP_CMC = "cmc"
 OPT_COMP_LICENSING = "licensing"
 
+_OPTS_WITH_HOST = [
+    OPT_PERFORMANCE_GRAPHS,
+    OPT_CHECKMK_OVERVIEW,
+]
+
 _BOOLEAN_CONFIG_OPTS = [
     OPT_LOCAL_FILES,
     OPT_OMD_CONFIG,
-    OPT_PERFORMANCE_GRAPHS,
-    OPT_CHECKMK_OVERVIEW,
+    OPT_CHECKMK_CRASH_REPORTS,
 ]
 
 _FILES_OPTS = [
@@ -72,54 +76,16 @@ _FILES_OPTS = [
 ]
 
 
-_MODULE_TO_PATH = {
-    "agent_based": "lib/check_mk/base/plugins/agent_based",
-    "agents": "share/check_mk/agents",
-    "alert_handlers": "share/check_mk/alert_handlers",
-    "bin": "bin",
-    "checkman": "share/check_mk/checkman",
-    "checks": "share/check_mk/checks",
-    "doc": "share/doc/check_mk",
-    "ec_rule_packs": "EC_RULE",
-    "inventory": "share/check_mk/inventory",
-    "lib": "lib",
-    "locales": "share/check_mk/locale",
-    "mibs": "share/snmp/mibs",
-    "notifications": "share/check_mk/notifications",
-    "pnp-templates": "share/check_mk/pnp-templates",
-    "web": "share/check_mk/web",
-}
-
-_CSV_COLUMNS = [
-    "path",
-    "exists",
-    "package",
-    "author",
-    "description",
-    "download_url",
-    "name",
-    "title",
-    "version",
-    "version.min_required",
-    "version.packaged",
-    "version.usable_until",
-    "permissions",
-    "installed",
-    "optional_packages",
-    "unpackaged",
-]
-
-
-def serialize_wato_parameters(  # pylint: disable=too-many-branches
+def serialize_wato_parameters(
     wato_parameters: DiagnosticsParameters,
 ) -> list[DiagnosticsCLParameters]:
     # TODO: reduce the number of branches and do the whole procedure in a more generic/elegant way
 
-    parameters = {}
+    parameters: dict[str, Any] = {}
 
     opt_info_parameters = wato_parameters.get("opt_info")
     if opt_info_parameters is not None:
-        parameters.update(opt_info_parameters)
+        parameters |= opt_info_parameters
 
     comp_specific_parameters = wato_parameters.get("comp_specific")
     if comp_specific_parameters is not None:
@@ -127,6 +93,12 @@ def serialize_wato_parameters(  # pylint: disable=too-many-branches
 
     boolean_opts: list[str] = [
         k for k in sorted(parameters.keys()) if k in _BOOLEAN_CONFIG_OPTS and parameters[k]
+    ]
+
+    opt_checkmk_server_host = wato_parameters.get("checkmk_server_host", "")
+
+    opts_with_host: list[list[str]] = [
+        [k, opt_checkmk_server_host] for k in _OPTS_WITH_HOST if k in parameters
     ]
 
     config_files: set[str] = set()
@@ -163,6 +135,9 @@ def serialize_wato_parameters(  # pylint: disable=too-many-branches
     chunks: list[list[str]] = []
     if boolean_opts:
         chunks.append(boolean_opts)
+
+    for opt in opts_with_host:
+        chunks.append(opt)
 
     max_args: int = _get_max_args() - 1  # OPT will be appended in for loop
     for config_args in [
@@ -205,9 +180,7 @@ def _get_max_args() -> int:
 
 
 def _extract_list_of_files(value: tuple[str, list[str]] | None) -> set[str]:
-    if value is None:
-        return set()
-    return set(value[1])
+    return set() if value is None else set(value[1])
 
 
 def deserialize_cl_parameters(
@@ -224,6 +197,9 @@ def deserialize_cl_parameters(
             if parameter in _BOOLEAN_CONFIG_OPTS:
                 deserialized_parameters[parameter] = True
 
+            elif parameter in _OPTS_WITH_HOST:
+                deserialized_parameters[parameter] = next(parameters)
+
             elif parameter in _FILES_OPTS:
                 deserialized_parameters[parameter] = next(parameters).split(",")
 
@@ -238,7 +214,7 @@ def deserialize_modes_parameters(
 ) -> DiagnosticsOptionalParameters:
     deserialized_parameters = {}
     for key, value in modes_parameters.items():
-        if key in _BOOLEAN_CONFIG_OPTS:
+        if key in _BOOLEAN_CONFIG_OPTS or key in _OPTS_WITH_HOST:
             deserialized_parameters[key] = value
 
         elif key in _FILES_OPTS:
@@ -262,7 +238,7 @@ def get_checkmk_config_files_map() -> CheckmkFilesMap:
 
 def get_checkmk_core_files_map() -> CheckmkFilesMap:
     files_map: CheckmkFilesMap = {}
-    for root, _dirs, files in os.walk(cmk.utils.paths.var_dir + "/core"):
+    for root, _dirs, files in os.walk(f"{cmk.utils.paths.var_dir}/core"):
         for file_name in files:
             filepath = Path(root).joinpath(file_name)
             if filepath.stem in ("state", "history", "config"):
@@ -273,7 +249,7 @@ def get_checkmk_core_files_map() -> CheckmkFilesMap:
 
 def get_checkmk_licensing_files_map() -> CheckmkFilesMap:
     files_map: CheckmkFilesMap = {}
-    for root, _dirs, files in os.walk(cmk.utils.paths.var_dir + "/licensing"):
+    for root, _dirs, files in os.walk(f"{cmk.utils.paths.var_dir}/licensing"):
         for file_name in files:
             filepath = Path(root).joinpath(file_name)
             rel_filepath = str(filepath.relative_to(cmk.utils.paths.var_dir))
@@ -286,33 +262,48 @@ def get_checkmk_log_files_map() -> CheckmkFilesMap:
     for root, _dirs, files in os.walk(cmk.utils.paths.log_dir):
         for file_name in files:
             filepath = Path(root).joinpath(file_name)
-            if filepath.suffix in (".log", ".state") or filepath.name == "stats":
+            if filepath.suffix in (".log", ".1", ".state") or filepath.name in (
+                "access_log",
+                "error_log",
+                "stats",
+            ):
                 rel_filepath = str(filepath.relative_to(cmk.utils.paths.log_dir))
                 files_map.setdefault(rel_filepath, filepath)
     return files_map
 
 
+class CheckmkFileEncryption(Enum):
+    none = auto()
+    rot47 = auto()
+
+
 class CheckmkFileSensitivity(Enum):
-    insensitive = 0
-    sensitive = 1
-    high_sensitive = 2
-    unknown = 3
+    insensitive = auto()
+    sensitive = auto()
+    high_sensitive = auto()
+    unknown = auto()
 
 
 class CheckmkFileInfo(NamedTuple):
     components: list[str]
     sensitivity: CheckmkFileSensitivity
     description: str
+    encryption: CheckmkFileEncryption
 
 
 def get_checkmk_file_sensitivity_for_humans(rel_filepath: str, file_info: CheckmkFileInfo) -> str:
     sensitivity = file_info.sensitivity
-    if sensitivity == CheckmkFileSensitivity.high_sensitive:
-        return "%s (H)" % rel_filepath
-    if sensitivity == CheckmkFileSensitivity.sensitive:
-        return "%s (M)" % rel_filepath
-    # insensitive
-    return "%s (L)" % rel_filepath
+    return f"{rel_filepath} {_get_sensitivity_suffix(sensitivity)}"
+
+
+def _get_sensitivity_suffix(sensitivity: CheckmkFileSensitivity) -> str:
+    match sensitivity:
+        case CheckmkFileSensitivity.high_sensitive:
+            return "(H)"
+        case CheckmkFileSensitivity.sensitive:
+            return "(M)"
+        case _:  # insensitive
+            return "(L)"
 
 
 def get_checkmk_file_description(rel_filepath: str | None = None) -> Sequence[tuple[str, str]]:
@@ -328,7 +319,7 @@ def get_checkmk_file_info(rel_filepath: str, component: str | None = None) -> Ch
     # Thus we have to find them via name. The presedence is as following:
     # 1. CheckmkFileInfoByNameMap
     # 2. CheckmkFileInfoByRelFilePathMap
-
+    #
     # Note:
     # A combination FILE + COMPONENT may be only in ONE of these two maps. Otherwise
     # a component collects too many files.
@@ -344,17 +335,27 @@ def get_checkmk_file_info(rel_filepath: str, component: str | None = None) -> Ch
     #   => MULTIPLE entries in CheckmkFileInfoByRelFilePathMap
     #      (Otherwise all other 'global.mk' would be associated with 'Notifications')
 
+    if Path(rel_filepath).suffix == ".1":
+        rel_filepath = rel_filepath[:-2]
+
     file_info_by_name = CheckmkFileInfoByNameMap.get(Path(rel_filepath).name)
-    if file_info_by_name is not None:
-        if component is None or component in file_info_by_name.components:
-            return file_info_by_name
+    if file_info_by_name is not None and (
+        component is None or component in file_info_by_name.components
+    ):
+        return file_info_by_name
 
     file_info_by_rel_filepath = CheckmkFileInfoByRelFilePathMap.get(rel_filepath)
-    if file_info_by_rel_filepath is not None:
-        if component is None or component in file_info_by_rel_filepath.components:
-            return file_info_by_rel_filepath
+    if file_info_by_rel_filepath is not None and (
+        component is None or component in file_info_by_rel_filepath.components
+    ):
+        return file_info_by_rel_filepath
 
-    return CheckmkFileInfo(components=[], sensitivity=CheckmkFileSensitivity(3), description="")
+    return CheckmkFileInfo(
+        components=[],
+        sensitivity=CheckmkFileSensitivity.unknown,
+        description="",
+        encryption=CheckmkFileEncryption.none,
+    )
 
 
 # Feel free to extend the maps:
@@ -366,47 +367,53 @@ CheckmkFileInfoByNameMap: dict[str, CheckmkFileInfo] = {
         components=[
             OPT_COMP_GLOBAL_SETTINGS,
         ],
-        sensitivity=CheckmkFileSensitivity(0),
+        sensitivity=CheckmkFileSensitivity.insensitive,
+        encryption=CheckmkFileEncryption.none,
         description="Configuration for the distributed monitoring.",
     ),
     "global.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_GLOBAL_SETTINGS,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="",
+        encryption=CheckmkFileEncryption.none,
     ),
     "hosts.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_HOSTS_AND_FOLDERS,
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(2),
+        sensitivity=CheckmkFileSensitivity.high_sensitive,
         description="Contains all hosts of a particular folder, including their attributes.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "rules.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_HOSTS_AND_FOLDERS,
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(2),
+        sensitivity=CheckmkFileSensitivity.high_sensitive,
         description="Contains all rules assigned to a particular folder.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "tags.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_HOSTS_AND_FOLDERS,
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="Contains tag groups and auxiliary tags.",
+        encryption=CheckmkFileEncryption.none,
     ),
     ".wato": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
             OPT_COMP_HOSTS_AND_FOLDERS,
         ],
-        sensitivity=CheckmkFileSensitivity(0),
+        sensitivity=CheckmkFileSensitivity.insensitive,
         description="Contains the folder properties of a particular folder.",
+        encryption=CheckmkFileEncryption.none,
     ),
 }
 
@@ -416,129 +423,210 @@ CheckmkFileInfoByRelFilePathMap: dict[str, CheckmkFileInfo] = {
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(2),
+        sensitivity=CheckmkFileSensitivity.high_sensitive,
         description="Alert handler configuration",
+        encryption=CheckmkFileEncryption.none,
     ),
     "conf.d/wato/contacts.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(2),
+        sensitivity=CheckmkFileSensitivity.high_sensitive,
         description="Contains users and their properties.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "conf.d/wato/global.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="Contains the global settings of a site.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "conf.d/wato/groups.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(0),
+        sensitivity=CheckmkFileSensitivity.insensitive,
         description="Contains the contact groups.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "conf.d/wato/notifications.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(2),
+        sensitivity=CheckmkFileSensitivity.high_sensitive,
         description="Contains the notification rules.",
+        encryption=CheckmkFileEncryption.none,
+    ),
+    "licensing.d/notification_settings.mk": CheckmkFileInfo(
+        components=[
+            OPT_COMP_LICENSING,
+        ],
+        sensitivity=CheckmkFileSensitivity.sensitive,
+        description="Contains set of users to be notified on licensing situations.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "main.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(0),
+        sensitivity=CheckmkFileSensitivity.insensitive,
         description="The main config file, which is used if you don't use the Setup features of the GUI.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "mknotifyd.d/wato/global.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="Contains the notification spooler's global settings.",
+        encryption=CheckmkFileEncryption.none,
+    ),
+    "multisite.d/licensing_settings.mk": CheckmkFileInfo(
+        components=[
+            OPT_COMP_LICENSING,
+        ],
+        sensitivity=CheckmkFileSensitivity.sensitive,
+        description="Contains licensing related settings for mode of connection, e.g. online verification, credentials, etc.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "multisite.d/wato/bi_config.bi": CheckmkFileInfo(
         components=[
             OPT_COMP_BUSINESS_INTELLIGENCE,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="Contains the Business Intelligence rules and aggregations.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "multisite.d/wato/global.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="Contains GUI related global settings.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "multisite.d/wato/groups.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(0),
+        sensitivity=CheckmkFileSensitivity.insensitive,
         description="Contains GUI related contact group properties.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "multisite.d/wato/users.mk": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(2),
+        sensitivity=CheckmkFileSensitivity.high_sensitive,
         description="Contains GUI related user properties.",
+        encryption=CheckmkFileEncryption.none,
+    ),
+    "multisite.d/wato/user_connections.mk": CheckmkFileInfo(
+        components=[],
+        sensitivity=CheckmkFileSensitivity.high_sensitive,
+        description="Contains GUI related user properties.",
+        encryption=CheckmkFileEncryption.none,
     ),
     # Core files
     "core/config.pb": CheckmkFileInfo(
         components=[
             OPT_COMP_CMC,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="Contains the current configuration of the core in the protobuff format.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "core/state": CheckmkFileInfo(
         components=[
             OPT_COMP_CMC,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="Contains the current status of the core.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "core/state.pb": CheckmkFileInfo(
         components=[
             OPT_COMP_CMC,
+            OPT_COMP_LICENSING,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="Contains the current status of the core in the protobuff format.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "core/history": CheckmkFileInfo(
         components=[
             OPT_COMP_CMC,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="Contains the latest state history of all hosts and services.",
+        encryption=CheckmkFileEncryption.none,
     ),
     # Licensing files
     "licensing/extensions.json": CheckmkFileInfo(
         components=[
             OPT_COMP_LICENSING,
         ],
-        sensitivity=CheckmkFileSensitivity(0),
+        sensitivity=CheckmkFileSensitivity.insensitive,
         description="Extends the information in history.json.",
+        encryption=CheckmkFileEncryption.rot47,
     ),
     "licensing/history.json": CheckmkFileInfo(
         components=[
             OPT_COMP_LICENSING,
         ],
-        sensitivity=CheckmkFileSensitivity(0),
+        sensitivity=CheckmkFileSensitivity.insensitive,
         description="Contains information about the licensing samples.",
+        encryption=CheckmkFileEncryption.rot47,
+    ),
+    "licensing/next_online_verification": CheckmkFileInfo(
+        components=[
+            OPT_COMP_LICENSING,
+        ],
+        sensitivity=CheckmkFileSensitivity.insensitive,
+        description="Contains timing information about the licensing samples.",
+        encryption=CheckmkFileEncryption.none,
+    ),
+    "licensing/verification_request_id": CheckmkFileInfo(
+        components=[
+            OPT_COMP_LICENSING,
+        ],
+        sensitivity=CheckmkFileSensitivity.insensitive,
+        description="Stores the request id of each verification request against the license server.",
+        encryption=CheckmkFileEncryption.none,
+    ),
+    "licensing/verification_response": CheckmkFileInfo(
+        components=[
+            OPT_COMP_LICENSING,
+        ],
+        sensitivity=CheckmkFileSensitivity.insensitive,
+        description="Contains the raw response from license server.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "licensing/verification_result.json": CheckmkFileInfo(
         components=[
             OPT_COMP_LICENSING,
         ],
-        sensitivity=CheckmkFileSensitivity(0),
+        sensitivity=CheckmkFileSensitivity.insensitive,
         description="Contains the last licensing verification result.",
+        encryption=CheckmkFileEncryption.none,
+    ),
+    "licensing/state_file_created": CheckmkFileInfo(
+        components=[
+            OPT_COMP_LICENSING,
+        ],
+        sensitivity=CheckmkFileSensitivity.insensitive,
+        description="Contains the trial start date.",
+        encryption=CheckmkFileEncryption.none,
+    ),
+    "licensing/licensed_state": CheckmkFileInfo(
+        components=[
+            OPT_COMP_LICENSING,
+        ],
+        sensitivity=CheckmkFileSensitivity.insensitive,
+        description="Contains the licensed state for CMC/NEB.",
+        encryption=CheckmkFileEncryption.none,
     ),
     # Log files
     "cmc.log": CheckmkFileInfo(
@@ -546,116 +634,157 @@ CheckmkFileInfoByRelFilePathMap: dict[str, CheckmkFileInfo] = {
             OPT_COMP_NOTIFICATIONS,
             OPT_COMP_CMC,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="In this file messages from starting and stopping the CMC can be found, as well as general warnings and error messages related to the core and the check helpers.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "web.log": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
+            OPT_COMP_LICENSING,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="The log file of the checkmk weg gui. Here you can find all kind of automations call, ldap sync and some failing GUI extensions.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "liveproxyd.log": CheckmkFileInfo(
         components=[
             OPT_COMP_CMC,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="Log file for the Livestatus proxies.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "liveproxyd.state": CheckmkFileInfo(
         components=[
             OPT_COMP_CMC,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="The current state of the Livestatus proxies in a readable form. This file is updated every 5 seconds.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "mknotifyd.log": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="The notification spooler’s log file.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "mknotifyd.state": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="The current status of the notification spooler. This is primarily relevant for notifications in distributed environments.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "notify.log": CheckmkFileInfo(
         components=[
             OPT_COMP_NOTIFICATIONS,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="The notification module’s log file. This will show you the rule based processing of the notifications.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "apache/access_log": CheckmkFileInfo(
         components=[],
-        sensitivity=CheckmkFileSensitivity(2),
+        sensitivity=CheckmkFileSensitivity.high_sensitive,
         description="This log file contains all requests that are sent to the site's apache server.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "apache/error_log": CheckmkFileInfo(
-        components=[],
-        sensitivity=CheckmkFileSensitivity(1),
+        components=[
+            OPT_COMP_LICENSING,
+        ],
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="this log file contains all errors that occur when requests are sent to the site's apache server.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "dcd.log": CheckmkFileInfo(
         components=[],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="The log file for the Dynamic Configuration Daemon (DCD).",
+        encryption=CheckmkFileEncryption.none,
     ),
     "alerts.log": CheckmkFileInfo(
         components=[],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="Log file with all events relevant to the alert handler (logged by the alert helper).",
+        encryption=CheckmkFileEncryption.none,
     ),
     "diskspace.log": CheckmkFileInfo(
         components=[],
-        sensitivity=CheckmkFileSensitivity(0),
+        sensitivity=CheckmkFileSensitivity.insensitive,
         description="The log file of the automatic disk space cleanup.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "mkeventd.log": CheckmkFileInfo(
         components=[],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="The event console log file. This will show you the processing of the incoming messages, matching of the rule packs and the processing of the matched mibs.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "rrdcached.log": CheckmkFileInfo(
         components=[],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="The log file of the rrd cache daemon.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "redis-server.log": CheckmkFileInfo(
         components=[],
-        sensitivity=CheckmkFileSensitivity(1),
-        description="The log file of the redis-server of the Checkmk instance.",
+        sensitivity=CheckmkFileSensitivity.sensitive,
+        description="The log file of the redis-server of the Checkmk site.",
+        encryption=CheckmkFileEncryption.none,
     ),
     "agent-receiver/access.log": CheckmkFileInfo(
         components=[],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="",
+        encryption=CheckmkFileEncryption.none,
     ),
     "agent-receiver/agent-receiver.log": CheckmkFileInfo(
         components=[],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="",
+        encryption=CheckmkFileEncryption.none,
     ),
     "agent-receiver/error.log": CheckmkFileInfo(
         components=[],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="",
+        encryption=CheckmkFileEncryption.none,
     ),
     "agent-registration.log": CheckmkFileInfo(
         components=[],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="",
+        encryption=CheckmkFileEncryption.none,
     ),
     "licensing.log": CheckmkFileInfo(
         components=[
             OPT_COMP_LICENSING,
         ],
-        sensitivity=CheckmkFileSensitivity(1),
+        sensitivity=CheckmkFileSensitivity.sensitive,
         description="",
+        encryption=CheckmkFileEncryption.none,
+    ),
+    "automation-helper/access.log": CheckmkFileInfo(
+        components=[],
+        sensitivity=CheckmkFileSensitivity.sensitive,
+        description="This log file contains all requests that are sent to the automation helper server.",
+        encryption=CheckmkFileEncryption.none,
+    ),
+    "automation-helper/automation-helper.log": CheckmkFileInfo(
+        components=[],
+        sensitivity=CheckmkFileSensitivity.sensitive,
+        description="This log file contains all activity inside the automation helper application.",
+        encryption=CheckmkFileEncryption.none,
+    ),
+    "automation-helper/error.log": CheckmkFileInfo(
+        components=[],
+        sensitivity=CheckmkFileSensitivity.sensitive,
+        description="This log file contains all errors that occur when requests are sent to the automation helper server.",
+        encryption=CheckmkFileEncryption.none,
     ),
 }

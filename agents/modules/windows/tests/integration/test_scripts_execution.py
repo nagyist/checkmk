@@ -35,7 +35,7 @@ def run_script(work_python: Path, *, script: Path) -> tuple[int, str, str]:
     "script,expected_code,expected_pipe,expected_err",
     [
         (
-            Path("..\\..\\..\\..\\..\\enterprise\\agents\\plugins\\cmk_update_agent.py"),
+            Path("..\\..\\..\\..\\..\\non-free\\cmk-update-agent\\cmk_update_agent.py"),
             1,
             "",
             "Missing config file at .\\cmk-update-agent.cfg. Configuration",
@@ -54,9 +54,9 @@ def run_script(work_python: Path, *, script: Path) -> tuple[int, str, str]:
         ),
     ],
 )
-def test_other_scripts(  # type: ignore[no-untyped-def]
+def test_other_scripts(
     python_to_test: Path, script: Path, expected_code: int, expected_pipe: str, expected_err: str
-):
+) -> None:
     pythons = python_to_test
     for python_name in os.listdir(pythons):
         # Call the script using deployed python as client does

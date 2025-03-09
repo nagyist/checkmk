@@ -3,23 +3,15 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-from collections.abc import (
-    Collection,
-    Iterable,
-    Iterator,
-    KeysView,
-    Mapping,
-    MutableMapping,
-    Sequence,
-)
+from collections.abc import Collection, Iterator, KeysView, Mapping, MutableMapping, Sequence
 from re import Pattern
-from typing import Any, Literal, TypedDict, Union
+from typing import Any, Literal, TypeAlias, TypedDict
 
-from cmk.utils.exceptions import MKException
+from cmk.ccc.exceptions import MKException
+
 from cmk.utils.translations import TranslationOptions
-from cmk.utils.type_defs import Seconds
 
-TextPattern = str | Pattern[str] | None
+TextPattern = str | Pattern[str]
 TextMatchResult = Literal[False] | Sequence[str]
 
 
@@ -35,7 +27,7 @@ class UseSNMPTrapTranslation(TypedDict, total=False):
     add_description: Literal[True]
 
 
-SNMPTrapTranslation = Union[Literal[False], tuple[Literal[True], UseSNMPTrapTranslation]]
+SNMPTrapTranslation = Literal[False] | tuple[Literal[True], UseSNMPTrapTranslation]
 
 
 class EMailActionConfig(TypedDict):
@@ -80,6 +72,7 @@ class EventLimits(TypedDict):
 
 LogLevel = int
 
+# TODO: Use keys which are valid identifiers
 LogConfig = TypedDict(
     "LogConfig",
     {
@@ -107,12 +100,18 @@ class Replication(ReplicationBase, total=False):
 
 
 class ContactGroups(TypedDict):
-    groups: Iterable[str]
+    groups: Collection[str]
     notify: bool
     precedence: Literal["host", "rule"]
 
 
+# number of second with an optional timzone offest from UTC in hours
+ExpectInterval: TypeAlias = int | tuple[int, int]
+
+
 class Expect(TypedDict):
+    interval: ExpectInterval
+    count: int
     merge: Literal["open", "acked", "never"]
 
 
@@ -124,44 +123,57 @@ class ServiceLevel(TypedDict):
 StatePatterns = TypedDict(
     "StatePatterns",
     {
-        "0": str,
-        "1": str,
-        "2": str,
+        "0": TextPattern,
+        "1": TextPattern,
+        "2": TextPattern,
     },
     total=False,
 )
 
-State = Union[
-    Literal[-1, 0, 1, 2, 3],
-    tuple[Literal["text_pattern"], StatePatterns],
-]
+State = Literal[-1, 0, 1, 2, 3] | tuple[Literal["text_pattern"], StatePatterns]
+
+
+class Count(TypedDict):
+    count: int
+    period: int  # seconds
+    algorithm: Literal["interval", "tokenbucket", "dynabucket"]
+    count_duration: int | None  # seconds
+    count_ack: bool
+    separate_host: bool
+    separate_application: bool
+    separate_match_groups: bool
 
 
 # TODO: This is only a rough approximation.
 class Rule(TypedDict, total=False):
-    actions: Iterable[str]
+    actions: Collection[str]
     actions_in_downtime: bool
     autodelete: bool
-    cancel_actions: Iterable[str]
+    cancel_actions: Collection[str]
     cancel_action_phases: str
-    cancel_application: str
+    cancel_application: TextPattern
     cancel_priority: tuple[int, int]
+    comment: str
     contact_groups: ContactGroups
-    count: int
+    count: Count
+    customer: str  # TODO: This is a GUI-only feature, which doesn't belong here at all.
+    description: str
+    docu_url: str
     disabled: bool
     expect: Expect
+    event_limit: EventLimit
     hits: int
     id: str
     invert_matching: bool
-    livetime: tuple[Seconds, Iterable[Literal["open", "ack"]]]
+    livetime: tuple[int, Collection[Literal["open", "ack"]]]
     match: TextPattern
-    match_application: str
+    match_application: TextPattern
     match_facility: int
-    match_host: str
+    match_host: TextPattern
     match_ipaddress: str
     match_ok: TextPattern
     match_priority: tuple[int, int]
-    match_site: Iterable[str]
+    match_site: Collection[str]
     match_sl: tuple[int, int]
     match_timeperiod: str
     pack: str
@@ -172,21 +184,22 @@ class Rule(TypedDict, total=False):
     set_text: str
     sl: ServiceLevel
     state: State
+    drop: bool | Literal["skip_pack"]
 
 
 class ECRulePackSpec(TypedDict, total=False):
     id: str
     title: str
     disabled: bool
-    rules: Collection[Any]  # TODO: This should actually be Collection[Rule]
+    rules: Collection[Rule]
     customer: str  # TODO: This is a GUI-only feature, which doesn't belong here at all.
 
 
 class MkpRulePackBindingError(MKException):
-    """Base class for exceptions related to rule pack binding"""
+    """Base class for exceptions related to rule pack binding."""
 
 
-class MkpRulePackProxy(MutableMapping[str, Any]):  # pylint: disable=too-many-ancestors
+class MkpRulePackProxy(MutableMapping[str, Any]):
     """
     An object of this class represents an entry (i.e. a rule pack) in
     mkp_rule_packs. It is used as a reference to an EC rule pack
@@ -232,13 +245,13 @@ class MkpRulePackProxy(MutableMapping[str, Any]):  # pylint: disable=too-many-an
         return len(self.keys())
 
     def keys(self) -> KeysView[str]:
-        """List of keys of this rule pack"""
+        """List of keys of this rule pack."""
         if self.rule_pack is None:
             raise MkpRulePackBindingError("Proxy is not bound")
         return self.rule_pack.keys()
 
     def bind_to(self, mkp_rule_pack: ECRulePackSpec) -> None:
-        """Binds this rule pack to the given MKP rule pack"""
+        """Binds this rule pack to the given MKP rule pack."""
         if self.id_ != mkp_rule_pack["id"]:
             raise MkpRulePackBindingError(
                 f"The IDs of {self} and {mkp_rule_pack} cannot be different."
@@ -298,13 +311,13 @@ class SNMPCredentialBase(TypedDict):
 
 
 class SNMPCredential(SNMPCredentialBase, total=False):
-    engine_ids: Iterable[str]
+    engine_ids: Collection[str]
 
 
 # This is what we get from the outside.
 class ConfigFromWATO(TypedDict):
     actions: Sequence[Action]
-    archive_mode: Literal["file", "mongodb"]
+    archive_mode: Literal["file", "mongodb", "sqlite"]
     archive_orphans: bool
     debug_rules: bool
     event_limit: EventLimits
@@ -322,7 +335,9 @@ class ConfigFromWATO(TypedDict):
     rule_optimizer: bool
     rule_packs: Sequence[ECRulePack]
     rules: Collection[Rule]
-    snmp_credentials: Iterable[SNMPCredential]
+    sqlite_housekeeping_interval: int
+    sqlite_freelist_size: int
+    snmp_credentials: Collection[SNMPCredential]
     socket_queue_len: int
     statistics_interval: int
     translate_snmptraps: SNMPTrapTranslation

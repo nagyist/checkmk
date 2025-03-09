@@ -4,23 +4,12 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 
-from typing import Final
+from collections.abc import Mapping
+from typing import Final, Literal
 
-from cmk.base.plugins.agent_based.agent_based_api.v1 import any_of, contains
+from cmk.plugins.lib.cisco_ucs import DETECT
 
-DETECT = any_of(
-    contains(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.9.1.1682"),
-    contains(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.9.1.1683"),
-    contains(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.9.1.1684"),
-    contains(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.9.1.1685"),
-    contains(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.9.1.2178"),
-    contains(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.9.1.2424"),
-    contains(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.9.1.2492"),
-    contains(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.9.1.2493"),
-)
-
-
-map_operability: Final = {
+MAP_OPERABILITY: Final[Mapping[str, tuple[Literal[0, 1, 2], str]]] = {
     "0": (2, "unknown"),
     "1": (0, "operable"),
     "2": (2, "inoperable"),
@@ -53,7 +42,7 @@ map_operability: Final = {
     "108": (1, "linkActivateBlocked"),
 }
 
-map_presence: Final = {
+MAP_PRESENCE: Final[Mapping[str, tuple[Literal[0, 1, 2], str]]] = {
     "0": (1, "unknown"),
     "1": (0, "empty"),
     "10": (0, "equipped"),
@@ -75,3 +64,5 @@ map_presence: Final = {
     "104": (2, "equippedDiscError"),
     "105": (1, "equippedDiscUnknown"),
 }
+
+__all__ = ["DETECT", "MAP_OPERABILITY", "MAP_PRESENCE"]

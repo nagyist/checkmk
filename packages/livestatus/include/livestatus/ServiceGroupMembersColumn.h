@@ -13,12 +13,12 @@
 
 #include "livestatus/Filter.h"
 #include "livestatus/ListColumn.h"
-#include "livestatus/ListFilter.h"  // IWYU pragma: keep
 #include "livestatus/Row.h"
-#include "livestatus/opids.h"
-enum class ServiceState;
+
+class ListFilter;
 class Logger;
-class ListRenderer;
+enum class RelationalOperator;
+enum class ServiceState;
 class User;
 
 namespace column::service_group_members {
@@ -57,7 +57,7 @@ private:
     verbosity verbosity_;
 };
 
-template <class T, class U>
+template <typename T, typename U>
 struct ServiceGroupMembersColumn : ListColumn<T, U> {
     using ListColumn<T, U>::ListColumn;
     [[nodiscard]] std::unique_ptr<Filter> createFilter(
@@ -74,7 +74,7 @@ inline std::string serialize<::column::service_group_members::Entry>(
 }
 }  // namespace column::detail
 
-template <class T, class U>
+template <typename T, typename U>
 std::unique_ptr<Filter> ServiceGroupMembersColumn<T, U>::createFilter(
     Filter::Kind kind, RelationalOperator relOp,
     const std::string &value) const {

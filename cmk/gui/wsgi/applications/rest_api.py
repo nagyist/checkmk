@@ -4,17 +4,17 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 from __future__ import annotations
 
-import functools
 import http.client
 import json
 import logging
-import mimetypes
 import traceback
 import urllib.parse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
-from typing import Any, Sequence, TYPE_CHECKING
+from typing import Any, Literal, NotRequired, TYPE_CHECKING, TypedDict
+from wsgiref.types import StartResponse, WSGIApplication, WSGIEnvironment
 
 from apispec.yaml_utils import dict_to_yaml
 from flask import g, send_from_directory
@@ -22,22 +22,27 @@ from marshmallow import fields as ma_fields
 from werkzeug.exceptions import HTTPException
 from werkzeug.routing import Map, Rule, Submount
 
-import cmk.utils.version as cmk_version
-from cmk.utils import crash_reporting, paths
-from cmk.utils.exceptions import MKException
-from cmk.utils.type_defs import HTTPMethod
+from livestatus import SiteId
 
-from cmk.gui import config, session
+import cmk.ccc.version as cmk_version
+from cmk.ccc import crash_reporting, store
+from cmk.ccc.exceptions import MKException
+from cmk.ccc.site import omd_site
+
+from cmk.utils import paths
+
+from cmk.gui import session
 from cmk.gui.exceptions import MKAuthException, MKHTTPException, MKUserError
 from cmk.gui.http import request, Response
-from cmk.gui.logged_in import LoggedInNobody, user
-from cmk.gui.openapi import add_once, ENDPOINT_REGISTRY, generate_data
-from cmk.gui.plugins.openapi.restful_objects import Endpoint
-from cmk.gui.plugins.openapi.restful_objects.parameters import (
+from cmk.gui.logged_in import LoggedInNobody, LoggedInSuperUser, user
+from cmk.gui.openapi import endpoint_registry
+from cmk.gui.openapi.restful_objects import Endpoint
+from cmk.gui.openapi.restful_objects.parameters import (
     HEADER_CHECKMK_EDITION,
     HEADER_CHECKMK_VERSION,
 )
-from cmk.gui.plugins.openapi.utils import (
+from cmk.gui.openapi.spec.utils import spec_path
+from cmk.gui.openapi.utils import (
     EXT,
     GeneralRestAPIException,
     problem,
@@ -49,11 +54,11 @@ from cmk.gui.plugins.openapi.utils import (
 from cmk.gui.wsgi.applications.utils import AbstractWSGIApp
 from cmk.gui.wsgi.wrappers import ParameterDict
 
-if TYPE_CHECKING:
-    # TODO: Directly import from wsgiref.types in Python 3.11, without any import guard
-    from _typeshed.wsgi import StartResponse, WSGIApplication, WSGIEnvironment
+from cmk.crypto import MKCryptoException
 
-    from cmk.gui.plugins.openapi.restful_objects.type_defs import EndpointTarget
+if TYPE_CHECKING:
+    from cmk.gui.http import HTTPMethod
+    from cmk.gui.openapi.restful_objects.type_defs import EndpointTarget
     from cmk.gui.wsgi.type_defs import WSGIResponse
 
 ARGS_KEY = "CHECK_MK_REST_API_ARGS"
@@ -73,26 +78,33 @@ def _get_header_name(header: Mapping[str, ma_fields.String]) -> str:
 
 
 def crash_report_response(exc: Exception) -> WSGIApplication:
-    site = config.omd_site()
-    details: dict[str, Any] = {}
+    site = omd_site()
+    details = RestAPIDetails(
+        crash_report_url={},
+        request_info=RequestInfo(
+            method="missing",
+            data_received="missing",
+            headers={"accept": "missing", "content_type": "missing"},
+        ),
+        check_mk_info={},
+    )
 
     if isinstance(exc, GeneralRestAPIException):
-        details["rest_api_exception"] = {
-            "description": exc.description,
-            "detail": exc.detail,
-            "ext": exc.ext,
-            "fields": exc.fields,
-        }
+        details["rest_api_exception"] = RestAPIException(
+            description=exc.description,
+            detail=exc.detail,
+            ext=exc.ext,
+            fields=exc.fields,
+        )
 
-    details["request_info"] = {
-        "method": request.environ["REQUEST_METHOD"],
-        "data_received": request.json if request.data else "",
-        "endpoint_url": request.path,
-        "headers": {
+    details["request_info"] = RequestInfo(
+        method=request.environ["REQUEST_METHOD"],
+        data_received=request.json if request.data else "",
+        headers={
             "accept": request.environ.get("HTTP_ACCEPT", "missing"),
             "content_type": request.environ.get("CONTENT_TYPE", "missing"),
         },
-    }
+    )
 
     details["check_mk_info"] = {
         "site": site,
@@ -103,7 +115,12 @@ def crash_report_response(exc: Exception) -> WSGIApplication:
         },
     }
 
-    crash = APICrashReport.from_exception(details=details)
+    crash = APICrashReport(
+        paths.crash_dir,
+        APICrashReport.make_crash_info(
+            cmk_version.get_general_version_infos(paths.omd_root), details
+        ),
+    )
     crash_reporting.CrashReportStore().save(crash)
     logger.exception("Unhandled exception (Crash-ID: %s)", crash.ident_to_text())
 
@@ -122,9 +139,8 @@ def crash_report_response(exc: Exception) -> WSGIApplication:
 
     del crash.crash_info["exc_traceback"]
     if user.may("general.see_crash_reports"):
-        crash.crash_info["exc_traceback"] = traceback.format_exc().split("\n")
+        crash.crash_info["exc_traceback"] = traceback.format_exc().split("\n")  # type: ignore[typeddict-item]
 
-    crash.crash_info["time"] = datetime.fromtimestamp(crash.crash_info["time"]).isoformat()
     crash_msg = (
         exc.description
         if isinstance(exc, GeneralRestAPIException)
@@ -135,7 +151,12 @@ def crash_report_response(exc: Exception) -> WSGIApplication:
         status=500,
         title="Internal Server Error",
         detail=f"{crash.crash_info['exc_type']}: {crash_msg}. Crash report generated. Please submit.",
-        ext=EXT(crash.crash_info),
+        ext=EXT(
+            {
+                **crash.crash_info,
+                **{"time": datetime.fromtimestamp(float(crash.crash_info["time"])).isoformat()},
+            }
+        ),
     )
 
 
@@ -160,30 +181,12 @@ class EndpointAdapter(AbstractWSGIApp):
             wsgi_app = self.endpoint.wrapped(ParameterDict(path_args))
 
         wsgi_app.headers[_get_header_name(HEADER_CHECKMK_VERSION)] = cmk_version.__version__
-        wsgi_app.headers[_get_header_name(HEADER_CHECKMK_EDITION)] = cmk_version.edition().short
+        wsgi_app.headers[_get_header_name(HEADER_CHECKMK_EDITION)] = cmk_version.edition(
+            paths.omd_root
+        ).short
 
         # Serve the response
         return wsgi_app(environ, start_response)
-
-
-@functools.lru_cache
-def serve_file(  # type: ignore[no-untyped-def]
-    file_name: str,
-    content: bytes,
-    default_content_type="text/plain; charset=utf-8",
-) -> Response:
-    """Construct and cache a Response from a static file."""
-    content_type, _ = mimetypes.guess_type(file_name)
-
-    resp = Response()
-    resp.direct_passthrough = True
-    resp.data = content
-    if content_type is not None:
-        resp.headers["Content-Type"] = content_type
-    else:
-        resp.headers["Content-Type"] = default_content_type
-    resp.freeze()
-    return resp
 
 
 def get_url(environ: WSGIEnvironment) -> str:
@@ -241,56 +244,124 @@ def get_filename_from_url(url: str) -> str:
     return Path(urllib.parse.urlparse(url).path).name
 
 
-@functools.lru_cache(maxsize=512)
-def serve_spec(
-    site: str,
+def _serve_spec(
     target: EndpointTarget,
     url: str,
-    content_type: str,
-    serializer: Callable[[dict[str, Any]], str],
+    extension: Literal["yaml", "json"],
 ) -> Response:
-    data = generate_data(target=target)
-    data.setdefault("servers", [])
-    add_once(
-        data["servers"],
-        {
-            "url": url,
-            "description": f"Site: {site}",
-        },
-    )
+    match extension:
+        case "yaml":
+            content_type = "application/x-yaml; charset=utf-8"
+        case "json":
+            content_type = "application/json"
+
     response = Response(status=200)
-    response.data = serializer(data)
+    response.data = _serialize_spec_cached(target, url, extension)
     response.content_type = content_type
     response.freeze()
     return response
 
 
+def _serialize_spec_cached(
+    target: EndpointTarget,
+    url: str,
+    extension: Literal["yaml", "json"],
+) -> str:
+    spec_mtime = spec_path(target).stat().st_mtime
+    url_hash = sha256(url.encode("utf-8")).hexdigest()
+    cache_file = paths.tmp_dir / "rest_api" / "spec_cache" / f"{target}-{extension}-{url_hash}.spec"
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if cache_file.stat().st_mtime > spec_mtime:
+            return cache_file.read_text()
+    except FileNotFoundError:
+        pass
+
+    serialized = _serialize_spec(target, url, extension)
+    cache_file.write_text(serialized)
+    return serialized
+
+
+def _serialize_spec(target: EndpointTarget, url: str, extension: Literal["yaml", "json"]) -> str:
+    serialize: Callable[[dict[str, Any]], str]
+    match extension:
+        case "yaml":
+            serialize = dict_to_yaml
+        case "json":
+            serialize = json.dumps
+    return serialize(_add_site_server(_read_spec(target), omd_site(), url))
+
+
+def _read_spec(target: EndpointTarget) -> dict[str, Any]:
+    path = spec_path(target)
+    spec = store.load_object_from_file(path, default={})
+    if not spec:
+        raise ValueError(f"Failed to load spec from {path}")
+    return spec
+
+
+def _add_site_server(spec: dict[str, Any], site: SiteId, url: str) -> dict[str, Any]:
+    """Add the server URL to the spec
+
+    This step needs to happen with the current request context at hand to
+    be able to add the protocol and URL currently being used by the client
+    """
+    spec.setdefault("servers", [])
+    add_once(
+        spec["servers"],
+        {
+            "url": url,
+            "description": f"Site: {site}",
+        },
+    )
+    return spec
+
+
+def add_once(coll: list[dict[str, Any]], to_add: dict[str, Any]) -> None:
+    """Add an entry to a collection, only once.
+
+    Examples:
+
+        >>> l = []
+        >>> add_once(l, {'foo': []})
+        >>> l
+        [{'foo': []}]
+
+        >>> add_once(l, {'foo': []})
+        >>> l
+        [{'foo': []}]
+
+    Args:
+        coll:
+        to_add:
+
+    Returns:
+
+    """
+    if to_add in coll:
+        return None
+
+    coll.append(to_add)
+    return None
+
+
 class ServeSpec(AbstractWSGIApp):
-    def __init__(self, target: EndpointTarget, extension: str, debug: bool = False) -> None:
+    def __init__(
+        self, target: EndpointTarget, extension: Literal["yaml", "json"], debug: bool = False
+    ) -> None:
         super().__init__(debug)
         self.target = target
         self.extension = extension
 
     def wsgi_app(self, environ: WSGIEnvironment, start_response: StartResponse) -> WSGIResponse:
-        serializers = {"yaml": dict_to_yaml, "json": json.dumps}
-        content_types = {
-            "json": "application/json",
-            "yaml": "application/x-yaml; charset=utf-8",
-        }
-
-        def _site(_environ: WSGIEnvironment) -> str:
-            path_info = _environ["PATH_INFO"].split("/")
-            return path_info[1]
-
         def _url(_environ: WSGIEnvironment) -> str:
             return "/".join(get_url(_environ).split("/")[:-1])
 
-        return serve_spec(
-            site=_site(environ),
+        return _serve_spec(
             target=self.target,
             url=_url(environ),
-            content_type=content_types[self.extension],
-            serializer=serializers[self.extension],
+            extension=self.extension,
         )(environ, start_response)
 
 
@@ -308,8 +379,8 @@ class ServeSwaggerUI(AbstractWSGIApp):
         )
 
 
-def ensure_authenticated(persist: bool = True) -> None:
-    session.session.persist_session = persist
+def _ensure_authenticated() -> None:
+    session.session.is_gui_session = False
     if session.session.user is None or isinstance(session.session.user, LoggedInNobody):
         # As a user we want the most specific error messages. Due to the errors being
         # generated at the start of the request, where it isn't clear if Checkmk or RESTAPI
@@ -317,16 +388,19 @@ def ensure_authenticated(persist: bool = True) -> None:
         if session.session.exc:
             raise session.session.exc
         raise MKAuthException("You need to be logged in to access this resource.")
+    if session.session.two_factor_pending():
+        raise MKAuthException("Two-factor authentication required.")
 
 
 class CheckmkRESTAPI(AbstractWSGIApp):
-    def __init__(self, debug: bool = False) -> None:
+    def __init__(self, debug: bool = False, testing: bool = False) -> None:
         super().__init__(debug)
         # This intermediate data structure is necessary because `Rule`s can't contain anything
         # other than str anymore. Technically they could, but the typing is now fixed to str.
         self._endpoints: dict[str, AbstractWSGIApp] = {}
         self._url_map: Map | None = None
         self._rules: list[Rule] = []
+        self.testing = testing
 
     def _build_url_map(self) -> Map:
         self._endpoints.clear()
@@ -359,11 +433,7 @@ class CheckmkRESTAPI(AbstractWSGIApp):
         )
 
         endpoint: Endpoint
-        for endpoint in ENDPOINT_REGISTRY:
-            if self.debug:
-                # This helps us to make sure we can always generate a valid OpenAPI yaml file.
-                _ = endpoint.to_operation_dict()
-
+        for endpoint in endpoint_registry:
             self.add_rule(
                 [endpoint.default_path],
                 EndpointAdapter(endpoint),
@@ -427,7 +497,16 @@ class CheckmkRESTAPI(AbstractWSGIApp):
             # credentials, but accessing the REST API will never touch the session store. We also
             # don't want to have cookies sent to the HTTP client whenever one is logged in using
             # the header methods.
-            ensure_authenticated(persist=False)
+            _ensure_authenticated()
+
+            # A Checmk Reserved endpoint can only be accessed with the site secret
+            if (
+                isinstance(wsgi_endpoint, EndpointAdapter)
+                and wsgi_endpoint.endpoint.internal_user_only
+                and not isinstance(session.session.user, LoggedInSuperUser)
+            ):
+                raise MKAuthException("This endpoint is reserved for Checkmk.")
+
             return wsgi_endpoint(environ, start_response)
 
         except ProblemException as exc:
@@ -458,8 +537,8 @@ class CheckmkRESTAPI(AbstractWSGIApp):
                 detail=str(exc),
             )
 
-        except MKException as exc:
-            if self.debug:
+        except (MKException, MKCryptoException) as exc:
+            if self.debug and not self.testing:
                 raise
             response = problem(
                 status=EXCEPTION_STATUS.get(type(exc), 500),
@@ -468,14 +547,34 @@ class CheckmkRESTAPI(AbstractWSGIApp):
             )
 
         except Exception as exc:
-            if self.debug:
+            if self.debug and not self.testing:
                 raise
             response = crash_report_response(exc)
 
         return response(environ, start_response)
 
 
-class APICrashReport(crash_reporting.ABCCrashReport):
+class RestAPIException(TypedDict):
+    description: str
+    detail: str
+    ext: dict[str, Any] | None
+    fields: dict[str, Any] | None
+
+
+class RequestInfo(TypedDict):
+    data_received: Any
+    method: str
+    headers: dict[str, Any]
+
+
+class RestAPIDetails(TypedDict):
+    crash_report_url: dict[str, Any]
+    rest_api_exception: NotRequired[RestAPIException]
+    request_info: RequestInfo
+    check_mk_info: dict[str, Any]
+
+
+class APICrashReport(crash_reporting.ABCCrashReport[RestAPIDetails]):
     """API specific crash reporting class."""
 
     @classmethod

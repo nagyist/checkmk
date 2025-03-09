@@ -5,25 +5,25 @@
 
 """Realizes the popup action menu for hosts/services in views"""
 
-from livestatus import SiteId
+from livestatus import livestatus_lql, SiteId
 
-from cmk.utils.prediction import livestatus_lql
-from cmk.utils.type_defs import HostName, ServiceName
+from cmk.utils.hostaddress import HostName
+from cmk.utils.servicename import ServiceName
 
-import cmk.gui.sites as sites
+from cmk.gui import sites
 from cmk.gui.display_options import display_options
 from cmk.gui.htmllib.html import html
 from cmk.gui.http import request
 from cmk.gui.i18n import _
+from cmk.gui.painter.v0.helpers import replace_action_url_macros, transform_action_url
 from cmk.gui.type_defs import Row
 
-from ..painter.v0.helpers import replace_action_url_macros, transform_action_url
 from .painter import get_icons, IconEntry, IconObjectType, iconpainter_columns, LegacyIconEntry
 
 
 def ajax_popup_action_menu() -> None:
     site = SiteId(request.get_ascii_input_mandatory("site"))
-    host = HostName(request.get_ascii_input_mandatory("host"))
+    host = request.get_validated_type_input_mandatory(HostName, "host")
     svcdesc = request.get_str_input("service")
     what: IconObjectType = "service" if svcdesc else "host"
 
@@ -36,7 +36,7 @@ def ajax_popup_action_menu() -> None:
     for icon in icons:
         if isinstance(icon, LegacyIconEntry):
             html.open_li()
-            html.write_text(icon.code)
+            html.write_text_permissive(icon.code)
             html.close_li()
         elif isinstance(icon, IconEntry):
             html.open_li()
@@ -51,9 +51,9 @@ def ajax_popup_action_menu() -> None:
 
             html.icon(icon.icon_name)
             if icon.title:
-                html.write_text(icon.title)
+                html.write_text_permissive(icon.title)
             else:
-                html.write_text(_("No title"))
+                html.write_text_permissive(_("No title"))
             if icon.url_spec:
                 html.close_a()
             html.close_li()

@@ -1,0 +1,10 @@
+title: GCP Cloud SQL: Summary
+agents: gcp
+catalog: cloud/gcp
+license: GPLv2
+distribution: check_mk
+description:
+ This check counts number of databases.
+
+discovery:
+ One service is created for all databases in this project.

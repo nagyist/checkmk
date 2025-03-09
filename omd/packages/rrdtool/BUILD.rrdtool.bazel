@@ -1,0 +1,114 @@
+load("@rules_foreign_cc//foreign_cc:defs.bzl", "configure_make")
+
+MAKE_PARALLEL = "-j4"
+
+filegroup(
+    name = "all_srcs",
+    srcs = glob(
+        ["**/*"],
+        exclude = ["bazel-*"],
+    ),
+)
+
+configure_make(
+    name = "rrdtool",
+    args = ["%s" % MAKE_PARALLEL],
+    build_data = [
+        "@omd_packages//omd/packages/perl-modules:perl-modules.tar",
+    ],
+    configure_in_place = True,
+    configure_options = [
+        "--verbose",
+        "--disable-ruby",
+        "--disable-libwrap",
+        "--enable-perl-site-install",
+        "--disable-tcl",
+        "--disable-lua",
+        "--disable-rrdcgi",
+        "--disable-libdbi",
+        "--disable-python",
+        "--with-systemdsystemunitdir=no",
+        "--with-perl-options='LIB=$${EXT_BUILD_DEPS}/lib/perl5/lib/perl5'",
+        "CFLAGS='-Dredacted=\"redacted\"'",
+        # Give up on pkg-config.  It's broken after updating foreign_cc
+        # from 0.9.  We should switch to an entirely bazel-native solution
+        # for this dependency soonish anyway.
+        "PKGCONFIG='no'",
+        "CPPFLAGS='" + " ".join([
+            "-I/usr/include/blkid",
+            "-I/usr/include/cairo",
+            "-I/usr/include/freetype2",
+            "-I/usr/include/fribidi",
+            "-I/usr/include/glib-2.0",
+            "-I/usr/include/harfbuzz",
+            "-I/usr/include/libmount",
+            "-I/usr/include/libpng16",
+            "-I/usr/include/libxml2",
+            "-I/usr/include/pango-1.0",
+            "-I/usr/include/pixman-1",
+            "-I/usr/include/uuid",
+            "-I/usr/lib64/glib-2.0",
+            "-I/usr/lib64/glib-2.0/include",
+            "-I/usr/lib/x86_64-linux-gnu/glib-2.0/include",
+        ]) + "'",
+    ],
+    copts = [
+        "-I$BUILD_TMPDIR/include",
+        "-Wno-stringop-overflow",
+    ],
+    env = {
+        "ORIGIN_VAR": "\\\\$$\\$$ORIGIN",
+        "RANLIB": "ranlib",
+        "PERL_DIR": "$$EXT_BUILD_DEPS/omd/packages/perl-modules",
+        "CFLAGS": "'-Dredacted=\"redacted\"'",
+        "top_builddir": ".",
+    },
+    install_prefix = "$INSTALLDIR",
+    lib_source = ":all_srcs",
+    linkopts = [
+        "-lcairo",
+        "-lglib-2.0",
+        "-lgobject-2.0",
+        "-lpango-1.0",
+        "-lpangocairo-1.0",
+        "-lpng",
+    ],
+    out_binaries = [
+    ],
+    out_data_dirs = [
+        "lib/perl5/lib/perl5/",
+    ],
+    out_headers_only = True,
+    out_shared_libs = [
+    ],
+    out_static_libs = [
+    ],
+    postfix_script = """
+        # The install step doesn't put the perl bindings where we
+        # expect them.  So let's copy them here.
+        LPLP="lib/perl5/lib/perl5"
+        cp -R ${INSTALLDIR}${EXT_BUILD_DEPS}/$LPLP/* ${INSTALLDIR}/$LPLP
+        # remove unnecessary folders
+        rm -rf ${INSTALLDIR}/{home,usr}
+    """,
+    targets = [
+        "-C po all",
+        "-C src all",
+        "-C tests all",
+        "-C etc all",
+        # Explicitly require perl bindings to make sure
+        # we fail if they are not built.
+        "-C bindings perl-piped",
+        "-C bindings perl-shared",
+        # DESTDIR for Perl, since the prefix is not honored
+        "DESTDIR=$INSTALLDIR -C bindings install",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "perl_bindings_gen_dir",
+    srcs = [":rrdtool"],
+    output_group = "gen_dir",
+    visibility = ["//visibility:public"],
+)

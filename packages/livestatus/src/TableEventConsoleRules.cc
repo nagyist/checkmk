@@ -11,8 +11,7 @@
 #include "livestatus/IntColumn.h"
 #include "livestatus/StringColumn.h"
 
-TableEventConsoleRules::TableEventConsoleRules(MonitoringCore *mc)
-    : TableEventConsole{mc} {
+TableEventConsoleRules::TableEventConsoleRules() {
     const ColumnOffsets offsets{};
     addColumn(
         ECRow::makeStringColumn("rule_id", "The ID of the rule", offsets));

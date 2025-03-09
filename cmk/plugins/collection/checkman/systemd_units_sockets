@@ -1,0 +1,22 @@
+title: Systemd Sockets
+agents: linux
+catalog: os/ps
+license: GPLv2
+distribution: check_mk
+description:
+ This check monitors the state of linux sockets provided by
+ the systemctl command 'systemctl --all'.
+ The check reports the 'active' attribute of the discovered sockets
+ and their description. The state mapping is configurable, by default
+ active and inactive states are OK, failed and all others are CRIT.
+
+item:
+ The socket unit name.
+
+discovery:
+ By default, no sockets are discovered. For a socket to be discovered it has to
+ match the conditions in the ruleset "Systemd single socket discovery".
+ Moreover, only systemd units listed by 'systemctl --all' are considered. It is
+ not sufficient for the socket to be listed by 'systemctl list-unit-files'.
+ Note, that even if a systemd unit is 'loaded', this does not mean it will be
+ listed by 'systemctl --all'.

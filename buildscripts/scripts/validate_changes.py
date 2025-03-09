@@ -17,12 +17,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
-from distutils.util import strtobool
-from functools import reduce
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -39,8 +38,11 @@ class StageInfo(TypedDict, total=False):
     NAME: str
     ONLY_WHEN_NOT_EMPTY: str
     DIR: str
-    ENV_VARS: Mapping[str, str]
+    ENV_VARS: Vars
     ENV_VAR_LIST: Sequence[str]
+    SEC_VAR_LIST: Sequence[str]
+    JENKINS_API_ACCESS: bool
+    BAZEL_LOCKS_AMOUNT: int
     COMMAND: str
     TEXT_ON_SKIP: str
     SKIPPED: str
@@ -112,6 +114,9 @@ def to_stage_info(raw_stage: Mapping[Any, Any]) -> StageInfo:
         ONLY_WHEN_NOT_EMPTY=str(raw_stage.get("ONLY_WHEN_NOT_EMPTY", "")),
         DIR=str(raw_stage.get("DIR", "")),
         ENV_VARS={str(k): str(v) for k, v in raw_stage.get("ENV_VARS", {}).items()},
+        SEC_VAR_LIST=list(raw_stage.get("SEC_VAR_LIST", [])),
+        JENKINS_API_ACCESS=bool(raw_stage.get("JENKINS_API_ACCESS", False)),
+        BAZEL_LOCKS_AMOUNT=int(raw_stage.get("BAZEL_LOCKS_AMOUNT", -1)),
         COMMAND=str(raw_stage["COMMAND"]),
         TEXT_ON_SKIP=str(raw_stage.get("TEXT_ON_SKIP", "")),
         RESULT_CHECK_TYPE=str(raw_stage.get("RESULT_CHECK_TYPE", "")),
@@ -123,7 +128,7 @@ def load_file(filename: Path) -> tuple[Sequence[Vars], Stages]:
     """Read and parse a YAML file containing 'VARIABLES' and 'STAGES' and return a tuple with
     typed content"""
     try:
-        raw_data = yaml.load(Path.read_text(filename), Loader=yaml.BaseLoader)
+        raw_data = yaml.safe_load(Path.read_text(filename))
     except FileNotFoundError:
         raise RuntimeError(
             f"Could not find {filename}. Must be a YAML file containing stage declarations."
@@ -140,7 +145,12 @@ def replace_variables(string: str, env_vars: Vars) -> str:
     >>> replace_variables("foo: ${foo}", {"foo": "bar"})
     'foo: bar'
     """
-    return reduce(lambda s, kv: str.replace(s, f"${{{kv[0]}}}", kv[1]), env_vars.items(), string)
+
+    def replace_match(match: re.Match) -> str:
+        var_name = match.group(1)
+        return env_vars.get(var_name, match.group(0))
+
+    return re.sub(r"\$\{(\w+)\}", replace_match, string)
 
 
 def apply_variables(in_data: StageInfo, env_vars: Vars) -> StageInfo:
@@ -150,6 +160,9 @@ def apply_variables(in_data: StageInfo, env_vars: Vars) -> StageInfo:
         ONLY_WHEN_NOT_EMPTY=replace_variables(in_data["ONLY_WHEN_NOT_EMPTY"], env_vars),
         DIR=replace_variables(in_data["DIR"], env_vars),
         ENV_VARS={k: replace_variables(v, env_vars) for k, v in in_data["ENV_VARS"].items()},
+        SEC_VAR_LIST=list(in_data["SEC_VAR_LIST"]),
+        JENKINS_API_ACCESS=in_data.get("JENKINS_API_ACCESS", False),
+        BAZEL_LOCKS_AMOUNT=int(replace_variables(str(in_data["BAZEL_LOCKS_AMOUNT"]), env_vars)),
         COMMAND=replace_variables(in_data["COMMAND"], env_vars),
         TEXT_ON_SKIP=replace_variables(in_data["TEXT_ON_SKIP"], env_vars),
         RESULT_CHECK_TYPE=replace_variables(in_data["RESULT_CHECK_TYPE"], env_vars),
@@ -166,6 +179,9 @@ def finalize_stage(stage: StageInfo, env_vars: Vars, no_skip: bool) -> StageInfo
             NAME=stage["NAME"],
             DIR=stage.get("DIR", ""),
             ENV_VAR_LIST=[f"{k}={v}" for k, v in stage.get("ENV_VARS", {}).items()],
+            SEC_VAR_LIST=list(stage.get("SEC_VAR_LIST", [])),
+            JENKINS_API_ACCESS=stage.get("JENKINS_API_ACCESS", False),
+            BAZEL_LOCKS_AMOUNT=int(stage.get("BAZEL_LOCKS_AMOUNT", -1)),
             COMMAND=stage["COMMAND"],
             RESULT_CHECK_TYPE=stage["RESULT_CHECK_TYPE"],
             RESULT_CHECK_FILE_PATTERN=stage["RESULT_CHECK_FILE_PATTERN"],
@@ -174,7 +190,7 @@ def finalize_stage(stage: StageInfo, env_vars: Vars, no_skip: bool) -> StageInfo
         else StageInfo(  #
             NAME=stage["NAME"],
             SKIPPED=(
-                f'Reason: {stage.get("TEXT_ON_SKIP") or "not provided"},'
+                f"Reason: {stage.get('TEXT_ON_SKIP') or 'not provided'},"
                 f" Condition: {condition_vars}"
             ),
         )
@@ -192,11 +208,18 @@ def finalize_stage(stage: StageInfo, env_vars: Vars, no_skip: bool) -> StageInfo
 
 def run_shell_command(cmd: str, replace_newlines: bool) -> str:
     """Run a command and return preprocessed stdout"""
-    stdout_str = subprocess.check_output(["sh", "-c", cmd], text=True).strip()
+    with subprocess.Popen(
+        ["sh"],
+        text=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    ) as proc_sh:
+        stdout_str, _ = proc_sh.communicate(cmd)
+    stdout_str = stdout_str.strip()
     return stdout_str.replace("\n", " ") if replace_newlines else stdout_str
 
 
-def evaluate_vars(raw_vars: Sequence[Vars], env_vars: Vars) -> Mapping[str, str]:
+def evaluate_vars(raw_vars: Sequence[Vars], env_vars: Vars) -> Vars:
     """Evaluate receipts for variables. Make sure already evaluated variables can be used in
     later steps.
     >>> evaluate_vars([
@@ -225,11 +248,26 @@ def evaluate_vars(raw_vars: Sequence[Vars], env_vars: Vars) -> Mapping[str, str]
             )
 
         LOG.debug("evaluate %r run command %r", e["NAME"], cmd)
-        cmd_result = run_shell_command(cmd, bool(strtobool(e.get("REPLACE_NEWLINES", "false"))))
+        replace_newlines = convert_newline_entry_to_bool(e.get("REPLACE_NEWLINES", False))
+        cmd_result = run_shell_command(cmd, replace_newlines)
         LOG.debug("set to %r", cmd_result)
         result[e["NAME"]] = cmd_result
 
     return result
+
+
+def convert_newline_entry_to_bool(entry: str | bool) -> bool:
+    if isinstance(entry, str):
+        return entry.lower() in (
+            "y",
+            "yes",
+            "t",
+            "true",
+            "on",
+            "1",
+        )
+
+    return bool(entry)
 
 
 def compile_stage_info(stages_file: Path, env_vars: Vars, no_skip: bool) -> tuple[Vars, Stages]:
@@ -251,18 +289,28 @@ def compile_stage_info(stages_file: Path, env_vars: Vars, no_skip: bool) -> tupl
 
 async def run_cmd(
     cmd: str,
-    env: Mapping[str, str],
+    env: Vars,
     cwd: str | None,
-    check: bool,
-    stdout_fn: Callable[[str], None],
-    stderr_fn: Callable[[str], None],
+    stdout_prefix: str = "",
+    stderr_prefix: str = "",
+    output: list[str] | None = None,
 ) -> bool:
     """Run a command while continuously capturing its stdout/stdin and printing it out in a
     predefined way for either stdout or stderr"""
 
-    async def process_lines(stream: asyncio.StreamReader, proc_fn: Callable[[str], None]) -> None:
+    async def process_lines(
+        stream: asyncio.StreamReader,
+        prefix: str = "",
+        output: list[str] | None = None,
+    ) -> None:
         async for line in stream:
-            proc_fn(line.decode().rstrip())
+            l = line.decode()
+            if l.strip():
+                msg = f"{prefix}{l}"
+                if output is not None:
+                    output.append(msg)
+                else:
+                    print(msg)
 
     process = await asyncio.create_subprocess_exec(
         # Use `bash` rather than `sh` in order to provide things like `&>`
@@ -281,7 +329,8 @@ async def run_cmd(
 
     assert process.stdout and process.stderr
     await asyncio.gather(
-        process_lines(process.stdout, stdout_fn), process_lines(process.stderr, stderr_fn)
+        process_lines(process.stdout, stdout_prefix, output),
+        process_lines(process.stderr, stderr_prefix, output),
     )
     await process.wait()
 
@@ -289,7 +338,7 @@ async def run_cmd(
 
 
 async def run_locally(
-    stages: Stages, exitfirst: bool, filter_substring: str, verbosity: int
+    stages: Stages, exitfirst: bool, filter_substring: list[str], verbosity: int
 ) -> None:
     """Not yet implementd: run all stages by executing each command"""
     col = {
@@ -302,13 +351,13 @@ async def run_locally(
     results = {}
     for stage in stages:
         name = stage["NAME"]
-        if filter_substring and not any(map(lambda s: s.lower() in name.lower(), filter_substring)):
-            results[name] = f"SKIPPED Reason: none of {filter_substring!r} in name"
-            print(f"Stage {name!r}: {results[name]}")
-            continue
-
-        if "SKIPPED" in stage:
-            results[name] = f"SKIPPED {stage['SKIPPED']}"
+        filtered = filter_substring and any(_ in name for _ in filter_substring)
+        if "SKIPPED" in stage or filtered:
+            results[name] = (
+                f"SKIPPED Reason: none of {filter_substring!r} in name"
+                if filtered
+                else f"SKIPPED {stage['SKIPPED']}"
+            )
             print(f"Stage {name!r}: {results[name]}")
             continue
 
@@ -318,23 +367,14 @@ async def run_locally(
             LOG.debug("%s: %s", key, value)
 
         output: list[str] = []
-
         t_before = time.time()
         cmd_successful = await run_cmd(
             cmd=stage["COMMAND"],
             env=dict(v.split("=", 1) for v in stage["ENV_VAR_LIST"]),
             cwd=stage["DIR"] or None,
-            check=exitfirst,
-            stdout_fn=(
-                lambda l, name=name: (output.append if verbosity == 0 else print)(
-                    f"{col['bold']}{name}: {col['reset']}{l}"
-                )
-            ),
-            stderr_fn=(
-                lambda l, name=name: (output.append if verbosity == 0 else print)(
-                    f"{col['bold']}{name}: {col['purple']}stderr:{col['reset']} {l}"
-                )
-            ),
+            stdout_prefix=f"{col['bold']}{name}: {col['reset']}",
+            stderr_prefix=f"{col['bold']}{name}: {col['purple']}stderr:{col['reset']} ",
+            output=output if verbosity == 0 else None,
         )
         duration = time.time() - t_before
 
@@ -401,17 +441,16 @@ def main() -> None:
             print(f"  {file}")
 
     if args.write_file:
-        json.dump(
-            obj={
-                "VARIABLES": variables,
-                "STAGES": stages,
-            },
-            fp=sys.stdout if args.write_file == "-" else open(args.write_file, "w"),
-            indent=2,
-        )
+        obj = {"VARIABLES": variables, "STAGES": stages}
+        if args.write_file == "-":
+            json.dump(obj=obj, fp=sys.stdout, indent=2)
+        else:
+            with open(Path(args.write_file), "w", encoding="UTF-8") as f:
+                json.dump(obj=obj, fp=f, indent=2)
     else:
         print(f"Found {len(stages)} stage commands to run locally")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         loop.run_until_complete(
             run_locally(stages, args.exitfirst, args.filter_substring, args.verbose)
         )

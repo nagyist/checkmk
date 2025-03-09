@@ -3,8 +3,7 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 """Import top level modules into the application to make them able to register with the application."""
-# flake8: noqa
-# pylint: disable=unused-import
+# ruff: noqa: F401
 
 import cmk.gui.autocompleters
 import cmk.gui.bi
@@ -12,6 +11,7 @@ import cmk.gui.crash_reporting
 import cmk.gui.cron
 import cmk.gui.dashboard
 import cmk.gui.default_permissions
+import cmk.gui.graphing_main
 import cmk.gui.help
 import cmk.gui.hooks
 import cmk.gui.inventory
@@ -20,13 +20,12 @@ import cmk.gui.logwatch
 import cmk.gui.main
 import cmk.gui.main_menu
 import cmk.gui.message
-import cmk.gui.metrics
 import cmk.gui.mobile
-import cmk.gui.node_visualization
+import cmk.gui.nodevis
 import cmk.gui.notifications
 import cmk.gui.openapi
 import cmk.gui.prediction
-import cmk.gui.robotmk
+import cmk.gui.rulespec
 import cmk.gui.sidebar
 import cmk.gui.user_message
 import cmk.gui.userdb

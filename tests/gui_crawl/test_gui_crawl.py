@@ -5,14 +5,15 @@
 
 import asyncio
 import os
+from collections.abc import Iterable
 
 import pytest
 
-from tests.testlib.crawler import Crawler, Iterable, mutate_url_with_xss_payload, Url
+from tests.gui_crawl.crawler import Crawler, mutate_url_with_xss_payload, Url
 
 
 def test_crawl(test_crawler: Crawler) -> None:
-    asyncio.run(test_crawler.crawl(max_tasks=int(os.environ.get("GUI_CRAWLER_TASK_LIMIT", 5))))
+    asyncio.run(test_crawler.crawl(max_tasks=int(os.environ.get("GUI_CRAWLER_TASK_LIMIT", 7))))
 
 
 @pytest.mark.type("unit")

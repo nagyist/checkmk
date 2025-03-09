@@ -6,14 +6,27 @@ import time
 from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
-import cmk.utils.tags
-from cmk.utils.tags import TagGroupID
-from cmk.utils.type_defs import HostName, UserId
+from marshmallow import ValidationError
 
-import cmk.gui.hooks as hooks
-import cmk.gui.userdb as userdb
+import cmk.utils.tags
+from cmk.utils.hostaddress import HostName
+from cmk.utils.tags import TagGroupID
+from cmk.utils.user import UserId
+
 from cmk.gui import fields as gui_fields
+from cmk.gui import hooks, userdb
 from cmk.gui.exceptions import MKUserError
+from cmk.gui.form_specs.converter import TransformDataForLegacyFormatOrRecomposeFunction
+from cmk.gui.form_specs.generators.host_address import create_host_address
+from cmk.gui.form_specs.generators.setup_site_choice import create_setup_site_choice
+from cmk.gui.form_specs.generators.snmp_credentials import create_snmp_credentials
+from cmk.gui.form_specs.private import labels as fs_labels
+from cmk.gui.form_specs.private import ListOfStrings as FSListOfStrings
+from cmk.gui.form_specs.private import (
+    OptionalChoice,
+    SingleChoiceElementExtended,
+    SingleChoiceExtended,
+)
 from cmk.gui.htmllib.generator import HTMLWriter
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
@@ -51,12 +64,12 @@ from cmk.gui.valuespec import (
     ValueSpecText,
     ValueSpecValidateFunc,
 )
-from cmk.gui.watolib.attributes import IPMIParameters, SNMPCredentials
+from cmk.gui.watolib.attributes import create_ipmi_parameters, IPMIParameters, SNMPCredentials
 from cmk.gui.watolib.config_hostname import ConfigHostname
 from cmk.gui.watolib.host_attributes import (
     ABCHostAttributeNagiosText,
     ABCHostAttributeValueSpec,
-    host_attribute_registry,
+    host_attribute_choices,
     HostAttributeTopic,
     HostAttributeTopicAddress,
     HostAttributeTopicBasicSettings,
@@ -72,6 +85,14 @@ from cmk.gui.watolib.translation import HostnameTranslation
 
 import cmk.fields.validators
 from cmk import fields
+from cmk.rulesets.v1 import Help, Label, Message, Title
+from cmk.rulesets.v1.form_specs import (
+    InvalidElementMode,
+    InvalidElementValidator,
+    List,
+    MonitoredHost,
+    String,
+)
 
 
 class HostAttributeAlias(ABCHostAttributeNagiosText):
@@ -133,7 +154,28 @@ class HostAttributeIPv4Address(ABCHostAttributeValueSpec):
             title=_("IPv4 address"),
             help=_(
                 "Specify an explicit IP address or resolvable DNS name here, if "
-                "the hostname is not resolvable via <tt>/etc/hots</tt> or DNS. "
+                "the host name is not resolvable via <tt>/etc/hosts</tt> or DNS. "
+                "If you do not set this attribute, host name resolution will be "
+                "performed when the configuration is enabled. Checkmk's "
+                "built-in DNS cache is enabled by default in the global "
+                "configuration to speed up the activation process. The cache is "
+                "normally updated daily by a cron job. You can manually update "
+                "the cache with the <tt>cmk -v --update-dns-cache</tt> "
+                "command.<br><br><b>Dynamic IP addresses only:</b><br>If you "
+                "enter a DNS name here, the DNS resolution will be performed "
+                "each time the host is checked. Checkmk's DNS cache is "
+                "<b>NOT</b> queried."
+            ),
+            allow_empty=False,
+            allow_ipv6_address=False,
+        )
+
+    def form_spec(self) -> String:
+        return create_host_address(
+            title=Title("IPv4 address"),
+            help_text=Help(
+                "Specify an explicit IP address or resolvable DNS name here, if "
+                "the host name is not resolvable via <tt>/etc/hosts</tt> or DNS. "
                 "If you do not set this attribute, host name resolution will be "
                 "performed when the configuration is enabled. Checkmk's "
                 "built-in DNS cache is enabled by default in the global "
@@ -180,10 +222,31 @@ class HostAttributeIPv6Address(ABCHostAttributeValueSpec):
 
     def valuespec(self) -> ValueSpec:
         return HostAddress(
-            title=_("IPv6 Address"),
+            title=_("IPv6 address"),
             help=_(
                 "Specify an explicit IPv6 address or resolvable DNS name here, if "
-                "the hostname is not resolvable via <tt>/etc/hots</tt> or DNS. "
+                "the host name is not resolvable via <tt>/etc/hosts</tt> or DNS. "
+                "If you do not set this attribute, host name resolution will be "
+                "performed when the configuration is enabled. Checkmk's "
+                "built-in DNS cache is enabled by default in the global "
+                "configuration to speed up the activation process. The cache is "
+                "normally updated daily by a cron job. You can manually update "
+                "the cache with the <tt>cmk -v --update-dns-cache</tt> "
+                "command.<br><br><b>Dynamic IP addresses only:</b><br>If you "
+                "enter a DNS name here, the DNS resolution will be performed "
+                "each time the host is checked. Checkmk's DNS cache is "
+                "<b>NOT</b> queried."
+            ),
+            allow_empty=False,
+            allow_ipv4_address=False,
+        )
+
+    def form_spec(self) -> String:
+        return create_host_address(
+            title=Title("IPv6 address"),
+            help_text=Help(
+                "Specify an explicit IPv6 address or resolvable DNS name here, if "
+                "the host name is not resolvable via <tt>/etc/hosts</tt> or DNS. "
                 "If you do not set this attribute, host name resolution will be "
                 "performed when the configuration is enabled. Checkmk's "
                 "built-in DNS cache is enabled by default in the global "
@@ -231,6 +294,9 @@ class HostAttributeAdditionalIPv4Addresses(ABCHostAttributeValueSpec):
     def show_in_folder(self):
         return False
 
+    def depends_on_tags(self):
+        return ["ip-v4"]
+
     def valuespec(self) -> ValueSpec:
         return ListOf(
             valuespec=HostAddress(
@@ -242,6 +308,16 @@ class HostAttributeAdditionalIPv4Addresses(ABCHostAttributeValueSpec):
                 "Specify additional IPv4 addresses here. These can be used in "
                 "active checks such as ICMP."
             ),
+        )
+
+    def form_spec(self) -> List:
+        return List[str](
+            title=Title("Additional IPv4 addresses"),
+            help_text=Help(
+                "Specify additional IPv4 addresses here. These can be used in "
+                "active checks such as ICMP."
+            ),
+            element_template=create_host_address(allow_empty=False, allow_ipv6_address=False),
         )
 
     def openapi_field(self) -> gui_fields.Field:
@@ -278,6 +354,9 @@ class HostAttributeAdditionalIPv6Addresses(ABCHostAttributeValueSpec):
     def show_in_folder(self):
         return False
 
+    def depends_on_tags(self):
+        return ["ip-v6"]
+
     def valuespec(self) -> ValueSpec:
         return ListOf(
             valuespec=HostAddress(
@@ -289,6 +368,16 @@ class HostAttributeAdditionalIPv6Addresses(ABCHostAttributeValueSpec):
                 "Specify additional IPv6 addresses here. These can be used in "
                 "active checks such as ICMP."
             ),
+        )
+
+    def form_spec(self) -> List:
+        return List[str](
+            title=Title("Additional IPv6 addresses"),
+            help_text=Help(
+                "Specify additional IPv6 addresses here. These can be used in "
+                "active checks such as ICMP."
+            ),
+            element_template=create_host_address(allow_empty=False, allow_ipv4_address=False),
         )
 
     def openapi_field(self) -> gui_fields.Field:
@@ -328,14 +417,27 @@ class HostAttributeSNMPCommunity(ABCHostAttributeValueSpec):
     def valuespec(self) -> ValueSpec:
         return SNMPCredentials(
             help=_(
-                "Configure the community to be used when contacting this host "
-                "via SNMP v1/v2 or v3. You can also configure the SNMP community "
-                'using the <a href="%s">SNMP Communities</a> ruleset. '
-                "Configuring a community when creating a host overrides the "
-                "community defined by the rules."
+                "Configure the community to be used when contacting this host via SNMP v1/v2 or "
+                "v3. You can also configure the SNMP community using the <a href='%s'>SNMP "
+                "credentials of monitored host</a> ruleset. Configuring a community explicitly "
+                "here overrides the community defined by a rule. Communication via SNMP v1 and v2c "
+                "is unencrypted. Consider using SNMP v3 for a higher level of security."
             )
             % "wato.py?mode=edit_ruleset&varname=snmp_communities",
             default_value=None,
+        )
+
+    def form_spec(self) -> TransformDataForLegacyFormatOrRecomposeFunction:
+        return create_snmp_credentials(
+            help_text=Help(
+                "Configure the community to be used when contacting this host via SNMP v1/v2 or "
+                "v3. You can also configure the SNMP community using the <a href='%s'>SNMP "
+                "credentials of monitored host</a> ruleset. Configuring a community explicitly "
+                "here overrides the community defined by a rule. Communication via SNMP v1 and v2c "
+                "is unencrypted. Consider using SNMP v3 for a higher level of security."
+            )
+            % "wato.py?mode=edit_ruleset&varname=snmp_communities",
+            default_value="community",
         )
 
     def openapi_field(self) -> gui_fields.Field:
@@ -364,10 +466,10 @@ class HostAttributeParents(ABCHostAttributeValueSpec):
     def is_show_more(self) -> bool:
         return True
 
-    def show_in_table(self):
+    def show_in_table(self) -> bool:
         return True
 
-    def show_in_folder(self):
+    def show_in_folder(self) -> bool:
         return True
 
     def valuespec(self) -> ValueSpec:
@@ -387,34 +489,50 @@ class HostAttributeParents(ABCHostAttributeValueSpec):
             orientation="horizontal",
         )
 
+    def form_spec(self) -> FSListOfStrings:
+        return FSListOfStrings(
+            title=Title("Parents"),
+            help_text=Help(
+                "Parents are used to configure the reachability of hosts to the "
+                "monitoring server. A host is considered unreachable if all of "
+                "its parents are unreachable or down. Unreachable hosts are not "
+                "actively monitored.<br><br><b>Clusters</b> automatically "
+                "configure all their nodes as Parents, but only if you do not "
+                "manually configure Parents.<br><br><b>Distributed "
+                "setup:</b><br>Make sure that the host and all its parents are "
+                "monitored by the same site."
+            ),
+            string_spec=MonitoredHost(title=Title("Host")),
+        )
+
     def openapi_field(self) -> gui_fields.Field:
         return fields.List(
-            gui_fields.HostField(should_exist=True),
+            gui_fields.HostField(should_exist=True, skip_validation_on_view=True),
             description="A list of parents of this host.",
         )
 
-    def is_visible(self, for_what, new) -> bool:  # type: ignore[no-untyped-def]
+    def is_visible(self, for_what: str, new: bool) -> bool:
         return for_what != "cluster"
 
-    def to_nagios(self, value):
+    def to_nagios(self, value: str) -> str | None:
         if value:
             return ",".join(value)
         return None
 
-    def nagios_name(self):
+    def nagios_name(self) -> str:
         return "parents"
 
     def is_explicit(self) -> bool:
         return True
 
-    def paint(self, value, hostname):
+    def paint(self, value: str, hostname: HostName) -> tuple[str, HTML]:
         parts = [
             HTMLWriter.render_a(
                 hn, "wato.py?" + urlencode_vars([("mode", "edit_host"), ("host", hn)])
             )
             for hn in value
         ]
-        return "", HTML(", ").join(parts)
+        return "", HTML.without_escaping(", ").join(parts)
 
     def filter_matches(self, crit: list, value: list, hostname: HostName) -> bool:
         return any(item in value for item in crit)
@@ -424,13 +542,15 @@ def validate_host_parents(host):
     for parent_name in host.parents():
         if parent_name == host.name():
             raise MKUserError(
-                None, _("You configured the host to be it's own parent, which is not allowed.")
+                None,
+                _("You configured the host to be it's own parent, which is not allowed."),
             )
 
         parent = Host.host(parent_name)
         if not parent:
             raise MKUserError(
-                None, _("You defined the non-existing host '%s' as a parent.") % parent_name
+                None,
+                _("You defined the non-existing host '%s' as a parent.") % parent_name,
             )
 
         if host.site_id() != parent.site_id():
@@ -443,9 +563,6 @@ def validate_host_parents(host):
                 )
                 % (parent_name, parent.site_id(), host.site_id()),
             )
-
-
-hooks.register_builtin("validate-host", validate_host_parents)
 
 
 @hooks.request_memoize()
@@ -491,13 +608,13 @@ class HostAttributeNetworkScan(ABCHostAttributeValueSpec):
     def valuespec(self) -> ValueSpec:
         return Dictionary(
             elements=self._network_scan_elements,
-            title=_("Network Scan"),
+            title=_("Network scan"),
             help=_(
                 "For each folder an automatic network scan can be configured. It will "
                 "try to detect new hosts in the configured IP ranges by sending pings "
-                "to each IP address to check whether or not a host is using this ip "
+                "to each IP address to check whether or not a host is using this IP "
                 "address. Each new found host will be added to the current folder by "
-                "it's hostname, when resolvable via DNS, or by it's IP address."
+                "its host name, when resolvable via DNS, or by its IP address."
             ),
             optional_keys=["max_parallel_pings", "translate_names"],
             default_text=_("Not configured."),
@@ -510,7 +627,7 @@ class HostAttributeNetworkScan(ABCHostAttributeValueSpec):
                 "Configuration for automatic network scan. Pings will be"
                 "sent to each IP address in the configured ranges to check"
                 "if a host is up or down. Each found host will be added to"
-                "the folder by it's hostname (if possible) or IP address."
+                "the folder by it's host name (if possible) or IP address."
             ),
         )
 
@@ -606,7 +723,7 @@ class HostAttributeNetworkScan(ABCHostAttributeValueSpec):
             (
                 "translate_names",
                 HostnameTranslation(
-                    title=_("Translate Hostnames"),
+                    title=_("Translate host names"),
                 ),
             ),
         ]
@@ -615,11 +732,9 @@ class HostAttributeNetworkScan(ABCHostAttributeValueSpec):
 
     @staticmethod
     def _time_allowed_to_valuespec(
-        v: TimeofdayRangeValue
-        |
         # we need list as input type here because Sequence[TimeofdayRangeValue] is hard to
         # distinguish from TimeofdayRangeValue
-        list[TimeofdayRangeValue],
+        v: TimeofdayRangeValue | list[TimeofdayRangeValue],
     ) -> list[TimeofdayRangeValue]:
         return v if isinstance(v, list) else [v]
 
@@ -656,7 +771,7 @@ class HostAttributeNetworkScan(ABCHostAttributeValueSpec):
         options: list[tuple[str, str, ValueSpec[Any]]] = [
             (
                 "ip_range",
-                _("IP-Range"),
+                _("IP range"),
                 Tuple(
                     elements=[
                         IPv4Address(
@@ -671,7 +786,7 @@ class HostAttributeNetworkScan(ABCHostAttributeValueSpec):
             ),
             (
                 "ip_network",
-                _("IP Network"),
+                _("IP network"),
                 Tuple(
                     elements=[
                         IPv4Address(
@@ -694,7 +809,7 @@ class HostAttributeNetworkScan(ABCHostAttributeValueSpec):
             ),
             (
                 "ip_list",
-                _("Explicit List of IP Addresses"),
+                _("Explicit list of IP addresses"),
                 ListOfStrings(
                     valuespec=IPv4Address(),
                     orientation="horizontal",
@@ -754,7 +869,8 @@ class HostAttributeNetworkScanResult(ABCHostAttributeValueSpec):
 
     def openapi_field(self) -> gui_fields.Field:
         return fields.Nested(
-            gui_fields.NetworkScanResult, description="Read only access to the network scan result"
+            gui_fields.NetworkScanResult,
+            description="Read only access to the network scan result",
         )
 
     def valuespec(self) -> ValueSpec:
@@ -857,9 +973,20 @@ class HostAttributeManagementAddress(ABCHostAttributeValueSpec):
             allow_empty=False,
         )
 
+    def form_spec(self) -> String:
+        return create_host_address(
+            title=Title("Address"),
+            help_text=Help(
+                "Address (IPv4 or IPv6) or dns name under which the "
+                "management board can be reached. If this is not set, "
+                "the same address as that of the host will be used."
+            ),
+            allow_empty=False,
+        )
+
     def openapi_field(self) -> gui_fields.Field:
         return fields.String(
-            description="Address (IPv4, IPv6 or hostname) under which the management board can be reached.",
+            description="Address (IPv4, IPv6 or host name) under which the management board can be reached.",
             validate=fields.ValidateAnyOfValidators(
                 [
                     fields.ValidateIPv4(),
@@ -899,6 +1026,26 @@ class HostAttributeManagementProtocol(ABCHostAttributeValueSpec):
             ],
         )
 
+    def form_spec(self) -> SingleChoiceExtended:
+        return SingleChoiceExtended(
+            title=Title("Protocol"),
+            help_text=Help("Specify the protocol used to connect to the management board."),
+            elements=[
+                SingleChoiceElementExtended(
+                    name=None,
+                    title=Title("No management board"),
+                ),
+                SingleChoiceElementExtended(
+                    name="snmp",
+                    title=Title("SNMP"),
+                ),
+                SingleChoiceElementExtended(
+                    name="ipmi",
+                    title=Title("IPMI"),
+                ),
+            ],
+        )
+
     def openapi_field(self) -> gui_fields.Field:
         return gui_fields.HostAttributeManagementBoardField()
 
@@ -926,6 +1073,12 @@ class HostAttributeManagementSNMPCommunity(ABCHostAttributeValueSpec):
             allow_none=True,
         )
 
+    def form_spec(self) -> TransformDataForLegacyFormatOrRecomposeFunction:
+        return create_snmp_credentials(
+            default_value=None,
+            allow_none=True,
+        )
+
     def openapi_field(self) -> gui_fields.Field:
         return fields.Nested(
             gui_fields.SNMPCredentials,
@@ -935,7 +1088,7 @@ class HostAttributeManagementSNMPCommunity(ABCHostAttributeValueSpec):
 
 
 class IPMICredentials(Alternative):
-    def __init__(  # pylint: disable=redefined-builtin
+    def __init__(
         self,
         match: Callable[[AlternativeModel], int] | None = None,
         show_alternative_title: bool = False,
@@ -990,11 +1143,19 @@ class HostAttributeManagementIPMICredentials(ABCHostAttributeValueSpec):
             default_value=None,
         )
 
+    def form_spec(self) -> OptionalChoice:
+        return OptionalChoice(
+            title=Title("Explicit credentials"),
+            none_label=Label(""),
+            parameter_form=create_ipmi_parameters(),
+        )
+
     def openapi_field(self) -> gui_fields.Field:
         return fields.Nested(
             gui_fields.IPMIParameters,
             description="IPMI credentials",
             required=False,
+            allow_none=True,
         )
 
 
@@ -1024,7 +1185,7 @@ class HostAttributeSite(ABCHostAttributeValueSpec):
             help=_("Specify the site that should monitor this host."),
             invalid_choice_error=_(
                 "The configured site is not known to this site. In case you "
-                "are configuring in a distributed slave, this may be a host "
+                "are configuring in a remote site, this may be a host "
                 "monitored by another site. If you want to modify this "
                 "host, you will have to change the site attribute to the "
                 "local site. But this may make the host be monitored from "
@@ -1032,9 +1193,27 @@ class HostAttributeSite(ABCHostAttributeValueSpec):
             ),
         )
 
+    def form_spec(self) -> SingleChoiceExtended[str]:
+        return create_setup_site_choice(
+            title=Title("Monitored on site"),
+            help_text=Help("Specify the site that should monitor this host."),
+            invalid_element_validation=InvalidElementValidator(
+                mode=InvalidElementMode.KEEP,
+                error_msg=Message(
+                    "The configured site is not known to this site. In case you "
+                    "are configuring in a remote site, this may be a host "
+                    "monitored by another site. If you want to modify this "
+                    "host, you will have to change the site attribute to the "
+                    "local site. But this may make the host be monitored from "
+                    "multiple sites."
+                ),
+            ),
+        )
+
     def openapi_field(self) -> gui_fields.Field:
         return gui_fields.SiteField(
-            description="The site that should monitor this host.", presence="might_not_exist"
+            description="The site that should monitor this host.",
+            presence="might_not_exist_on_view",
         )
 
     def get_tag_groups(self, value):
@@ -1098,7 +1277,10 @@ class HostAttributeLockedBy(ABCHostAttributeValueSpec):
         )
 
     def filter_matches(
-        self, crit: list[str], value: list[str] | tuple[str, str, str], hostname: HostName
+        self,
+        crit: list[str],
+        value: list[str] | tuple[str, str, str],
+        hostname: HostName,
     ) -> bool:
         return crit == list(value)
 
@@ -1164,7 +1346,7 @@ class HostAttributeLockedAttributes(ABCHostAttributeValueSpec):
 
     def valuespec(self) -> ValueSpec:
         return ListOf(
-            valuespec=DropdownChoice(choices=host_attribute_registry.get_choices),
+            valuespec=DropdownChoice(choices=host_attribute_choices),
             title=_("Locked attributes"),
             text_if_empty=_("Not locked"),
         )
@@ -1263,7 +1445,7 @@ class HostAttributeDiscoveryFailed(ABCHostAttributeValueSpec):
     def name(self) -> str:
         return "inventory_failed"
 
-    def topic(self) -> type[HostAttributeTopic]:
+    def topic(self) -> type[HostAttributeTopicMetaData]:
         return HostAttributeTopicMetaData
 
     @classmethod
@@ -1318,6 +1500,65 @@ class HostAttributeDiscoveryFailed(ABCHostAttributeValueSpec):
         return {}
 
 
+class HostAttributeWaitingForDiscovery(ABCHostAttributeValueSpec):
+    def name(self) -> str:
+        return "waiting_for_discovery"
+
+    def topic(self) -> type[HostAttributeTopic]:
+        return HostAttributeTopicCustomAttributes
+
+    @classmethod
+    def sort_index(cls) -> int:
+        return 210
+
+    def show_in_table(self):
+        return False
+
+    def show_in_form(self):
+        return False
+
+    def show_on_create(self):
+        return False
+
+    def show_in_folder(self):
+        return False
+
+    def show_in_host_search(self):
+        return False
+
+    def show_inherited_value(self):
+        return False
+
+    def editable(self):
+        return False
+
+    def openapi_editable(self) -> bool:
+        return True
+
+    def valuespec(self) -> ValueSpec:
+        return Checkbox(
+            title=_("Waiting for discovery"),
+            help=self._help_text(),
+            default_value=False,
+        )
+
+    def openapi_field(self) -> gui_fields.Field:
+        return fields.Boolean(
+            example=False,
+            required=False,
+            description=self._help_text(),
+        )
+
+    def _help_text(self) -> str:
+        return _(
+            "Indicates that host is waiting for bulk discovery. It is set to True once it in queue."
+            "Removed after discovery is ended."
+        )
+
+    def get_tag_groups(self, value):
+        return {}
+
+
 class HostAttributeLabels(ABCHostAttributeValueSpec):
     def name(self) -> str:
         return "labels"
@@ -1336,8 +1577,9 @@ class HostAttributeLabels(ABCHostAttributeValueSpec):
         return _(
             "Labels allow you to flexibly group your hosts in order to "
             "refer to them later at other places in Checkmk, e.g. in rule "
-            "chains.<br><b>Label format:</b>  key:value<br><br>Checkmk does not "
-            "perform any validation on the labels you use."
+            "chains.<br><b>Label format:</b>  key:value<br><br>Neither the "
+            "key nor the value can contain ‘:’.  CheckMK does not perform "
+            "any other validation on the labels you use."
         )
 
     def show_in_table(self):
@@ -1349,12 +1591,27 @@ class HostAttributeLabels(ABCHostAttributeValueSpec):
     def valuespec(self) -> ValueSpec:
         return Labels(world=Labels.World.CONFIG, label_source=Labels.Source.EXPLICIT)
 
+    def form_spec(self) -> fs_labels.Labels:
+        return fs_labels.Labels(
+            world=fs_labels.World.CONFIG, label_source=fs_labels.Source.EXPLICIT
+        )
+
     def openapi_field(self) -> gui_fields.Field:
         return fields.Dict(
             description=self.help(),
-            keys=fields.String(description="The host label key"),
-            values=fields.String(description="The host label value"),
+            keys=fields.String(description="The host label key", validate=self._validate_label_key),
+            values=fields.String(
+                description="The host label value", validate=self._validate_label_value
+            ),
         )
+
+    def _validate_label_key(self, data: str) -> None:
+        if ":" in data:
+            raise ValidationError(f"Invalid label key: {data!r}")
+
+    def _validate_label_value(self, data: str) -> None:
+        if ":" in data:
+            raise ValidationError(f"Invalid label value: {data!r}")
 
     def filter_matches(self, crit, value, hostname):
         return set(value).issuperset(set(crit))
