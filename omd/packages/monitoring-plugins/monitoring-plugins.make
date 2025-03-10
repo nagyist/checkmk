@@ -2,14 +2,10 @@ MONITORING_PLUGINS := monitoring-plugins
 
 MONITORING_PLUGINS_INSTALL := $(BUILD_HELPER_DIR)/$(MONITORING_PLUGINS)-install
 
-# on Centos8 we don't build our own OpenSSL, so we have to inform the build about it
-ifeq ($(DISTRO_CODE),el8)
-OPTIONAL_BUILD_ARGS := BAZEL_EXTRA_ARGS="--define no-own-openssl=true"
-endif
-
+.PHONY: $(MONITORING_PLUGINS_INSTALL)
 $(MONITORING_PLUGINS_INSTALL):
 	# run the Bazel build process which does all the dependency stuff
-	$(OPTIONAL_BUILD_ARGS) $(BAZEL_BUILD) @$(MONITORING_PLUGINS)//:$(MONITORING_PLUGINS)
+	bazel build @$(MONITORING_PLUGINS)//:$(MONITORING_PLUGINS)
 
 	# THIS IS ALL HACKY WORKAROUND STUFF - BETTER GET RID OF IT BY LETTING
 	# BAZEL HANDLE ALL THIS RATHER THAN MODIFYING IT!
@@ -21,11 +17,11 @@ $(MONITORING_PLUGINS_INSTALL):
 	# copy over all the plugins we built
 	mkdir -p "$(TMP_DIR)/lib/nagios"
 	$(RSYNC) -r --chmod=u+w \
-	    "$(BAZEL_BIN)/$(MONITORING_PLUGINS)/$(MONITORING_PLUGINS)/libexec/" \
+	    "$(BAZEL_BIN_EXT)/$(MONITORING_PLUGINS)/$(MONITORING_PLUGINS)/libexec/" \
 	    "$(TMP_DIR)/lib/nagios/plugins/"
 	# copy locales and 'documentation'
 	$(RSYNC) -r --chmod=u+w \
-	    "$(BAZEL_BIN)/$(MONITORING_PLUGINS)/$(MONITORING_PLUGINS)/share/" \
+	    "$(BAZEL_BIN_EXT)/$(MONITORING_PLUGINS)/$(MONITORING_PLUGINS)/share/" \
 	    "$(TMP_DIR)/share/"
 	# set RPATH for all ELF binaries we find
 	find "$(TMP_DIR)/lib/nagios/plugins/" -exec file {} \; \

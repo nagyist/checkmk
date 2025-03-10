@@ -33,11 +33,10 @@ def copy_cmk_updater(source_dir: Path, target_dir: Path) -> None:
     shutil.copy(source_dir / CMK_UPDATER_PY, target_dir / CMK_UPDATER_CHECKMK_PY)
 
 
-@pytest.mark.skip
-def test_python_module(  # type: ignore[no-untyped-def]
+def test_python_module(
     main_exe: Path,
     default_yaml_config: YamlDict,
-    unpack,
+    unpack: object,
     module_dir: Path,
     data_dir: Path,
     git_dir: Path,
@@ -54,7 +53,7 @@ def test_python_module(  # type: ignore[no-untyped-def]
     assert output.ret_code == 1
     assert output.stdout.startswith("\r\n\tYou must install Agent Updater Python plugin")
     copy_cmk_updater(
-        git_dir / "enterprise" / "agents" / "plugins",
+        git_dir / "non-free" / "cmk-update-agent",
         data_dir / "plugins",
     )
     output = run_agent(
@@ -65,4 +64,4 @@ def test_python_module(  # type: ignore[no-untyped-def]
     )
     assert output.ret_code == 0
     assert output.stderr.startswith("Missing config file")
-    assert output.stdout.startswith("<<<cmk_update_agent_status>>>")
+    assert output.stdout.startswith("<<<cmk_update_agent_status:sep(0)>>>")

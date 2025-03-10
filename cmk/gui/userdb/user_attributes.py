@@ -3,11 +3,14 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+from cmk.utils.rulesets.definition import RuleGroup
+from cmk.utils.urls import is_allowed_url
+
+from cmk.gui.exceptions import MKUserError
 from cmk.gui.http import request
 from cmk.gui.i18n import _
-from cmk.gui.plugins.userdb.utils import show_mode_choices, UserAttribute, validate_start_url
+from cmk.gui.theme.choices import theme_choices
 from cmk.gui.utils.temperate_unit import temperature_unit_choices
-from cmk.gui.utils.theme import theme_choices
 from cmk.gui.utils.urls import makeuri_contextless
 from cmk.gui.valuespec import (
     AbsoluteDate,
@@ -21,6 +24,21 @@ from cmk.gui.valuespec import (
     Tuple,
     ValueSpec,
 )
+
+from ._user_attribute import UserAttribute, UserAttributeRegistry
+
+
+def register(user_attribute_registry: UserAttributeRegistry) -> None:
+    user_attribute_registry.register(TemperatureUnitUserAttribute)
+    user_attribute_registry.register(ForceAuthUserUserAttribute)
+    user_attribute_registry.register(DisableNotificationsUserAttribute)
+    user_attribute_registry.register(StartURLUserAttribute)
+    user_attribute_registry.register(UIThemeUserAttribute)
+    user_attribute_registry.register(UISidebarPosition)
+    user_attribute_registry.register(UIIconTitle)
+    user_attribute_registry.register(UIIconPlacement)
+    user_attribute_registry.register(UIBasicAdvancedToggle)
+    user_attribute_registry.register(ContextualHelpIcon)
 
 
 class TemperatureUnitUserAttribute(UserAttribute):
@@ -54,7 +72,10 @@ class TemperatureUnitUserAttribute(UserAttribute):
                     request,
                     [
                         ("mode", "edit_ruleset"),
-                        ("varname", "checkgroup_parameters:temperature"),
+                        (
+                            "varname",
+                            RuleGroup.CheckgroupParameters("temperature"),
+                        ),
                     ],
                     filename="wato.py",
                 ),
@@ -86,9 +107,9 @@ class ForceAuthUserUserAttribute(UserAttribute):
             title=_("Visibility of hosts/services"),
             label=_("Only show hosts and services the user is a contact for"),
             help=_(
-                "When this option is checked, then the status GUI will only "
+                "When this option is checked, the status GUI will only "
                 "display hosts and services that the user is a contact for - "
-                "even if he has the permission for seeing all objects."
+                "even they have the permission for seeing all objects."
             ),
         )
 
@@ -112,7 +133,7 @@ class DisableNotificationsUserAttribute(UserAttribute):
                     "When this option is active you will not get <b>any</b> "
                     "alerts or other notifications via email, SMS or similar. "
                     "This overrides all other notification settings and rules, so make "
-                    "sure that you know what you do. Moreover you can specify a timerange "
+                    "sure that you know what you do. Moreover you can specify a time range "
                     "where no notifications are generated."
                 ),
                 elements=[
@@ -127,7 +148,7 @@ class DisableNotificationsUserAttribute(UserAttribute):
                     (
                         "timerange",
                         Tuple(
-                            title=_("Customize timerange"),
+                            title=_("Customize time range"),
                             elements=[
                                 AbsoluteDate(title=_("From:"), include_time=True),
                                 AbsoluteDate(title=_("To:"), include_time=True),
@@ -184,6 +205,17 @@ class StartURLUserAttribute(UserAttribute):
 
     def domain(self) -> str:
         return "multisite"
+
+
+def validate_start_url(value: str, varprefix: str) -> None:
+    if not is_allowed_url(value):
+        raise MKUserError(
+            varprefix,
+            _(
+                "The given value is not allowed. You may only configure "
+                "relative URLs like <tt>dashboard.py?name=my_dashboard</tt>."
+            ),
+        )
 
 
 class UIThemeUserAttribute(UserAttribute):
@@ -251,7 +283,7 @@ class UIIconTitle(UserAttribute):
                 "to save some space in the UI."
             ),
             # FIXME: Why isn't this simply a bool instead of an Optional[Literal["hide"]]?
-            choices=[(None, _("Show title")), ("hide", _("Do not show title"))],
+            choices=[(None, _("Show title")), ("hide", _("Hide title"))],
         )
 
 
@@ -315,3 +347,30 @@ class UIBasicAdvancedToggle(UserAttribute):
 
     def domain(self) -> str:
         return "multisite"
+
+
+class ContextualHelpIcon(UserAttribute):
+    @classmethod
+    def name(cls) -> str:
+        return "contextual_help_icon"
+
+    def topic(self) -> str:
+        return "interface"
+
+    def valuespec(self) -> ValueSpec:
+        return DropdownChoice(
+            title=_("Contextual help icon"),
+            help=_("Some help text"),
+            choices=[(None, _("Show icon")), ("hide_icon", _("Hide icon"))],
+        )
+
+    def domain(self) -> str:
+        return "multisite"
+
+
+def show_mode_choices() -> list[tuple[str | None, str]]:
+    return [
+        ("default_show_less", _("Default to show less")),
+        ("default_show_more", _("Default to show more")),
+        ("enforce_show_more", _("Enforce show more")),
+    ]

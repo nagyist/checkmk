@@ -46,7 +46,7 @@ raw_context = collect_context()
 message = get_sms_message_from_context(raw_context)
 
 
-def quote_message(msg, max_length=None):
+def quote_message(msg: str, max_length: int | None = None) -> str:
     if max_length:
         return "'" + msg.replace("'", "'\"'\"'")[: max_length - 2] + "'"
     return "'" + msg.replace("'", "'\"'\"'") + "'"
@@ -65,6 +65,6 @@ elif spool_dir:
         fd, b"To: %s\n\n%s" % (recipient.encode("utf-8"), quote_message(message).encode("utf-8"))
     )
     os.close(fd)
-    os.chmod(path, 0o660)
+    os.chmod(path, 0o660)  # nosec B103 # BNS:ce45cd
     filename = path.split("/")[-1]
     shutil.move(path, spool_dir + "/" + filename)

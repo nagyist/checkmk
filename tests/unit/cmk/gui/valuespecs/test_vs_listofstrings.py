@@ -12,7 +12,7 @@ from .utils import expect_validate_failure, expect_validate_success, request_var
 
 class TestListOfStrings:
     def test_canonical_value(self) -> None:
-        assert vs.ListOfStrings().canonical_value() == []
+        assert not vs.ListOfStrings().canonical_value()
 
     def test_validate(self) -> None:
         expect_validate_success(vs.ListOfStrings(), ["1", "2"])
@@ -31,14 +31,14 @@ class TestListOfStrings:
         )
 
     def test_value_to_html(self) -> None:
-        assert vs.ListOfStrings().value_to_html(["1", "2"]) == HTML(
+        assert vs.ListOfStrings().value_to_html(["1", "2"]) == HTML.without_escaping(
             "<table><tr><td>1</td></tr><tr><td>2</td></tr></table>"
         )
         assert vs.ListOfStrings(orientation="horizontal").value_to_html(["1", "2"]) == "1, 2"
         assert vs.ListOfStrings().value_to_html([]) == ""
         assert vs.ListOfStrings(empty_text="smth").value_to_html([]) == "smth"
 
-    def test_from_html_vars(self) -> None:
+    def test_from_html_vars(self, request_context: None) -> None:
         with request_var(l_0="a", l_4="b", l_9="", l_9999="z", l_smth="smth"):
             assert vs.ListOfStrings().from_html_vars("l") == ["a", "b", "z"]
 

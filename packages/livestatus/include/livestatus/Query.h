@@ -8,10 +8,9 @@
 
 #include <bitset>
 #include <chrono>
-#include <cstddef>
 #include <cstdint>
-#include <functional>
-#include <list>
+#include <iosfwd>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -22,34 +21,38 @@
 
 #include "livestatus/Aggregator.h"  // IWYU pragma: keep
 #include "livestatus/Filter.h"
+#include "livestatus/ParsedQuery.h"
 #include "livestatus/Renderer.h"
-#include "livestatus/RendererBrokenCSV.h"
-#include "livestatus/Row.h"
-#include "livestatus/StatsColumn.h"
-#include "livestatus/Triggers.h"
+#include "livestatus/Sorter.h"
 #include "livestatus/User.h"
-class Column;
-class Logger;
+
+class ICore;
 class OutputBuffer;
+class Row;
 class Table;
+class Logger;
 
 class Query {
 public:
-    Query(const std::list<std::string> &lines, Table &table,
-          Encoding data_encoding, size_t max_response_size,
-          OutputBuffer &output, Logger *logger);
+    Query(ParsedQuery parsed_query, Table &table, ICore &core,
+          OutputBuffer &output);
 
     bool process();
 
-    // NOTE: We cannot make this 'const' right now, it increments _current_line
+    // NOTE: We cannot make this 'const' right now, it increments current_line_
     // and calls the non-const getAggregatorsFor() member function.
     bool processDataset(Row row);
 
     bool timelimitReached() const;
+
+    void badRequest(const std::string &message) const;
+    void payloadTooLarge(const std::string &message) const;
     void invalidRequest(const std::string &message) const;
     void badGateway(const std::string &message) const;
 
-    std::chrono::seconds timezoneOffset() const { return _timezone_offset; }
+    std::chrono::seconds timezoneOffset() const {
+        return parsed_query_.timezone_offset;
+    }
 
     std::unique_ptr<Filter> partialFilter(const std::string &message,
                                           columnNamePredicate predicate) const;
@@ -62,74 +65,37 @@ public:
     std::optional<std::bitset<32>> valueSetLeastUpperBoundFor(
         const std::string &column_name) const;
 
-    const std::unordered_set<std::shared_ptr<Column>> &allColumns() const {
-        return _all_columns;
-    }
+    const std::unordered_set<std::string> &allColumnNames() const;
 
 private:
-    using LogicalConnective =
-        std::function<std::unique_ptr<Filter>(Filter::Kind, const Filters &)>;
-
-    const Encoding _data_encoding;
-    const size_t _max_response_size;
-    OutputBuffer &_output;
-    QueryRenderer *_renderer_query;
-    Table &_table;
-    bool _keepalive;
-    using FilterStack = Filters;
-    std::unique_ptr<Filter> _filter;
+    const ParsedQuery parsed_query_;
+    Table &table_;
+    ICore &core_;
+    OutputBuffer &output_;
     std::unique_ptr<const User> user_;
-    std::unique_ptr<Filter> _wait_condition;
-    std::chrono::milliseconds _wait_timeout;
-    Triggers::Kind _wait_trigger;
-    Row _wait_object;
-    CSVSeparators _separators;
-    bool _show_column_headers;
-    OutputFormat _output_format;
-    int _limit;
-    std::optional<
-        std::pair<std::chrono::seconds, std::chrono::steady_clock::time_point>>
-        _time_limit;
-    unsigned _current_line;
-    std::chrono::seconds _timezone_offset;
-    Logger *const _logger;
-    std::vector<std::shared_ptr<Column>> _columns;
-    std::vector<std::unique_ptr<StatsColumn>> _stats_columns;
-    std::map<RowFragment, std::vector<std::unique_ptr<Aggregator>>>
-        _stats_groups;
-    std::unordered_set<std::shared_ptr<Column>> _all_columns;
 
+    std::unique_ptr<Renderer> renderer_;
+    QueryRenderer query_renderer_;
+    int current_line_;
+    std::map<RowFragment, std::vector<std::unique_ptr<Aggregator>>>
+        stats_groups_;
+    std::vector<std::pair<Sorter::key_type, RowFragment>> sorted_rows_;
+
+    [[nodiscard]] Logger *logger() const;
     bool doStats() const;
+    bool hasOrderBy() const;
+    [[nodiscard]] const OrderBy &orderBy() const;
+    std::unique_ptr<Renderer> makeRenderer(std::ostream &os);
+    void renderColumnHeaders();
+    void renderSorters();
+    void renderAggregators();
     void doWait();
-    void parseFilterLine(char *line, FilterStack &filters);
-    void parseStatsLine(char *line);
-    void parseStatsGroupLine(char *line);
-    void parseAndOrLine(char *line, Filter::Kind kind,
-                        const LogicalConnective &connective,
-                        FilterStack &filters);
-    void parseNegateLine(char *line, FilterStack &filters);
-    void parseStatsAndOrLine(char *line, const LogicalConnective &connective);
-    void parseStatsNegateLine(char *line);
-    void parseColumnsLine(const char *line);
-    void parseColumnHeadersLine(char *line);
-    void parseLimitLine(char *line);
-    void parseTimelimitLine(char *line);
-    void parseSeparatorsLine(char *line);
-    void parseOutputFormatLine(const char *line);
-    void parseKeepAliveLine(char *line);
-    void parseResponseHeaderLine(char *line);
-    void parseAuthUserHeader(const char *line);
-    void parseWaitTimeoutLine(char *line);
-    void parseWaitTriggerLine(char *line);
-    void parseWaitObjectLine(const char *line);
-    void parseLocaltimeLine(char *line);
-    void start(QueryRenderer &q);
-    void finish(QueryRenderer &q);
 
     // NOTE: We cannot make this 'const' right now, it adds entries into
-    // _stats_groups.
-    const std::vector<std::unique_ptr<Aggregator>> &getAggregatorsFor(
-        const RowFragment &groupspec);
+    // stats_groups_.
+    const std::vector<std::unique_ptr<Aggregator>> &getAggregatorsFor(Row row);
+
+    void renderColumns(Row row, QueryRenderer &q) const;
 };
 
 #endif  // Query_h

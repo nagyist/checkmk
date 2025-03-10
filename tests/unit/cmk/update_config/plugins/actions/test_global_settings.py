@@ -3,14 +3,15 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 import logging
 
 import pytest
 from pytest_mock import MockerFixture
 
-from cmk.gui.plugins.wato.check_mk_configuration import ConfigVariableGroupUserInterface
-from cmk.gui.plugins.watolib.utils import ConfigVariable, ConfigVariableRegistry
+from cmk.gui.plugins.wato.utils import ConfigVariableGroupUserInterface
 from cmk.gui.valuespec import TextInput, Transform
+from cmk.gui.watolib.config_domain_name import ConfigVariable, ConfigVariableRegistry
 from cmk.gui.watolib.config_domains import ConfigDomainGUI
 
 from cmk.update_config.plugins.actions import global_settings
@@ -29,8 +30,8 @@ def test_update_global_config_transform_values(
         def group(self) -> type[ConfigVariableGroupUserInterface]:
             return ConfigVariableGroupUserInterface
 
-        def domain(self) -> type[ConfigDomainGUI]:
-            return ConfigDomainGUI
+        def domain(self) -> ConfigDomainGUI:
+            return ConfigDomainGUI()
 
         def ident(self) -> str:
             return "key"
@@ -47,17 +48,22 @@ def test_update_global_config_transform_values(
     }
 
 
-def test_update_global_config_rename_variables_and_change_values(
+def test_update_global_config(
     mocker: MockerFixture,
 ) -> None:
     mocker.patch.object(
         global_settings,
-        "_REMOVED_GLOBALS",
+        "_RENAMED_GLOBALS",
         [
             ("global_a", "new_global_a", {True: 1, False: 0}),
             ("global_b", "new_global_b", {}),
             ("missing", "new_missing", {}),
         ],
+    )
+    mocker.patch.object(
+        global_settings,
+        "_REMOVED_OPTIONS",
+        ["old_unused"],
     )
 
     # Disable variable filtering by known Checkmk variables
@@ -71,6 +77,7 @@ def test_update_global_config_rename_variables_and_change_values(
             "global_a": True,
             "global_b": 14,
             "keep": "do not remove me",
+            "old_unused": "remove me",
             "unknown": "How did this get here?",
         },
     ) == {
@@ -78,4 +85,21 @@ def test_update_global_config_rename_variables_and_change_values(
         "unknown": "How did this get here?",
         "new_global_a": 1,
         "new_global_b": 14,
+    }
+
+
+def test_remove_options() -> None:
+    assert global_settings._remove_options(
+        logging.getLogger(),
+        {
+            "global_a": True,
+            "global_b": 14,
+            "old_unused": "remove me",
+            "unknown": "How did this get here?",
+        },
+        ["old_unused"],
+    ) == {
+        "global_a": True,
+        "global_b": 14,
+        "unknown": "How did this get here?",
     }

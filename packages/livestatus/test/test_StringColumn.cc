@@ -4,10 +4,10 @@
 // source code package.
 
 #include <functional>
-#include <memory>
 #include <string>
 
 #include "gtest/gtest.h"
+#include "livestatus/Column.h"
 #include "livestatus/Row.h"
 #include "livestatus/StringColumn.h"
 

@@ -9,10 +9,11 @@ import os
 
 from livestatus import SiteConfiguration, SiteConfigurations, SiteId
 
-import cmk.utils.paths
-from cmk.utils.site import omd_site
+from cmk.ccc.site import omd_site
 
-from cmk.gui.config import active_config
+import cmk.utils.paths
+
+from cmk.gui.config import active_config, Config
 
 
 def sitenames() -> list[SiteId]:
@@ -25,15 +26,17 @@ def sitenames() -> list[SiteId]:
 def enabled_sites() -> SiteConfigurations:
     return SiteConfigurations(
         {
-            name: get_site_config(name)  #
+            name: get_site_config(active_config, name)  #
             for name in sitenames()
-            if not get_site_config(name).get("disabled", False)
+            if not get_site_config(active_config, name).get("disabled", False)
         }
     )
 
 
 def configured_sites() -> SiteConfigurations:
-    return SiteConfigurations({site_id: get_site_config(site_id) for site_id in sitenames()})
+    return SiteConfigurations(
+        {site_id: get_site_config(active_config, site_id) for site_id in sitenames()}
+    )
 
 
 def has_wato_slave_sites() -> bool:
@@ -62,19 +65,27 @@ def get_login_slave_sites() -> list[SiteId]:
     """Returns a list of site ids which are Setup slave sites and users can login"""
     login_sites = []
     for site_id, site_spec in wato_slave_sites().items():
-        if site_spec.get("user_login", True) and not site_is_local(site_id):
+        if site_spec.get("user_login", True) and not site_is_local(active_config, site_id):
             login_sites.append(site_id)
     return login_sites
 
 
+def is_replication_enabled(site_config: SiteConfiguration) -> bool:
+    return bool(site_config.get("replication"))
+
+
+def get_replication_site_id(site_config: SiteConfiguration) -> str:
+    return replication if (replication := site_config.get("replication")) else ""
+
+
 def wato_slave_sites() -> SiteConfigurations:
     return SiteConfigurations(
-        {site_id: s for site_id, s in active_config.sites.items() if s.get("replication")}
+        {site_id: s for site_id, s in active_config.sites.items() if is_replication_enabled(s)}
     )
 
 
-def get_site_config(site_id: SiteId) -> SiteConfiguration:
-    s: SiteConfiguration = active_config.sites.get(site_id, {})
+def get_site_config(config: Config, site_id: SiteId) -> SiteConfiguration:
+    s: SiteConfiguration = config.sites.get(site_id, {})
     # Now make sure that all important keys are available.
     # Add missing entries by supplying default values.
     s.setdefault("alias", site_id)
@@ -84,8 +95,8 @@ def get_site_config(site_id: SiteId) -> SiteConfiguration:
     return s
 
 
-def site_is_local(site_id: SiteId) -> bool:
-    socket_info = get_site_config(site_id)["socket"]
+def site_is_local(config: Config, site_id: SiteId) -> bool:
+    socket_info = get_site_config(config, site_id)["socket"]
     if isinstance(socket_info, str):
         # Should be unreachable
         return False
@@ -107,7 +118,7 @@ def is_single_local_site() -> bool:
 
     # Also use Multisite mode if the one and only site is not local
     sitename = list(active_config.sites.keys())[0]
-    return site_is_local(sitename)
+    return site_is_local(active_config, sitename)
 
 
 def wato_site_ids() -> list[SiteId]:

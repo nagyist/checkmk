@@ -1,0 +1,19 @@
+title: HPE MSA 2040: Volume Health Status
+agents: linux
+catalog: hw/storagehw/hp
+license: GPLv2
+distribution: check_mk
+description:
+ This check reports the health states of the volumes
+ of a HPE MSA 2040 storage system.
+ To make it work you have to configure the hp_msa datasource program via WATO.
+
+ If the state of the volumes are "OK" then the service state is OK.
+ Otherwise the service shows the health status and reason of the volume
+ and changes to WARN or CRIT.
+
+item:
+ Name of the volume
+
+discovery:
+ One service is created.

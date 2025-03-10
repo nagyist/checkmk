@@ -10,6 +10,7 @@
 
 #include <bitset>
 #include <cstddef>
+#include <iterator>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -21,9 +22,6 @@ namespace mk {
 std::string unsafe_tolower(const std::string &str);
 std::string unsafe_toupper(const std::string &str);
 
-bool starts_with(std::string_view input, std::string_view test);
-bool ends_with(std::string_view input, std::string_view test);
-
 std::string replace_chars(const std::string &str,
                           const std::string &chars_to_replace,
                           char replacement);
@@ -31,9 +29,6 @@ std::string replace_chars(const std::string &str,
 std::vector<std::string> split(const std::string &str, char delimiter);
 
 std::tuple<std::string, std::string> splitCompositeKey2(
-    const std::string &composite_key);
-
-std::tuple<std::string, std::string, std::string> splitCompositeKey3(
     const std::string &composite_key);
 
 std::string join(const std::vector<std::string> &values,
@@ -53,14 +48,8 @@ inline std::string rstrip(const std::string &str) {
     return rstrip(str, whitespace);
 }
 
-std::string strip(const std::string &str, const std::string &chars);
-
-inline std::string strip(const std::string &str) {
-    return strip(str, whitespace);
-}
-
 struct escape_nonprintable {
-    const std::string_view buffer;
+    std::string_view buffer;
 };
 
 std::ostream &operator<<(std::ostream &os, const escape_nonprintable &enp);
@@ -77,21 +66,30 @@ std::string replace_first(const std::string &str, const std::string &from,
 
 std::string replace_all(const std::string &str, const std::string &from,
                         const std::string &to);
-std::string from_multi_line(const std::string &str);
-std::string to_multi_line(const std::string &str);
 
 std::string ipv4ToString(in_addr_t ipv4_address);
+
 namespace ec {
 bool is_none(const std::string &str);
 std::vector<std::string> split_list(const std::string &str);
 }  // namespace ec
 
 bool is_utf8(std::string_view s);
+
+// -----------------------------------------------------------------------------
+// We basically use a std::string_view argument like a stream below.
+
+void skip_whitespace(std::string_view &str);
+
+// An argument starts with the first non-whitespace character and extends up to
+// the next whitespace character. Optionally, the argument can be in single
+// quotes, where 2 consecutive quotes are treated as a verbatim quote.
+std::string next_argument(std::string_view &str);
 }  // namespace mk
 
 template <size_t N>
 struct FormattedBitSet {
-    const std::bitset<N> &value;
+    std::bitset<N> value;
 };
 
 template <size_t N>

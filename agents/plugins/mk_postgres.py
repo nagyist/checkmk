@@ -7,33 +7,70 @@ r"""Check_MK Agent Plugin: mk_postgres
 
 This is a Check_MK Agent plugin. If configured, it will be called by the
 agent without any arguments.
+
+Can be configured with $MK_CONFDIR/postgres.cfg
+Example for postgres.cfg file:
+
+-----postgres.cfg-----------------------------------------
+DBUSER=postgres
+PG_BINARY_PATH=/usr/bin/psql
+INSTANCE=/home/postgres/db1.env:USER_NAME:/PATH/TO/.pgpass:
+INSTANCE=/home/postgres/db2.env:USER_NAME:/PATH/TO/.pgpass:
+----------------------------------------------------------
+
+Example of an environment file:
+
+-----/home/postgres/db1.env-----------------------------------------
+export PGDATABASE="data"
+export PGPORT="5432"
+export PGVERSION="14"
+----------------------------------------------------------
+
+Inside of the environment file, only `PGPORT` is mandatory.
+In case there is no `INSTANCE` specified by the postgres.cfg, then the plugin assumes defaults.
+For example, the configuration
+
+-----postgres.cfg-----------------------------------------
+DBUSER=postgres
+PG_BINARY_PATH=/usr/bin/psql
+----------------------------------------------------------
+
+is equivalent to
+
+-----postgres.cfg-----------------------------------------
+DBUSER=postgres
+PG_BINARY_PATH=/usr/bin/psql
+INSTANCE=/home/postgres/does-not-exist.env:postgres::postgres
+----------------------------------------------------------
+
+-----/home/postgres/does-not-exist.env--------------------
+export PGDATABASE="main"
+export PGPORT="5432"
+----------------------------------------------------------
+
+The only difference being `/home/postgres/does-not-exist.env` does not exist in the first setup.
+Different defaults are chosen for Windows.
 """
 
-__version__ = "2.3.0b1"
+__version__ = "2.5.0b1"
 
 import abc
 import io
 import logging
 
 # optparse exist in python2.6 up to python 3.8. Do not use argparse, because it will not run with python2.6
-import optparse  # pylint: disable=W0402
+import optparse
 import os
 import platform
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 
 try:
-    from typing import (  # noqa: F401 # pylint: disable=unused-import
-        Any,
-        Callable,
-        Dict,
-        Iterable,
-        List,
-        Optional,
-        Sequence,
-        Tuple,
-    )
+    from collections.abc import Callable, Iterable, Sequence  # noqa: F401
+    from typing import Any  # noqa: F401
 except ImportError:
     # We need typing only for testing
     pass
@@ -101,9 +138,8 @@ def ensure_str(s):
     if sys.version_info[0] >= 3:
         if isinstance(s, bytes):
             return s.decode("utf-8")
-    else:
-        if isinstance(s, unicode):  # pylint: disable=undefined-variable
-            return s.encode("utf-8")
+    elif isinstance(s, unicode):  # noqa: F821
+        return s.encode("utf-8")
     return s
 
 
@@ -125,8 +161,8 @@ class PostgresBase:
     __metaclass__ = abc.ABCMeta
     _supported_pg_versions = ["12"]
 
-    def __init__(self, db_user, instance, process_match_patterns):
-        # type: (str, Dict, Sequence[re.Pattern]) -> None
+    def __init__(self, db_user, pg_binary_path, instance, process_match_patterns):
+        # type: (str, str | None, dict, Sequence[re.Pattern]) -> None
         self.db_user = db_user
         self.name = instance["name"]
         self.pg_user = instance["pg_user"]
@@ -135,10 +171,15 @@ class PostgresBase:
         self.pg_passfile = instance.get("pg_passfile", "")
         self.pg_version = instance.get("pg_version")
         self.my_env = os.environ.copy()
-        self.my_env["PGPASSFILE"] = instance.get("pg_passfile", "")
+        pg_passfile = instance.get("pg_passfile")
+        if pg_passfile:
+            self.my_env["PGPASSFILE"] = pg_passfile
         self.sep = os.sep
         self.psql_binary_name = "psql"
-        self.psql_binary_path = self.get_psql_binary_path()
+        if pg_binary_path is None:
+            self.psql_binary_path = self.get_psql_binary_path()
+        else:
+            self.psql_binary_path = pg_binary_path
         self.psql_binary_dirname = self.get_psql_binary_dirname()
         self.conn_time = ""  # For caching as conn_time and version are in one query
         self.process_match_patterns = process_match_patterns
@@ -215,8 +256,8 @@ class PostgresBase:
         condition = "%s = %s" % (row, idle)
 
         sql_cmd = (
-            "SELECT %s, count(*) FROM pg_stat_activity " "WHERE %s IS NOT NULL GROUP BY (%s);"
-        ) % (condition, row, condition)
+            "SELECT %s, count(*) FROM pg_stat_activity WHERE %s IS NOT NULL GROUP BY (%s);"
+        ) % (condition, row, condition)  # nosec B608 # BNS:fa3c6c
 
         out = self.run_sql_as_db_user(
             sql_cmd, quiet=False, extra_args="--variable ON_ERROR_STOP=1", field_sep=" "
@@ -297,7 +338,7 @@ class PostgresBase:
         """
 
         out = subprocess_check_output(
-            ["%s%spg_isready" % (self.psql_binary_dirname, self.sep), "-p", self.pg_port],
+            ["%s%spg_isready" % (self.psql_binary_dirname, os.sep), "-p", self.pg_port],
         )
 
         sys.stdout.write("%s\n" % ensure_str(out))
@@ -417,7 +458,7 @@ class PostgresWin(PostgresBase):
     def run_sql_as_db_user(
         self, sql_cmd, extra_args="", field_sep=";", quiet=True, rows_only=True, mixed_cmd=False
     ):
-        # type: (str, str, str, Optional[bool], Optional[bool],Optional[bool]) -> str
+        # type: (str, str, str, bool | None, bool | None,bool | None) -> str
         """This method implements the system specific way to call the psql interface"""
         extra_args += " -U %s" % self.pg_user
         extra_args += " -d %s" % self.pg_database
@@ -445,7 +486,7 @@ class PostgresWin(PostgresBase):
                 self.db_user,
                 sql_cmd,
             )
-        proc = subprocess.Popen(  # pylint: disable=consider-using-with
+        proc = subprocess.Popen(
             cmd_str,
             env=self.my_env,
             stdout=subprocess.PIPE,
@@ -551,7 +592,7 @@ class PostgresWin(PostgresBase):
         return out.rstrip()
 
     def get_stats(self, databases):
-        # type: (List[str]) -> str
+        # type: (list[str]) -> str
         """Get the stats"""
         # The next query had to be slightly modified:
         # As cmd.exe interprets > as redirect and we need <> as "not equal", this was changed to
@@ -583,7 +624,7 @@ class PostgresWin(PostgresBase):
         return self.run_sql_as_db_user(query, mixed_cmd=True, rows_only=cur_rows_only)
 
     def get_version_and_connection_time(self):
-        # type: () -> Tuple[str, str]
+        # type: () -> tuple[str, str]
         """Get the pg version and the time for the query connection"""
         cmd = "SELECT version() AS v"
 
@@ -594,7 +635,7 @@ class PostgresWin(PostgresBase):
         return out, "%.3f" % diff
 
     def get_bloat(self, databases, numeric_version):
-        # type: (List[Any], float) -> str
+        # type: (list[Any], float) -> str
         """Get the db bloats"""
         # Bloat index and tables
         # Supports versions <9.0, >=9.0
@@ -726,23 +767,29 @@ class PostgresWin(PostgresBase):
                 "BY totalwastedbytes DESC LIMIT 10;"
             )
 
-        query = "\\pset footer off \\\\"
-
         cur_rows_only = False
+        output = ""
         for idx, database in enumerate(databases):
-            query = "%s \\c %s \\\\ %s" % (query, database, bloat_query)
+            query = "\\pset footer off \\\\ \\c %s \\\\ %s" % (database, bloat_query)
             if idx == 0:
                 query = "%s \\pset tuples_only on" % query
-
-        return self.run_sql_as_db_user(query, mixed_cmd=True, rows_only=cur_rows_only)
+            output += self.run_sql_as_db_user(query, mixed_cmd=True, rows_only=cur_rows_only)
+            cur_rows_only = True
+        return output
 
 
 class PostgresLinux(PostgresBase):
-    def run_sql_as_db_user(
-        self, sql_cmd, extra_args="", field_sep=";", quiet=True, rows_only=True, mixed_cmd=False
+    def _run_sql_as_db_user(
+        self, sql_file_path, extra_args="", field_sep=";", quiet=True, rows_only=True
     ):
-        # type: (str, str, str, bool, bool, bool) -> str
-        base_cmd_list = ["su", "-", self.db_user, "-c", r"""PGPASSFILE=%s %s -X %s -A0 -F'%s'%s"""]
+        # type: (str, str, str, bool, bool) -> str
+        base_cmd_list = [
+            "su",
+            "-",
+            self.db_user,
+            "-c",
+            r"""PGPASSFILE=%s %s -X %s -A0 -F'%s' -f %s""",
+        ]
         extra_args += " -U %s" % self.pg_user
         extra_args += " -d %s" % self.pg_database
         extra_args += " -p %s" % self.pg_port
@@ -752,40 +799,34 @@ class PostgresLinux(PostgresBase):
         if rows_only:
             extra_args += " -t"
 
-        # In case we want to use postgres meta commands AND SQL queries in one call, we need to pipe
-        # the full cmd string into psql executable
-        # see https://www.postgresql.org/docs/9.2/app-psql.html
-        if mixed_cmd:
-            cmd_to_pipe = subprocess.Popen(  # pylint: disable=consider-using-with
-                ["echo", sql_cmd], stdout=subprocess.PIPE
-            )
-            base_cmd_list[-1] = base_cmd_list[-1] % (
-                self.pg_passfile,
-                self.psql_binary_path,
-                extra_args,
-                field_sep,
-                "",
-            )
+        base_cmd_list[-1] = base_cmd_list[-1] % (
+            self.pg_passfile,
+            self.psql_binary_path,
+            extra_args,
+            field_sep,
+            sql_file_path,
+        )
+        proc = subprocess.Popen(base_cmd_list, env=self.my_env, stdout=subprocess.PIPE)
+        return _sanitize_sql_query(proc.communicate()[0])
 
-            receiving_pipe = subprocess.Popen(  # pylint: disable=consider-using-with
-                base_cmd_list, stdin=cmd_to_pipe.stdout, stdout=subprocess.PIPE, env=self.my_env
+    def run_sql_as_db_user(
+        self, sql_cmd, extra_args="", field_sep=";", quiet=True, rows_only=True, mixed_cmd=False
+    ):
+        # type: (str, str, str, bool, bool, bool) -> str
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            tmp.write(sql_cmd.encode("utf-8"))
+            # set cursor to the beginning of the file
+            tmp.seek(0)
+            # We use 'psql ... -f <FILE_PATH>', the tmp file has to be readable to all users,
+            # ie. stat.S_IROTH
+            os.chmod(tmp.name, stat.S_IROTH)
+            return self._run_sql_as_db_user(
+                tmp.name,
+                extra_args=extra_args,
+                field_sep=field_sep,
+                quiet=quiet,
+                rows_only=rows_only,
             )
-            out = receiving_pipe.communicate()[0]
-
-        else:
-            base_cmd_list[-1] = base_cmd_list[-1] % (
-                self.pg_passfile,
-                self.psql_binary_path,
-                extra_args,
-                field_sep,
-                ' -c "%s" ' % sql_cmd,
-            )
-            proc = subprocess.Popen(  # pylint: disable=consider-using-with
-                base_cmd_list, env=self.my_env, stdout=subprocess.PIPE
-            )
-            out = proc.communicate()[0]
-
-        return _sanitize_sql_query(out)
 
     def get_psql_binary_path(self):
         # type: () -> str
@@ -809,12 +850,10 @@ class PostgresLinux(PostgresBase):
 
     def _default_psql_binary_path(self):
         # type: () -> str
-        try:
-            proc = subprocess.Popen(  # pylint: disable=consider-using-with
-                ["which", self.psql_binary_name], stdout=subprocess.PIPE
-            )
-            out = ensure_str(proc.communicate()[0])
-        except subprocess.CalledProcessError:
+        proc = subprocess.Popen(["which", self.psql_binary_name], stdout=subprocess.PIPE)
+        out = ensure_str(proc.communicate()[0])
+
+        if proc.returncode != 0:
             raise RuntimeError("Could not determine %s executable." % self.psql_binary_name)
 
         return out.strip()
@@ -830,7 +869,7 @@ class PostgresLinux(PostgresBase):
         return self.name == "main" and "data" in proc
 
     def _filter_instances(self, procs_list, proc_sensitive_filter):
-        # type: (List[str], Callable[[str], bool]) -> List[str]
+        # type: (list[str], Callable[[str], bool]) -> list[str]
         return [
             proc
             for proc in procs_list
@@ -887,7 +926,7 @@ class PostgresLinux(PostgresBase):
         )
 
     def get_stats(self, databases):
-        # type: (List[str]) -> str
+        # type: (list[str]) -> str
         sql_cmd_lastvacuum = (
             "SELECT "
             "current_database() AS datname, nspname AS sname, "
@@ -915,7 +954,7 @@ class PostgresLinux(PostgresBase):
         return self.run_sql_as_db_user(query, mixed_cmd=True, rows_only=cur_rows_only)
 
     def get_version_and_connection_time(self):
-        # type: () -> Tuple[str, str]
+        # type: () -> tuple[str, str]
         cmd = "SELECT version() AS v"
         usage_start = resource.getrusage(resource.RUSAGE_CHILDREN)
         out = self.run_sql_as_db_user(cmd)
@@ -928,7 +967,7 @@ class PostgresLinux(PostgresBase):
         return out, "%.3f" % real
 
     def get_bloat(self, databases, numeric_version):
-        # type: (List[Any], float) -> str
+        # type: (list[Any], float) -> str
         # Bloat index and tables
         # Supports versions <9.0, >=9.0
         # This huge query has been gratefully taken from Greg Sabino Mullane's check_postgres.pl
@@ -1064,12 +1103,12 @@ class PostgresLinux(PostgresBase):
         return self.run_sql_as_db_user(query, mixed_cmd=True, rows_only=cur_rows_only)
 
 
-def postgres_factory(db_user, pg_instance):
-    # type: (str, Dict[str, Optional[str]]) -> PostgresBase
+def postgres_factory(db_user, pg_binary_path, pg_instance):
+    # type: (str, str | None, dict[str, str | None]) -> PostgresBase
     if IS_LINUX:
-        return PostgresLinux(db_user, pg_instance, LINUX_PROCESS_MATCH_PATTERNS)
+        return PostgresLinux(db_user, pg_binary_path, pg_instance, LINUX_PROCESS_MATCH_PATTERNS)
     if IS_WINDOWS:
-        return PostgresWin(db_user, pg_instance, WINDOWS_PROCESS_MATCH_PATTERNS)
+        return PostgresWin(db_user, pg_binary_path, pg_instance, WINDOWS_PROCESS_MATCH_PATTERNS)
     raise OSNotImplementedError
 
 
@@ -1137,7 +1176,7 @@ class LinuxHelpers(Helpers):
     def get_default_postgres_user():
         for user_id in ("pgsql", "postgres"):
             try:
-                proc = subprocess.Popen(  # pylint: disable=consider-using-with
+                proc = subprocess.Popen(
                     ["id", user_id], stdout=subprocess.PIPE, stderr=subprocess.PIPE
                 )
                 proc.communicate()
@@ -1167,34 +1206,47 @@ def open_env_file(file_to_open):
 
 
 def parse_env_file(env_file):
-    # type: (str) -> Tuple[str, str, Optional[str]]
+    # type: (str) -> tuple[str, str, str | None]
     pg_port = None  # mandatory in env_file
     pg_database = "postgres"  # default value
     pg_version = None
+
     for line in open_env_file(env_file):
         line = line.strip()
+        if not line or "=" not in line or line.startswith("#"):
+            continue
         if "PGDATABASE=" in line:
             pg_database = re.sub(re.compile("#.*"), "", line.split("=")[-1]).strip()
         elif "PGPORT=" in line:
             pg_port = re.sub(re.compile("#.*"), "", line.split("=")[-1]).strip()
         elif "PGVERSION=" in line:
             pg_version = re.sub(re.compile("#.*"), "", line.split("=")[-1]).strip()
+
     if pg_port is None:
         raise ValueError("PGPORT is not specified in %s" % env_file)
     return pg_database, pg_port, pg_version
 
 
+def _parse_INSTANCE_value(value, config_separator):
+    # type: (str, str) -> tuple[str, str, str, str]
+    keys = value.split(config_separator)
+    if len(keys) == 3:
+        # Old format (deprecated in Werk 16016), but we don't force updates unless there is
+        # a substantial benefit.
+        keys = keys + [""]
+    env_file, pg_user, pg_passfile, instance_name = keys
+    env_file = env_file.strip()
+    return env_file, pg_user, pg_passfile, instance_name or env_file.split(os.sep)[-1].split(".")[0]
+
+
 def parse_postgres_cfg(postgres_cfg, config_separator):
-    # type: (List[str], str) -> Tuple[str, List[Dict[str, Optional[str]]]]
+    # type: (list[str], str) -> tuple[str, str | None, list[dict[str, str | None]]]
     """
     Parser for Postgres config. x-Plattform compatible.
-
-    Example for .cfg file:
-    DBUSER=postgres
-    INSTANCE=/home/postgres/db1.env:USER_NAME:/PATH/TO/.pgpass
-    INSTANCE=/home/postgres/db2.env:USER_NAME:/PATH/TO/.pgpass
+    See comment at the beginning of this file for an example.
     """
     dbuser = None
+    pg_binary_path = None
     instances = []
     for line in postgres_cfg:
         if line.startswith("#") or "=" not in line:
@@ -1203,13 +1255,16 @@ def parse_postgres_cfg(postgres_cfg, config_separator):
         key, value = line.split("=")
         if key == "DBUSER":
             dbuser = value.rstrip()
+        if key == "PG_BINARY_PATH":
+            pg_binary_path = value.rstrip()
         if key == "INSTANCE":
-            env_file, pg_user, pg_passfile = value.split(config_separator)
-            env_file = env_file.strip()
+            env_file, pg_user, pg_passfile, instance_name = _parse_INSTANCE_value(
+                value, config_separator
+            )
             pg_database, pg_port, pg_version = parse_env_file(env_file)
             instances.append(
                 {
-                    "name": env_file.split(os.sep)[-1].split(".")[0],
+                    "name": instance_name.strip(),
                     "pg_user": pg_user.strip(),
                     "pg_passfile": pg_passfile.strip(),
                     "pg_database": pg_database,
@@ -1219,7 +1274,7 @@ def parse_postgres_cfg(postgres_cfg, config_separator):
             )
     if dbuser is None:
         raise ValueError("DBUSER must be specified in postgres.cfg")
-    return dbuser, instances
+    return dbuser, pg_binary_path, instances
 
 
 def parse_arguments(argv):
@@ -1237,7 +1292,7 @@ def parse_arguments(argv):
 
 
 def main(argv=None):
-    # type: (Optional[List]) -> int
+    # type: (list | None) -> int
 
     helper = helper_factory()
     if argv is None:
@@ -1251,17 +1306,19 @@ def main(argv=None):
         level={0: logging.WARN, 1: logging.INFO, 2: logging.DEBUG}.get(opt.verbose, logging.DEBUG),
     )
 
-    instances = []  # type: List[Dict[str, Optional[str]]]
+    instances = []  # type: list[dict[str, str | None]]
     try:
         postgres_cfg_path = os.path.join(
             os.getenv("MK_CONFDIR", helper.get_default_path()), "postgres.cfg"
         )
         with open(postgres_cfg_path) as opened_file:
             postgres_cfg = opened_file.readlines()
-        dbuser, instances = parse_postgres_cfg(postgres_cfg, helper.get_conf_sep())
+        postgres_cfg = [ensure_str(el) for el in postgres_cfg]
+        dbuser, pg_binary_path, instances = parse_postgres_cfg(postgres_cfg, helper.get_conf_sep())
     except Exception:
         _, e = sys.exc_info()[:2]  # python2 and python3 compatible exception logging
         dbuser = helper.get_default_postgres_user()
+        pg_binary_path = None
         LOGGER.debug("try_parse_config: exception: %s", str(e))
         LOGGER.debug('Using "%s" as default postgres user.', dbuser)
 
@@ -1280,7 +1337,7 @@ def main(argv=None):
         instances.append(default_postgres_installation_parameters)
 
     for instance in instances:
-        postgres = postgres_factory(dbuser, instance)
+        postgres = postgres_factory(dbuser, pg_binary_path, instance)
         if opt.test_connection:
             postgres.is_pg_ready()
             sys.exit(0)

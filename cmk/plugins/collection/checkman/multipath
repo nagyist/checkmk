@@ -1,0 +1,28 @@
+title: State of Multipathing on Linux
+agents: linux
+catalog: os/storage
+license: GPLv2
+distribution: check_mk
+description:
+ This check monitors the state of multipath devices on Linux
+ hosts. For each multipath device at time of inventory the number
+ of paths is put into the check parameters. If later the number
+ of paths is less then expected, the check goes critical. So it
+ does if any of the paths is broken.
+
+ If the number of paths is higher than expected, the check goes
+ warning. A re-discovery of the check might be necessary in that
+ case.
+
+ This check is based on the output of the command {multipath -l} as
+ sent by the Linux agent. It correctly deals with various subtle
+ differences between the available versions of the multipath tools.
+
+item:
+ The UUID of the multipath device, e.g. {"360a980004334644d654a364469555a76"}.
+ Via {inventory_multipath_rules} you can specify wether an alias should be used
+ as item instead of the UUID. If the multipath device has an alias the alias will
+ be used as item.
+
+discovery:
+ One service is created for each multipath device.

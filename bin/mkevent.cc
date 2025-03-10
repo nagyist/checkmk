@@ -152,10 +152,9 @@ int main(int argc, char **argv) {
         strncpy(message, argv[1], sizeof(message) - 1);
     }
 
-    /* If we have a remote host and there is no local event Console running,
-       then we will send the message via syslog to the remote host. */
+    /* If we have a remote host, send the message via syslog to the remote host. */
     int fd;
-    if (file_exists(path_to_pipe) == 0 && remote[0] != 0) {
+    if (remote[0] != 0) {
         if (isdigit(remote[0]) == 0) {
             std::cerr
                 << "ERROR: Please specify the remote host as IPv4 address, not '"
@@ -168,9 +167,10 @@ int main(int argc, char **argv) {
         servaddr.sin_family = AF_INET;
         servaddr.sin_addr.s_addr = inet_addr(remote);
         servaddr.sin_port = htons(514);
-        sendto(fd, message, strlen(message), 0,
-               reinterpret_cast<struct sockaddr *>(&servaddr),
-               sizeof(servaddr));
+        ::sendto(fd, message, strlen(message), 0,
+                 // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+                 reinterpret_cast<struct sockaddr *>(&servaddr),
+                 sizeof(servaddr));
     } else {
         fd = open(path_to_pipe.c_str(), O_WRONLY);
         if (fd < 0) {

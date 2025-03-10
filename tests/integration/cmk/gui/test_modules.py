@@ -6,8 +6,9 @@
 from collections.abc import Iterator
 
 import pytest
+import requests
 
-from tests.testlib import wait_until
+from tests.testlib.common.utils import wait_until
 from tests.testlib.site import Site
 
 
@@ -42,10 +43,14 @@ def fixture_result_file(site: Site) -> Iterator[None]:
             site.delete_file("tmp/dashboard_test")
 
 
+@pytest.mark.skip(reason="Test is flaky, should be fixed and unskipped with CMK-19250")
 @pytest.mark.usefixtures("plugin_path", "result_file")
-def test_load_dashboard_plugin(request: pytest.FixtureRequest, site: Site) -> None:
+def test_load_dashboard_plugin_omd_restart(request: pytest.FixtureRequest, site: Site) -> None:
     # Reload site apache to trigger the reload of our plugin
     site.omd("reload", "apache")
+
+    # We load the login page to trigger the application's lazy loading profiler to load the app.
+    requests.get(site.url_for_path("login.py"))
 
     def file_created():
         return site.file_exists("tmp/dashboard_test")

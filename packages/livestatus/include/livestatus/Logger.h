@@ -6,8 +6,7 @@
 #ifndef Logger_h
 #define Logger_h
 
-// The stream-related pragmas are probably caused by
-// https://github.com/include-what-you-use/include-what-you-use/issues/277
+// NOTE: <iosfwd> should be enough, but IWYU complains then.
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -94,7 +93,8 @@ public:
     }
 
 private:
-    std::shared_ptr<Formatter> _formatter{std::make_shared<SimpleFormatter>()};
+    std::atomic<std::shared_ptr<Formatter>> _formatter{
+        std::make_shared<SimpleFormatter>()};
 };
 
 class SharedStreamHandler : public Handler {

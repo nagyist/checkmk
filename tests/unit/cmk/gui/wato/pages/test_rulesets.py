@@ -3,21 +3,21 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 from collections.abc import Iterable
 
 import pytest
 from pytest import MonkeyPatch
 from pytest_mock import MockerFixture
 
-from cmk.utils.redis import disable_redis
+from cmk.utils.rulesets.conditions import HostOrServiceConditions
 from cmk.utils.rulesets.ruleset_matcher import TagConditionNE
 from cmk.utils.tags import TagConfig, TagGroupID, TagID
-from cmk.utils.type_defs import HostOrServiceConditions
 
+from cmk.gui.config import active_config
 from cmk.gui.utils.html import HTML
-from cmk.gui.wato.pages.rulesets import _get_groups, active_config, Rule, RuleConditionRenderer
-from cmk.gui.watolib.hosts_and_folders import CREFolder, Folder, Host
-from cmk.gui.watolib.rulesets import Ruleset
+from cmk.gui.wato.pages.rulesets import RuleConditionRenderer
+from cmk.gui.watolib.hosts_and_folders import FolderLookupCache, Host
 
 
 @pytest.fixture(name="tag_config")
@@ -96,7 +96,7 @@ def patch_tag_config(
 @pytest.fixture(name="folder_lookup")
 def fixture_folder_lookup(mocker: MockerFixture) -> None:
     folder_cache = {"cached_host": "cached_host_value"}
-    mocker.patch.object(Folder, "get_folder_lookup_cache", return_value=folder_cache)
+    mocker.patch.object(FolderLookupCache, "get_cache", return_value=folder_cache)
 
     class MockHost:
         def edit_url(self):
@@ -112,37 +112,37 @@ class TestRuleConditionRenderer:
             pytest.param(
                 "tag_grp_1",
                 "grp_1_tg_1",
-                HTML("Host tag: Tag group 1 is <b>Tag 1.1</b>"),
+                HTML.without_escaping("Host tag: Tag group 1 is <b>Tag 1.1</b>"),
                 id="grouped tag",
             ),
             pytest.param(
                 "tag_grp_1",
                 {"$ne": "grp_1_tg_1"},
-                HTML("Host tag: Tag group 1 is <b>not</b> <b>Tag 1.1</b>"),
+                HTML.without_escaping("Host tag: Tag group 1 is <b>not</b> <b>Tag 1.1</b>"),
                 id="negated grouped tag",
             ),
             pytest.param(
                 "aux_tag_1",
                 "aux_tag_1",
-                HTML("Host has tag <b>Auxiliary tag 1</b>"),
+                HTML.without_escaping("Host has tag <b>Auxiliary tag 1</b>"),
                 id="auxiliary tag",
             ),
             pytest.param(
                 "aux_tag_1",
                 {"$ne": "aux_tag_1"},
-                HTML("Host does not have tag <b>Auxiliary tag 1</b>"),
+                HTML.without_escaping("Host does not have tag <b>Auxiliary tag 1</b>"),
                 id="negated auxiliary tag",
             ),
             pytest.param(
                 "xyz",
                 "a",
-                HTML("Unknown tag: Host has the tag <tt>a</tt>"),
+                HTML.without_escaping("Unknown tag: Host has the tag <tt>a</tt>"),
                 id="unknown tag group",
             ),
             pytest.param(
                 "xyz",
                 "grp_1_tg_1",
-                HTML("Unknown tag: Host has the tag <tt>grp_1_tg_1</tt>"),
+                HTML.without_escaping("Unknown tag: Host has the tag <tt>grp_1_tg_1</tt>"),
                 id="unknown tag",
             ),
         ],
@@ -182,14 +182,14 @@ class TestRuleConditionRenderer:
                 }
             )
         ) == [
-            HTML(
+            HTML.without_escaping(
                 "Host tag: Tag group 1 is <b>Tag 1.1</b> <i>or</i> Host tag: Tag group 1 is <b>Tag 1.2</b>"
             ),
-            HTML(
+            HTML.without_escaping(
                 "Neither Host tag: Tag group 2 is <b>Tag 2.1</b> <i>nor</i> Host tag: Tag group 2 is <b>Tag 2.2</b>"
             ),
-            HTML("Host tag: Tag group 3 is <b>Tag 3.1</b>"),
-            HTML("Host does not have tag <b>Auxiliary tag 1</b>"),
+            HTML.without_escaping("Host tag: Tag group 3 is <b>Tag 3.1</b>"),
+            HTML.without_escaping("Host does not have tag <b>Auxiliary tag 1</b>"),
         ]
 
     # FIXME: add special case if only one regex is given
@@ -277,7 +277,9 @@ class TestRuleConditionRenderer:
     def test_render_host_condition_text(
         self, conditions: HostOrServiceConditions, expected: str
     ) -> None:
-        assert RuleConditionRenderer()._render_host_condition_text(conditions) == HTML(expected)
+        assert RuleConditionRenderer()._render_host_condition_text(
+            conditions
+        ) == HTML.without_escaping(expected)
 
     @pytest.mark.parametrize(
         "conditions, exception",
@@ -334,63 +336,67 @@ class TestRuleConditionRenderer:
                 "service",
                 "foo",
                 [],
-                [HTML("Does not match any service")],
+                [HTML.without_escaping("Does not match any service")],
                 id="item_type and item_name without conditions",
             ),
             pytest.param(
                 "service",
                 "foo",
                 ["bar"],
-                [HTML("Service name is <b>bar</b>")],
+                [HTML.without_escaping("Service name is <b>bar</b>")],
                 id="item_type and item_name without conditions",
             ),
             pytest.param(
                 "item",
                 "foo",
                 ["bar"],
-                [HTML("foo is <b>bar</b>")],
+                [HTML.without_escaping("foo is <b>bar</b>")],
                 id="item with one name",
             ),
             pytest.param(
                 "item",
                 "foo",
                 ["bar", "baz"],
-                [HTML("foo is <b>bar</b> or <b>baz</b>")],
+                [HTML.without_escaping("foo is <b>bar</b> or <b>baz</b>")],
                 id="item with two names",
             ),
             pytest.param(
                 "service",
                 "foo",
                 [{"$regex": "b?r"}, "baz"],
-                [HTML("Service name begins with <b>b?r</b> or begins with <b>baz</b>")],
+                [
+                    HTML.without_escaping(
+                        "Service name begins with <b>b?r</b> or begins with <b>baz</b>"
+                    )
+                ],
                 id="service with one regex and one name",
             ),
             pytest.param(
                 "service",
                 "foo",
                 [{"$regex": "b?r"}, {"$regex": "b.*z"}],
-                [HTML("Service name begins with <b>b?r</b> or <b>b.*z</b>")],
+                [HTML.without_escaping("Service name begins with <b>b?r</b> or <b>b.*z</b>")],
                 id="service with two regexes",
             ),
             pytest.param(
                 "item",
                 "foo",
                 {"$nor": ["bar"]},
-                [HTML("foo is not <b>bar</b>")],
+                [HTML.without_escaping("foo is not <b>bar</b>")],
                 id="negated item with one name",
             ),
             pytest.param(
                 "item",
                 "foo",
                 {"$nor": [{"$regex": "b?z"}]},
-                [HTML("foo does not begin with <b>b?z</b>")],
+                [HTML.without_escaping("foo does not begin with <b>b?z</b>")],
                 id="negated item with one regex",
             ),
             pytest.param(
                 "item",
                 "foo",
                 {"$nor": ["bar", "baz"]},
-                [HTML("foo is not <b>bar</b> or <b>baz</b>")],
+                [HTML.without_escaping("foo is not <b>bar</b> or <b>baz</b>")],
                 id="negated item with two names",
             ),
             pytest.param(
@@ -398,7 +404,7 @@ class TestRuleConditionRenderer:
                 "foo",
                 {"$nor": ["bar", {"$regex": "b?z"}, "bam"]},
                 [
-                    HTML(
+                    HTML.without_escaping(
                         "foo begins not with <b>bar</b>, begins not with <b>b?z</b> or begins not with <b>bam</b>"
                     )
                 ],
@@ -408,7 +414,7 @@ class TestRuleConditionRenderer:
                 "item",
                 "foo",
                 {"$nor": [{"$regex": "f.*o"}, {"$regex": "b?z"}]},
-                [HTML("foo does not begin with <b>f.*o</b> or <b>b?z</b>")],
+                [HTML.without_escaping("foo does not begin with <b>f.*o</b> or <b>b?z</b>")],
                 id="negated item with two regexes",
             ),
         ],
@@ -424,52 +430,3 @@ class TestRuleConditionRenderer:
             list(RuleConditionRenderer()._service_conditions(item_type, item_name, conditions))
             == expected
         )
-
-
-def test_get_groups() -> None:
-    """Test sort order of rules"""
-    expected_folder_order: list[CREFolder] = [
-        Folder("folder2/folder2/folder2", "folder2"),
-        Folder("folder2/folder2/folder1", "folder1"),
-        Folder("folder2/folder2", "folder2"),
-        Folder("folder2/folder1/folder2", "folder2"),
-        Folder("folder2/folder1/folder1", "folder1"),
-        Folder("folder2/folder1", "folder1"),
-        Folder("folder2", "folder2"),
-        Folder("folder1/folder2/folder2", "folder2"),
-        Folder("folder1/folder2/folder1", "folder1"),
-        Folder("folder1/folder2", "folder2"),
-        Folder("folder1/folder1/folder2", "folder2"),
-        Folder("folder1/folder1/folder1", "folder1"),
-        Folder("folder1/folder1", "folder1"),
-        Folder("folder1", "folder1"),
-        Folder("folder4", "abc"),
-        Folder("", "Main"),
-    ]
-
-    root: CREFolder = Folder.root_folder()
-    ruleset: Ruleset = Ruleset("only_hosts", {TagID("TAG1"): TagGroupID("TG1")})
-    rules: list[tuple[CREFolder, int, Rule]] = [
-        (root, 0, Rule.from_ruleset_defaults(root, ruleset))
-    ]
-
-    for nr in range(1, 3):
-        folder = Folder("folder%d" % nr, parent_folder=root)
-        rules.append((folder, 0, Rule.from_ruleset_defaults(folder, ruleset)))
-        for x in range(1, 3):
-            subfolder = Folder("folder%d" % x, parent_folder=folder)
-            rules.append((subfolder, 0, Rule.from_ruleset_defaults(folder, ruleset)))
-            for y in range(1, 3):
-                sub_subfolder = Folder("folder%d" % y, parent_folder=subfolder)
-                rules.append((sub_subfolder, 0, Rule.from_ruleset_defaults(folder, ruleset)))
-
-    # Also test renamed folder
-    folder4 = Folder("folder4", parent_folder=root)
-    folder4._title = "abc"  # pylint: disable=protected-access
-    rules.append((folder4, 0, Rule.from_ruleset_defaults(folder4, ruleset)))
-
-    sorted_rules = sorted(
-        rules, key=lambda x: (x[0].path().split("/"), len(rules) - x[1]), reverse=True
-    )
-    with disable_redis():
-        assert list(rule[0] for rule in _get_groups(sorted_rules, root)) == expected_folder_order

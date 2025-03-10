@@ -2,6 +2,7 @@
 # Copyright (C) 2020 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
+# ruff: noqa: A005
 
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from cmk.utils.livestatus_helpers.expressions import (
     UnaryExpression,
 )
 
-LivestatusType = Literal["string", "int", "float", "list", "dict", "time", "blob"]
+LivestatusType = Literal["string", "int", "float", "list", "dict", "dictdouble", "time", "blob"]
 ExpressionDict = dict[str, Any]
 
 
@@ -40,10 +41,6 @@ class Table(abc.ABC):
             if isinstance(value, Column):
                 columns.append(key)
         return columns
-
-
-class Hurz:
-    pass
 
 
 class NoTable(Table):

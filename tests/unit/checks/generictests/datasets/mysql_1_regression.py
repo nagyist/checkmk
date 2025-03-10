@@ -9,6 +9,15 @@
 
 checkname = "mysql"
 
+mock_item_state = {
+    "sessions": {
+        "mysql.sessions": (0, 2),
+    },
+    "innodb_io": {
+        "read": (0.0, 1024),
+        "write": (0.0, 2048),
+    }
+}
 
 info = [
     ["[[mysql]]"],
@@ -301,7 +310,17 @@ checks = {
             [
                 (
                     0,
-                    "read: 0.00 B/s, write: 0.00 B/s",
+                    "Read: 0.00 B/s",
+                    [],
+                ),
+                (
+                    0,
+                    "Write: 0.00 B/s",
+                    [],
+                ),
+                (
+                    0,
+                    "",
                     [
                         ("read", 0.0, None, None, None, None),
                         ("write", 0.0, None, None, None, None),

@@ -1,12 +1,11 @@
 // Configuration Parameters for whole Agent
 #include "stdafx.h"
 
-#include "cfg.h"
-
-#include <WinSock2.h>
+#include "wnx/cfg.h"
 
 #include <ShlObj.h>  // known path
 #include <VersionHelpers.h>
+#include <WinSock2.h>
 #include <direct.h>  // known path
 
 #include <atomic>
@@ -14,21 +13,21 @@
 #include <ranges>
 #include <string>
 
-#include "cap.h"
-#include "cfg_details.h"
-#include "cma_core.h"
 #include "common/cfg_info.h"
 #include "common/object_repo.h"
 #include "common/version.h"
 #include "common/wtools.h"
 #include "common/yaml.h"
-#include "logger.h"
-#include "read_file.h"
 #include "tools/_misc.h"     // setenv
 #include "tools/_process.h"  // GetSomeFolder...
 #include "tools/_tgt.h"      // we need IsDebug
-#include "upgrade.h"
-#include "windows_service_api.h"
+#include "wnx/cap.h"
+#include "wnx/cfg_details.h"
+#include "wnx/cma_core.h"
+#include "wnx/logger.h"
+#include "wnx/read_file.h"
+#include "wnx/upgrade.h"
+#include "wnx/windows_service_api.h"
 namespace fs = std::filesystem;
 namespace rs = std::ranges;
 using namespace std::string_literals;
@@ -608,12 +607,10 @@ bool Folders::setRootEx(const std::wstring &service_name,  // look in registry
     return true;
 }  // namespace cma::cfg::details
 
-void Folders::createDataFolderStructure(const std::wstring &proposed_folder,
-                                        Protection protection) {
+void Folders::createDataFolderStructure(const std::wstring &proposed_folder) {
     try {
         fs::path folder = proposed_folder;
-        data_ = makeDefaultDataFolder(folder.lexically_normal().wstring(),
-                                      protection);
+        data_ = makeDefaultDataFolder(folder.lexically_normal().wstring());
     } catch (const std::exception &e) {
         XLOG::l.bp("Cannot create Default Data Folder , exception : {}",
                    e.what());
@@ -801,11 +798,10 @@ int CreateTree(const fs::path &base_path) {
 // to create folder structure in next folders:
 // 1. ProgramData/CorpName/AgentName
 //
-fs::path Folders::makeDefaultDataFolder(std::wstring_view data_folder,
-                                        Protection protection) {
+fs::path Folders::makeDefaultDataFolder(std::wstring_view data_folder) {
     if (data_folder.empty()) {
         using tools::win::GetSomeSystemFolder;
-        auto draw_folder = [](std::wstring_view DataFolder) -> auto{
+        auto draw_folder = [](std::wstring_view DataFolder) -> auto {
             fs::path app_data = DataFolder;
             app_data /= kAppDataCompanyName;
             app_data /= kAppDataAppName;
@@ -817,14 +813,6 @@ fs::path Folders::makeDefaultDataFolder(std::wstring_view data_folder,
 
         auto app_data = draw_folder(app_data_folder);
         auto ret = CreateTree(app_data);
-        if (protection == Protection::yes) {
-            XLOG::d.i("Protection requested");
-            std::vector<std::wstring> commands;
-
-            security::ProtectAll(
-                fs::path(app_data_folder) / kAppDataCompanyName, commands);
-            wtools::ExecuteCommandsAsync(L"all", commands);
-        }
 
         if (ret == 0) {
             return app_data;
@@ -1247,9 +1235,7 @@ void ConfigInfo::initFolders(
     const std::wstring &data_folder)         // look in dis
 {
     cleanFolders();
-    folders_.createDataFolderStructure(
-        data_folder, service_valid_name.empty() ? Folders::Protection::no
-                                                : Folders::Protection::yes);
+    folders_.createDataFolderStructure(data_folder);
 
     // This is not very good idea, but we want
     // to start logging as early as possible
@@ -1267,7 +1253,11 @@ void ConfigInfo::initFolders(
         std::vector<std::wstring> commands;
         wtools::ProtectFileFromUserWrite(exe_path, commands);
         wtools::ProtectPathFromUserAccess(root, commands);
-        wtools::ExecuteCommandsAsync(L"data", commands);
+
+        auto data = folders_.getData();
+        wtools::ProtectPathFromUserAccess(data.parent_path(), commands);
+        wtools::ProtectPathFromUserAccess(data, commands);
+        wtools::ExecuteCommands(L"all", commands, wtools::ExecuteMode::async);
     }
 
     if (folders_.getData().empty()) {
@@ -1312,7 +1302,7 @@ bool ConfigInfo::pushFolders(const fs::path &root, const fs::path &data) {
     }
     folders_stack_.push(folders_);
     folders_.setRoot({}, root.wstring());
-    folders_.createDataFolderStructure(data, Folders::Protection::no);
+    folders_.createDataFolderStructure(data);
 
     return true;
 }
@@ -1554,30 +1544,35 @@ std::vector<ConfigInfo::YamlData> ConfigInfo::buildYamlData(
     return yamls;
 }
 
-// declares what should be merged
-static void PreMergeSections(YAML::Node target, YAML::Node source) {
-    // plugins:
-    {
-        auto tgt_plugin = target[groups::kPlugins];
-        const auto src_plugin = source[groups::kPlugins];
+namespace {
 
-        MergeStringSequence(tgt_plugin, src_plugin, vars::kPluginsFolders);
-        MergeMapSequence(tgt_plugin, src_plugin, vars::kPluginsExecution,
-                         vars::kPluginPattern);
-    }
+void PreMergeSection(YAML::Node target, YAML::Node source,
+                     std::string_view section) {
+    const auto tgt = target[section];
+    const auto src = source[section];
 
-    // local:
-    {
-        auto tgt_local = target[groups::kLocal];
-        const auto src_local = source[groups::kLocal];
-
-        MergeStringSequence(tgt_local, src_local, vars::kPluginsFolders);
-        MergeMapSequence(tgt_local, src_local, vars::kPluginsExecution,
-                         vars::kPluginPattern);
-    }
+    MergeStringSequence(tgt, src, vars::kPluginsFolders);
+    MergeMapSequence(tgt, src, vars::kPluginsExecution, vars::kPluginPattern);
 }
 
-static bool Is64BitWindows() {
+// declares what should be merged
+void PreMergeSectionPlugins(YAML::Node target, YAML::Node source) {
+    return PreMergeSection(target, source, groups::kPlugins);
+}
+
+void PreMergeSectionLocal(YAML::Node target, YAML::Node source) {
+    return PreMergeSection(target, source, groups::kLocal);
+}
+
+void PreMergeSectionExtensions(YAML::Node target, YAML::Node source) {
+    const auto tgt = target[groups::kExtensions];
+    const auto src = source[groups::kExtensions];
+
+    MergeMapSequence(tgt, src, std::string{vars::kExtensionsExecution},
+                     std::string{vars::kExecutionName});
+}
+
+bool Is64BitWindows() {
 #if defined(_WIN64)
     return true;  // 64-bit programs run only on Win64
 #elif defined(_WIN32)
@@ -1589,6 +1584,7 @@ static bool Is64BitWindows() {
     return false;  // Win64 does not support Win16
 #endif
 }
+}  // namespace
 
 // Scott Meyer method to have a safe singleton
 // static variables with block scope created only once
@@ -1662,12 +1658,14 @@ bool TryMerge(YAML::Node &config_node, const ConfigInfo::YamlData &yaml_data) {
         return false;
     }
 
-    auto bakery = YAML::LoadFile(wtools::ToUtf8(yaml_data.path_.wstring()));
-    // special cases for plugins and folder
-    PreMergeSections(bakery, config_node);
+    auto config = YAML::LoadFile(wtools::ToUtf8(yaml_data.path_.wstring()));
+
+    PreMergeSectionPlugins(config, config_node);
+    PreMergeSectionLocal(config, config_node);
+    PreMergeSectionExtensions(config, config_node);
 
     // normal cases
-    ConfigInfo::smartMerge(config_node, bakery, Combine::overwrite);
+    ConfigInfo::smartMerge(config_node, config, Combine::overwrite);
     return true;
 }
 }  // namespace
@@ -1744,7 +1742,7 @@ LoadCfgStatus ConfigInfo::loadAggregated(const std::wstring &config_filename,
         XLOG::l(XLOG_FLINE + " empty name");
         return LoadCfgStatus::kAllFailed;
     }
-    auto yamls = buildYamlData(config_filename);
+    const auto yamls = buildYamlData(config_filename);
 
     // check root
     auto &root = yamls[0];
@@ -1753,48 +1751,31 @@ LoadCfgStatus ConfigInfo::loadAggregated(const std::wstring &config_filename,
         return LoadCfgStatus::kAllFailed;
     }
 
-    bool changed = false;
-    for (auto &yd : yamls) {
-        if (yd.changed()) {
-            changed = true;
-            break;
-        }
-    }
-
-    if (!changed) {
+    if (rs::all_of(yamls, [](const auto &v) { return !v.changed(); })) {
         return LoadCfgStatus::kFileLoaded;
     }
 
-    int error_code = 0;
     try {
         auto config = YAML::LoadFile(wtools::ToUtf8(yamls[0].path_.wstring()));
-
         if (config[groups::kGlobal].IsDefined()) {
             mergeYamlData(config, yamls);
 
             if (ok_ && user_ok_ && cache_op == YamlCacheOp::update) {
                 StoreUserYamlToCache();
             }
-            return LoadCfgStatus::kFileLoaded;
         }
-        error_code = ErrorCode::kNotCheckMK;
-
+        ok_ = true;
+        return LoadCfgStatus::kFileLoaded;
     } catch (const YAML::ParserException &e) {
         XLOG::l.crit(XLOG_FLINE + " yaml: '{}'", e.what());
-        error_code = ErrorCode::kMalformed;
     } catch (const YAML::BadFile &e) {
         XLOG::l.crit(XLOG_FLINE + " yaml: '{}'", e.what());
-        error_code = ErrorCode::kMissing;
     } catch (...) {
         XLOG::l.crit("Strange exception");
-        error_code = ErrorCode::kWeird;
     }
 
-    if (error_code != 0) {
-        ok_ = false;
-        return LoadCfgStatus::kAllFailed;
-    }
-    return LoadCfgStatus::kFileLoaded;
+    ok_ = false;
+    return LoadCfgStatus::kAllFailed;
 }
 
 // LOOOONG operation
@@ -2005,7 +1986,7 @@ bool PatchRelativePath(YAML::Node yaml_config, std::string_view group_name,
 // wmic product get name,version /format:csv
 //      to get name and version
 // Run
-// wmic product where name="Check MK Agent 2.0" call uninstall /nointeractive
+// wmic product where name="Checkmk Agent 2.3" call uninstall /nointeractive
 //      to remove the product
 // Oprations ARE VERY LONG
 constexpr std::string_view g_wmic_uninstall_command =
@@ -2036,19 +2017,22 @@ fs::path CreateWmicUninstallFile(const fs::path &temp_dir,
 }
 
 bool UninstallProduct(std::string_view name) {
-    fs::path temp{GetTempDir()};
-    auto fname = CreateWmicUninstallFile(temp, name);
+    const fs::path temp{GetTempDir()};
+    const auto fname = CreateWmicUninstallFile(temp, name);
     if (fname.empty()) {
         return false;
     }
     XLOG::l.i("Starting uninstallation command '{}'", fname);
-    auto pid = tools::RunStdCommand(fname.wstring(), true);
-    if (pid == 0) {
-        XLOG::l("Failed to start '{}'", fname);
-        return false;
+
+    if (const auto pid =
+            tools::RunStdCommand(fname.wstring(), tools::WaitForEnd::yes);
+        pid.has_value()) {
+        XLOG::l.i("Started uninstallation command '{}' with pid [{}]", fname,
+                  *pid);
+        return true;
     }
-    XLOG::l.i("Started uninstallation command '{}' with pid [{}]", fname, pid);
-    return true;
+    XLOG::l("Failed to start '{}'", fname);
+    return false;
 }
 
 details::ConfigInfo &GetCfg() noexcept { return details::g_config_info; }

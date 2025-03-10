@@ -4,9 +4,6 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-__version__ = "2.3.0b1"
-
-USER_AGENT = "checkmk-agent-apache_status-" + __version__
 # Checkmk-Agent-Plugin - Apache Server Status
 #
 # Fetches the server-status page from detected or configured apache
@@ -30,6 +27,10 @@ import re
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.request import build_opener, HTTPSHandler, install_opener, Request, urlopen
+
+__version__ = "2.5.0b1"
+
+USER_AGENT = "checkmk-agent-apache_status-" + __version__
 
 if sys.version_info < (2, 6):
     sys.stderr.write("ERROR: Python 2.5 is not supported. Please use Python 2.6 or newer.\n")
@@ -66,7 +67,7 @@ def get_config():
     }
     if os.path.exists(config_file):
         with open(config_file) as config_file_obj:
-            exec(config_file_obj.read(), config)
+            exec(config_file_obj.read(), config)  # nosec B102 # BNS:a29406
     return config
 
 
@@ -92,11 +93,11 @@ def parse_address_and_port(address_and_port, ssl_ports):
     server_port = int(_server_port)
 
     # Use localhost when listening globally
-    if server_address == "0.0.0.0":  # nosec - B104
+    if server_address == "0.0.0.0":  # nosec B104 # BNS:537c43
         server_address = "127.0.0.1"
-    elif server_address == "::":
+    elif server_address in ("::", "*", "[::]"):
         server_address = "[::1]"
-    elif ":" in server_address:
+    elif ":" in server_address and server_address[0] != "[":
         server_address = "[%s]" % server_address
 
     # Switch protocol if port is SSL port. In case you use SSL on another
@@ -118,28 +119,34 @@ def try_detect_servers(ssl_ports):
         "httpd-prefork",
         "httpd2-prefork",
         "httpd2-worker",
+        "httpd-worker",
         "httpd.worker",
         "httpd-event",
         "fcgi-pm",
     ]
 
-    for netstat_line in os.popen("netstat -tlnp 2>/dev/null").readlines():
-        parts = netstat_line.split()
+    #  ss lists parent and first level child processes
+    #  last process in line is the parent:
+    #    users:(("apache2",pid=123456,fd=3),...,("apache2",pid=123,fd=3))
+    #  capture content of last brackets (...))
+    pattern = re.compile(r"users:.*\(([^\(\)]*?)\)\)$")
+
+    for ss_line in os.popen("ss -tlnp 2>/dev/null").readlines():
+        parts = ss_line.split()
         # Skip lines with wrong format
-        if len(parts) < 7 or "/" not in parts[6]:
+        if len(parts) < 6 or "users:" not in parts[5]:
             continue
 
-        pid, proc = parts[6].split("/", 1)
-        to_replace = re.compile("^.*/")
-        proc = to_replace.sub("", proc)
-
-        # the pid/proc field length is limited to 19 chars. Thus in case of
-        # long PIDs, the process names are stripped of by that length.
-        # Workaround this problem here
-        stripped_procs = [p[: 19 - len(pid) - 1] for p in procs]
+        match = re.match(pattern, parts[5])
+        if match is None:
+            continue
+        proc_info = match.group(1)
+        proc, pid, _fd = proc_info.split(",")
+        proc = proc.replace('"', "")
+        pid = pid.replace("pid=", "")
 
         # Skip unwanted processes
-        if proc not in stripped_procs:
+        if proc not in procs:
             continue
 
         scheme, server_address, server_port = parse_address_and_port(parts[3], ssl_ports)
@@ -147,32 +154,27 @@ def try_detect_servers(ssl_ports):
         results.append((scheme, server_address, server_port))
 
     if not results:
-        # if netstat output was empty (maybe not installed), try ss instead
+        # if ss output was empty (maybe not installed), try netstat instead
         # (plugin silently fails without any section output,
         #  if neither netstat nor ss are installed.)
 
-        #  ss lists parent and first level child processes
-        #  last process in line is the parent:
-        #    users:(("apache2",pid=123456,fd=3),...,("apache2",pid=123,fd=3))
-        #  capture content of last brackets (...))
-        pattern = re.compile(r"users:.*\(([^\(\)]*?)\)\)$")
-
-        for ss_line in os.popen("ss -tlnp 2>/dev/null").readlines():
-            parts = ss_line.split()
+        for netstat_line in os.popen("netstat -tlnp 2>/dev/null").readlines():
+            parts = netstat_line.split()
             # Skip lines with wrong format
-            if len(parts) < 6 or "users:" not in parts[5]:
+            if len(parts) < 7 or "/" not in parts[6]:
                 continue
 
-            match = re.match(pattern, parts[5])
-            if match is None:
-                continue
-            proc_info = match.group(1)
-            proc, pid, _fd = proc_info.split(",")
-            proc = proc.replace('"', "")
-            pid = pid.replace("pid=", "")
+            pid, proc = parts[6].split("/", 1)
+            to_replace = re.compile("^.*/")
+            proc = to_replace.sub("", proc)
+
+            # the pid/proc field length is limited to 19 chars. Thus in case of
+            # long PIDs, the process names are stripped of by that length.
+            # Workaround this problem here
+            stripped_procs = [p[: 19 - len(pid) - 1] for p in procs]
 
             # Skip unwanted processes
-            if proc not in procs:
+            if proc not in stripped_procs:
                 continue
 
             scheme, server_address, server_port = parse_address_and_port(parts[3], ssl_ports)
@@ -289,7 +291,7 @@ def main():
         try:
             response_body = get_response_body(proto, cafile, address, portspec, page)
             for line in response_body.split("\n"):
-                if not line.strip():
+                if not line or line.isspace():
                     continue
                 if line.lstrip()[0] == "<":
                     # Seems to be html output. Skip this server.
@@ -300,7 +302,7 @@ def main():
         except HTTPError as exc:
             sys.stderr.write("HTTP-Error (%s%s): %s %s\n" % (address, portspec, exc.code, exc))
 
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception as exc:
             sys.stderr.write("Exception (%s%s): %s\n" % (address, portspec, exc))
 
     return 0

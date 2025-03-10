@@ -9,10 +9,10 @@ import time
 from collections.abc import Iterable
 from logging import Logger
 
-import cmk.utils.debug
-import cmk.utils.defines
 from cmk.utils.log import VERBOSE
-from cmk.utils.type_defs import ContactgroupName, ECEventContext
+from cmk.utils.statename import service_state_name
+
+from cmk.events import event_context
 
 from .config import Action, Config, EMailActionConfig, Rule, ScriptActionConfig
 from .core_queries import query_contactgroups_members, query_status_enable_notifications
@@ -20,6 +20,41 @@ from .event import Event
 from .history import History
 from .host_config import HostConfig
 from .settings import Settings
+
+
+class ECEventContext(event_context.EventContext, total=False):
+    """The keys "found" in cmk.ec
+
+    Not sure if subclassing EventContext is the right call...
+    Feel free to merge if you feel like doing it.
+    """
+
+    EC_CONTACT: str
+    EC_CONTACT_GROUPS: str
+    EC_ID: str
+    EC_MATCH_GROUPS: str
+    EC_ORIG_HOST: str
+    EC_OWNER: str
+    EC_PHASE: str
+    EC_PID: str
+    HOSTADDRESS: str
+    HOSTALIAS: str
+    HOSTDOWNTIME: str
+    LASTSERVICESTATEID: str
+    NOTIFICATIONAUTHOR: str
+    NOTIFICATIONAUTHORALIAS: str
+    NOTIFICATIONAUTHORNAME: str
+    SERVICEACKAUTHOR: str
+    SERVICEACKCOMMENT: str
+    SERVICEPERFDATA: str
+    SERVICEPROBLEMID: str
+    SERVICESTATEID: str
+    SERVICE_EC_CONTACT: str
+    SERVICE_SL: str
+
+    # Dynamically added:
+    # HOST_*: str  #  custom_variables
+
 
 # .
 #   .--Actions-------------------------------------------------------------.
@@ -33,6 +68,8 @@ from .settings import Settings
 #   | Global functions for executing rule actions like sending emails and  |
 #   | executing scripts.                                                   |
 #   '----------------------------------------------------------------------'
+
+_ContactgroupName = str
 
 
 def event_has_opened(
@@ -82,18 +119,20 @@ def do_event_actions(
     event: Event,
     is_cancelling: bool,
 ) -> None:
-    """
-    Execute a list of actions on an event that has just been opened or cancelled.
-    """
+    """Execute a list of actions on an event that has just been opened or cancelled."""
     table = config["action"]
     for aname in actions:
         if aname == "@NOTIFY":
             do_notify(host_config, logger, event, is_cancelling=is_cancelling)
         elif action := table.get(aname):
-            logger.info(f'executing action "{action["title"]}" on event {event["id"]}')
+            logger.info('executing action "%s" on event %s', action["title"], event["id"])
             do_event_action(history, settings, config, logger, event_columns, action, event, "")
         else:
-            logger.info('undefined action "{aname}, must be one of {", ".join(table.keys()}"')
+            logger.info(
+                'undefined action "%s", must be one of %s',
+                aname,
+                ", ".join(table.keys()),
+            )
 
 
 # Rule actions are currently done synchronously. Actions should
@@ -121,7 +160,8 @@ def do_event_action(
         elif act[0] == "script":
             _do_script_action(history, logger, event_columns, act[1], action_id, event, user)
         else:
-            logger.error("Cannot execute action %s: invalid action type %s", action_id, act[0])
+            # TODO: Really parse the config, then this can't happen
+            logger.error("Cannot execute action %s: invalid action type %s", action_id, act[0])  # type: ignore[unreachable]
     except Exception:
         if settings.options.debug:
             raise
@@ -254,10 +294,7 @@ def _get_event_tags(
 
     tags: dict[str, str] = {}
     for key, value in substs:
-        if isinstance(value, tuple):
-            value = " ".join(map(to_string, value))
-        else:
-            value = to_string(value)
+        value = " ".join(map(to_string, value)) if isinstance(value, tuple) else to_string(value)
 
         tags[key] = value
 
@@ -384,7 +421,7 @@ def _base_notification_context(
         SERVICEOUTPUT=event["text"],
         SERVICEPERFDATA="",
         SERVICEPROBLEMID="ec-id-" + str(event["id"]),
-        SERVICESTATE=cmk.utils.defines.service_state_name(event["state"]),
+        SERVICESTATE=service_state_name(event["state"]),
         SERVICESTATEID=str(event["state"]),
         SERVICE_EC_CONTACT=event.get("owner", ""),
         SERVICE_SL=str(event["sl"]),
@@ -416,7 +453,7 @@ def _add_infos_from_monitoring_host(
     def _add_artificial_context_info() -> None:
         context.update(
             {
-                "HOSTNAME": event["host"],
+                "HOSTNAME": event_context.HostName(event["host"]),
                 "HOSTALIAS": event["host"],
                 "HOSTADDRESS": event["ipaddress"],
                 "HOSTTAGS": "",
@@ -440,12 +477,13 @@ def _add_infos_from_monitoring_host(
 
     context.update(
         {
-            "HOSTNAME": config.name,
+            "HOSTNAME": event_context.HostName(config.name),
             "HOSTALIAS": config.alias,
             "HOSTADDRESS": config.address,
             "HOSTTAGS": config.custom_variables.get("TAGS", ""),
             "CONTACTS": ",".join(config.contacts),
             "SERVICECONTACTGROUPNAMES": ",".join(config.contact_groups),
+            "HOSTGROUPNAMES": ",".join(config.host_groups),
         }
     )
 
@@ -460,9 +498,8 @@ def _add_infos_from_monitoring_host(
 def _add_contacts_from_rule(context: ECEventContext, event: Event, logger: Logger) -> None:
     """
     Add contact information from the rule, but only if the
-    host is unknown or if contact groups in rule have precedence
+    host is unknown or if contact groups in rule have precedence.
     """
-
     contact_groups = event.get("contact_groups")
     if (
         contact_groups is not None
@@ -477,12 +514,12 @@ def _add_contacts_from_rule(context: ECEventContext, event: Event, logger: Logge
 
 
 def _add_contact_information_to_context(
-    context: ECEventContext, contact_groups: Iterable[ContactgroupName], logger: Logger
+    context: ECEventContext, contact_groups: Iterable[_ContactgroupName], logger: Logger
 ) -> None:
     try:
         contact_names = query_contactgroups_members(contact_groups)
-    except Exception as e:
-        logger.error(f"Cannot get contact group members, assuming none: {e}")
+    except Exception:
+        logger.exception("Cannot get contact group members, assuming none:")
         contact_names = set()
     context["CONTACTS"] = ",".join(contact_names)
     context["SERVICECONTACTGROUPNAMES"] = ",".join(contact_groups)
@@ -498,8 +535,8 @@ def _add_contact_information_to_context(
 def _core_has_notifications_enabled(logger: Logger) -> bool:
     try:
         return query_status_enable_notifications()
-    except Exception as e:
-        logger.error(
-            f"Cannot determine whether notifications are enabled in core, assuming YES: {e}"
+    except Exception:
+        logger.exception(
+            "Cannot determine whether notifications are enabled in core, assuming YES."
         )
         return True
