@@ -4,12 +4,18 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 """Verify or find out a hosts agent related configuration"""
 
+import base64
 import json
 from collections.abc import Collection
+from typing import NotRequired, TypedDict
 
-from cmk.utils.exceptions import MKGeneralException
+from cmk.ccc.exceptions import MKGeneralException
 
-import cmk.gui.forms as forms
+from cmk.utils.hostaddress import HostAddress, HostName
+
+from cmk.snmplib import SNMPCredentials  # pylint: disable=cmk-module-layer-violation
+
+from cmk.gui import forms
 from cmk.gui.breadcrumb import Breadcrumb
 from cmk.gui.exceptions import MKAuthException, MKUserError
 from cmk.gui.htmllib.html import html
@@ -23,29 +29,39 @@ from cmk.gui.page_menu import (
     PageMenuEntry,
     PageMenuTopic,
 )
-from cmk.gui.pages import AjaxPage, page_registry, PageResult
-from cmk.gui.plugins.wato.utils import flash, mode_registry, mode_url, redirect, WatoMode
+from cmk.gui.pages import AjaxPage, PageRegistry, PageResult
 from cmk.gui.type_defs import ActionResult, PermissionName
 from cmk.gui.utils.csrf_token import check_csrf_token
+from cmk.gui.utils.encrypter import Encrypter
+from cmk.gui.utils.flashed_messages import flash
 from cmk.gui.utils.transaction_manager import transactions
 from cmk.gui.utils.user_errors import user_errors
-from cmk.gui.valuespec import (
-    Dictionary,
-    DropdownChoice,
-    FixedValue,
-    Float,
-    HostAddress,
-    Integer,
-    Password,
-)
+from cmk.gui.valuespec import Dictionary, DropdownChoice, FixedValue, Float, Integer, Password
+from cmk.gui.valuespec import HostAddress as VSHostAddress
 from cmk.gui.wato.pages.hosts import ModeEditHost, page_menu_host_entries
-from cmk.gui.watolib.attributes import SNMPCredentials
+from cmk.gui.watolib.attributes import SNMPCredentials as VSSNMPCredentials
 from cmk.gui.watolib.check_mk_automations import diag_host
-from cmk.gui.watolib.host_attributes import host_attribute_registry
-from cmk.gui.watolib.hosts_and_folders import Folder, folder_preserving_link, Host
+from cmk.gui.watolib.host_attributes import HostAttributes
+from cmk.gui.watolib.hosts_and_folders import folder_from_request, folder_preserving_link, Host
+from cmk.gui.watolib.mode import mode_url, ModeRegistry, redirect, WatoMode
+
+SNMPv3NoAuthNoPriv = tuple[str, str]
+SNMPv3AuthNoPriv = tuple[str, str, str, str]
+SNMPv3AuthPriv = tuple[str, str, str, str, str, str]
 
 
-@mode_registry.register
+class HostSpec(TypedDict):
+    hostname: HostName
+    ipaddress: NotRequired[HostAddress]
+    snmp_community: NotRequired[SNMPCredentials]
+    snmp_v3_credentials: NotRequired[SNMPv3NoAuthNoPriv | SNMPv3AuthNoPriv | SNMPv3AuthPriv]
+
+
+def register(page_registry: PageRegistry, mode_registry: ModeRegistry) -> None:
+    page_registry.register_page("wato_ajax_diag_host")(PageAjaxDiagHost)
+    mode_registry.register(ModeDiagHost)
+
+
 class ModeDiagHost(WatoMode):
     @classmethod
     def name(cls) -> str:
@@ -71,10 +87,12 @@ class ModeDiagHost(WatoMode):
             ("traceroute", _("Traceroute")),
         ]
 
-    def _from_vars(self):
-        self._hostname = request.get_ascii_input_mandatory("host")
-        self._host = Folder.current().load_host(self._hostname)
-        self._host.need_permission("read")
+    def _from_vars(self) -> None:
+        self._hostname = request.get_validated_type_input_mandatory(HostName, "host")
+        self._host = folder_from_request(request.var("folder"), self._hostname).load_host(
+            self._hostname
+        )
+        self._host.permissions.need_permission("read")
 
         if self._host.is_cluster():
             raise MKGeneralException(_("This page does not support cluster hosts."))
@@ -130,6 +148,8 @@ class ModeDiagHost(WatoMode):
         )
 
     def action(self) -> ActionResult:
+        check_csrf_token()
+
         if not transactions.check_transaction():
             return None
 
@@ -143,34 +163,37 @@ class ModeDiagHost(WatoMode):
         if request.var("go_to_properties"):
             # Save the ipaddress and/or community
             vs_host = self._vs_host()
-            new = vs_host.from_html_vars("vs_host")
+            new: HostSpec = vs_host.from_html_vars("vs_host")
             vs_host.validate_value(new, "vs_host")
 
-            # If both snmp types have credentials set - snmpv3 takes precedence
             return_message = []
+            attributes = HostAttributes()
+
             if "ipaddress" in new:
                 return_message.append(_("IP address"))
+                attributes["ipaddress"] = new["ipaddress"]
+
+            # If both SNMP types have credentials set - SNMPv3 takes precedence
             if "snmp_v3_credentials" in new:
                 if "snmp_community" in new:
                     return_message.append(_("SNMPv3 credentials (SNMPv2 community was discarded)"))
                 else:
                     return_message.append(_("SNMPv3 credentials"))
-                new["snmp_community"] = new["snmp_v3_credentials"]
+                attributes["snmp_community"] = new["snmp_v3_credentials"]
             elif "snmp_community" in new:
                 return_message.append(_("SNMP credentials"))
+                attributes["snmp_community"] = new["snmp_community"]
 
-            # Remove fields in this page that are not host attributes in order to avoid
-            # data corruption.
-            self._host.update_attributes(
-                {k: v for k, v in new.items() if k in host_attribute_registry}
-            )
+            self._host.update_attributes(attributes)
 
             flash(_("Updated attributes: ") + ", ".join(return_message))
             return redirect(
                 mode_url(
                     "edit_host",
                     host=self._hostname,
-                    folder=Folder.current().path(),
+                    folder=folder_from_request(
+                        request.var("folder"), request.get_ascii_input("host")
+                    ).path(),
                 )
             )
         return None
@@ -190,48 +213,47 @@ class ModeDiagHost(WatoMode):
         html.open_tr()
         html.open_td()
 
-        html.begin_form("diag_host", method="POST")
-        html.prevent_password_auto_completion()
+        with html.form_context("diag_host", method="POST"):
+            html.prevent_password_auto_completion()
 
-        forms.header(_("Host Properties"))
+            forms.header(_("Host Properties"))
 
-        forms.section(legend=False)
+            forms.section(legend=False)
 
-        # The diagnose page shows both snmp variants at the same time
-        # We need to analyse the preconfigured community and set either the
-        # snmp_community or the snmp_v3_credentials
-        vs_dict = {}
-        for key, value in self._host.attributes().items():
-            if key == "snmp_community" and isinstance(value, tuple):
-                vs_dict["snmp_v3_credentials"] = value
-                continue
-            vs_dict[key] = value
+            # The diagnose page shows both SNMP variants at the same time
+            # We need to analyse the preconfigured community and set either the
+            # snmp_community or the snmp_v3_credentials
+            vs_dict: dict[str, object] = {}
+            for key, value in self._host.attributes.items():
+                if key == "snmp_community" and isinstance(value, tuple):
+                    vs_dict["snmp_v3_credentials"] = value
+                    continue
+                vs_dict[key] = value
 
-        vs_host = self._vs_host()
-        vs_host.render_input("vs_host", vs_dict)
-        html.help(vs_host.help())
+            vs_host = self._vs_host()
+            vs_host.render_input("vs_host", vs_dict)
+            html.help(vs_host.help())
 
-        forms.end()
+            forms.end()
 
-        html.open_div(style="margin-bottom:10px")
-        html.close_div()
+            html.open_div(style="margin-bottom:10px")
+            html.close_div()
 
-        forms.header(_("Options"))
+            forms.header(_("Options"))
 
-        value = {}
-        forms.section(legend=False)
-        vs_rules = self._vs_rules()
-        vs_rules.render_input("vs_rules", value)
-        html.help(vs_rules.help())
-        forms.end()
+            value = {}
+            forms.section(legend=False)
+            vs_rules = self._vs_rules()
+            vs_rules.render_input("vs_rules", value)
+            html.help(vs_rules.help())
+            forms.end()
 
-        # When clicking "Save & Test" on the "Edit host" page, this will be set
-        # to immediately execute the tests using the just saved settings
-        if request.has_var("_start_on_load"):
-            html.final_javascript("cmk.page_menu.form_submit('diag_host', '_save');")
+            # When clicking "Save & Test" on the "Edit host" page, this will be set
+            # to immediately execute the tests using the just saved settings
+            if request.has_var("_start_on_load"):
+                html.final_javascript("cmk.page_menu.form_submit('diag_host', '_save');")
 
-        html.hidden_fields()
-        html.end_form()
+            html.hidden_fields()
 
         html.close_td()
         html.open_td(style="padding-left:10px;")
@@ -297,12 +319,12 @@ class ModeDiagHost(WatoMode):
                     "hostname",
                     FixedValue(
                         value=self._hostname,
-                        title=_("Hostname"),
+                        title=_("Host name"),
                     ),
                 ),
                 (
                     "ipaddress",
-                    HostAddress(
+                    VSHostAddress(
                         title=_("IPv4 address"),
                         allow_empty=False,
                         allow_ipv6_address=False,
@@ -317,7 +339,7 @@ class ModeDiagHost(WatoMode):
                 ),
                 (
                     "snmp_v3_credentials",
-                    SNMPCredentials(
+                    VSSNMPCredentials(
                         default_value=None,
                         only_v3=True,
                     ),
@@ -353,7 +375,7 @@ class ModeDiagHost(WatoMode):
                         unit=_("sec"),
                         display_format="%.0f",  # show values consistent to
                         size=2,  # SNMP-Timeout
-                        title=_('TCP Connection Timeout (<a href="%s">Rules</a>)')
+                        title=_('TCP connection timeout (<a href="%s">Rules</a>)')
                         % folder_preserving_link(
                             [("mode", "edit_ruleset"), ("varname", "tcp_connect_timeouts")]
                         ),
@@ -397,8 +419,7 @@ class ModeDiagHost(WatoMode):
         )
 
 
-@page_registry.register_page("wato_ajax_diag_host")
-class ModeAjaxDiagHost(AjaxPage):
+class PageAjaxDiagHost(AjaxPage):
     def page(self) -> PageResult:
         check_csrf_token()
         if not user.may("wato.diag_host"):
@@ -411,7 +432,7 @@ class ModeAjaxDiagHost(AjaxPage):
 
         hostname = api_request.get("host")
         if not hostname:
-            raise MKGeneralException(_("The hostname is missing."))
+            raise MKGeneralException(_("The host name is missing."))
 
         host = Host.host(hostname)
 
@@ -420,7 +441,7 @@ class ModeAjaxDiagHost(AjaxPage):
         if host.is_cluster():
             raise MKGeneralException(_("This view does not support cluster hosts."))
 
-        host.need_permission("read")
+        host.permissions.need_permission("read")
 
         _test = api_request.get("_test")
         if not _test:
@@ -456,21 +477,27 @@ class ModeAjaxDiagHost(AjaxPage):
                 snmpv3_auth_proto = {
                     str(DropdownChoice.option_id("md5")): "md5",
                     str(DropdownChoice.option_id("sha")): "sha",
+                    str(DropdownChoice.option_id("SHA-224")): "SHA-224",
+                    str(DropdownChoice.option_id("SHA-256")): "SHA-256",
+                    str(DropdownChoice.option_id("SHA-384")): "SHA-384",
+                    str(DropdownChoice.option_id("SHA-512")): "SHA-512",
                 }.get(api_request.get("snmpv3_auth_proto", ""), "")
 
                 args[8] = snmpv3_auth_proto
                 args[9] = api_request.get("snmpv3_security_name", "")
-                args[10] = api_request.get("snmpv3_security_password", "")
+                args[10] = _decrypt_passwd(api_request.get("snmpv3_security_password", ""))
 
                 if snmpv3_use == "authPriv":
                     snmpv3_privacy_proto = {
                         str(DropdownChoice.option_id("DES")): "DES",
                         str(DropdownChoice.option_id("AES")): "AES",
+                        str(DropdownChoice.option_id("AES-192")): "AES-192",
+                        str(DropdownChoice.option_id("AES-256")): "AES-256",
                     }.get(api_request.get("snmpv3_privacy_proto", ""), "")
 
                     args[11] = snmpv3_privacy_proto
 
-                    args[12] = api_request.get("snmpv3_privacy_password", "")
+                    args[12] = _decrypt_passwd(api_request.get("snmpv3_privacy_password", ""))
             else:
                 args[9] = api_request.get("snmpv3_security_name", "")
 
@@ -485,3 +512,10 @@ class ModeAjaxDiagHost(AjaxPage):
             "status_code": result.return_code,
             "output": result.response,
         }
+
+
+def _decrypt_passwd(encrypted_passwd: str) -> str:
+    try:
+        return Encrypter.decrypt(base64.b64decode(encrypted_passwd.encode("ascii")))
+    except Exception:
+        raise MKUserError(None, _("Decryption of SNMPv3 password failed."))

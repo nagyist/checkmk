@@ -4,7 +4,7 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-__version__ = "2.3.0b1"
+__version__ = "2.5.0b1"
 
 ###################################################
 # plugin to retrieve data from tinkerforge devices.
@@ -40,19 +40,13 @@ __version__ = "2.3.0b1"
 #  implemented
 
 # Don't have tinkerforge module during tests. So disable those checks
-# pylint: disable=import-error
 
 import hashlib
 import os
 import sys
 import time
-from optparse import OptionParser  # pylint: disable=deprecated-module
+from optparse import OptionParser
 from urllib.request import urlopen
-
-try:
-    from typing import List  # noqa: F401 # pylint: disable=unused-import
-except ImportError:
-    pass
 
 
 def check_digest(data, expected):
@@ -80,7 +74,7 @@ def install():
     #   `curl -s "https://download.tinkerforge.com/[new-version].zip | sha256sum`
     download_digest = "e735e0e53ad56e2c2919cf412f3ec28ec0997919eb556b20c27519a57fb7bad0"
 
-    response = urlopen(url)  # nosec B310 # BNS:28af27 # pylint: disable=consider-using-with
+    response = urlopen(url)  # nosec B310 # BNS:28af27
     buf = BytesIO(response.read())
     check_digest(buf, download_digest)
 
@@ -122,21 +116,27 @@ def print_generic(settings, sensor_type, ident, factor, unit, *values):
 
 
 def print_ambient_light(conn, settings, uid):
-    from tinkerforge.bricklet_ambient_light import BrickletAmbientLight  # type: ignore[import]
+    from tinkerforge.bricklet_ambient_light import (  # type: ignore[import-not-found]
+        BrickletAmbientLight,
+    )
 
     br = BrickletAmbientLight(uid, conn)
     print_generic(settings, "ambient", br.get_identity(), 0.01, "L", br.get_illuminance())
 
 
 def print_ambient_light_v2(conn, settings, uid):
-    from tinkerforge.bricklet_ambient_light_v2 import BrickletAmbientLightV2  # type: ignore[import]
+    from tinkerforge.bricklet_ambient_light_v2 import (  # type: ignore[import-not-found]
+        BrickletAmbientLightV2,
+    )
 
     br = BrickletAmbientLightV2(uid, conn)
     print_generic(settings, "ambient", br.get_identity(), 0.01, "L", br.get_illuminance())
 
 
 def print_temperature(conn, settings, uid):
-    from tinkerforge.bricklet_temperature import BrickletTemperature  # type: ignore[import]
+    from tinkerforge.bricklet_temperature import (  # type: ignore[import-not-found]
+        BrickletTemperature,
+    )
 
     br = BrickletTemperature(uid, conn)
     print_generic(
@@ -145,7 +145,7 @@ def print_temperature(conn, settings, uid):
 
 
 def print_temperature_ext(conn, settings, uid):
-    from tinkerforge.bricklet_ptc import BrickletPTC  # type: ignore[import]
+    from tinkerforge.bricklet_ptc import BrickletPTC  # type: ignore[import-not-found]
 
     br = BrickletPTC(uid, conn)
     print_generic(
@@ -159,14 +159,14 @@ def print_temperature_ext(conn, settings, uid):
 
 
 def print_humidity(conn, settings, uid):
-    from tinkerforge.bricklet_humidity import BrickletHumidity  # type: ignore[import]
+    from tinkerforge.bricklet_humidity import BrickletHumidity  # type: ignore[import-not-found]
 
     br = BrickletHumidity(uid, conn)
     print_generic(settings, "humidity", br.get_identity(), 0.1, "RH", br.get_humidity())
 
 
 def print_master(conn, settings, uid):
-    from tinkerforge.brick_master import BrickMaster  # type: ignore[import]
+    from tinkerforge.brick_master import BrickMaster  # type: ignore[import-not-found]
 
     br = BrickMaster(uid, conn)
     print_generic(
@@ -182,7 +182,9 @@ def print_master(conn, settings, uid):
 
 
 def print_motion_detector(conn, settings, uid):
-    from tinkerforge.bricklet_motion_detector import BrickletMotionDetector  # type: ignore[import]
+    from tinkerforge.bricklet_motion_detector import (  # type: ignore[import-not-found]
+        BrickletMotionDetector,
+    )
 
     br = BrickletMotionDetector(uid, conn)
     print_generic(settings, "motion", br.get_identity(), 1.0, "", br.get_motion_detected())
@@ -217,12 +219,12 @@ def display_on_segment(conn, settings, text):
         "\N{DEGREE SIGN}": 0x63,
     }
 
-    from tinkerforge.bricklet_segment_display_4x7 import (  # type: ignore[import]
+    from tinkerforge.bricklet_segment_display_4x7 import (  # type: ignore[import-not-found]
         BrickletSegmentDisplay4x7,
     )
 
     br = BrickletSegmentDisplay4x7(segment_display, conn)
-    segments = []  # type: List
+    segments = []  # type: list
     for letter in text:
         if len(segments) >= 4:
             break
@@ -285,7 +287,7 @@ def read_config(env):
 
     if os.path.isfile(cfg_path):
         with open(cfg_path) as opened_file:
-            exec(opened_file.read(), settings, settings)
+            exec(opened_file.read(), settings, settings)  # nosec B102 # BNS:a29406
     return settings
 
 
@@ -345,7 +347,7 @@ def main():
         return install()
 
     try:
-        from tinkerforge.ip_connection import IPConnection  # type: ignore[import]
+        from tinkerforge.ip_connection import IPConnection  # type: ignore[import-not-found]
     except ImportError:
         sys.stdout.write("<<<tinkerforge:sep(44)>>>\n")
         sys.stdout.write("master,0.0.0,tinkerforge api isn't installed\n")
@@ -361,7 +363,13 @@ def main():
 
         conn.register_callback(
             IPConnection.CALLBACK_ENUMERATE,
-            lambda uid, connected_uid, position, hardware_version, firmware_version, device_identifier, enumeration_type: enumerate_callback(
+            lambda uid,
+            connected_uid,
+            position,
+            hardware_version,
+            firmware_version,
+            device_identifier,
+            enumeration_type: enumerate_callback(
                 conn,
                 device_handlers,
                 settings,

@@ -8,6 +8,7 @@ cmk
 Crontab
 crontab
 cron
+Jira
 keepalive
 Liveproxyd
 Livestatus
@@ -43,3 +44,18 @@ decrypt
 upstreamed
 TLS
 unencrypted
+UUID
+Werk
+Kubernetes
+cAdvisor
+unescaping
+configurability
+kube
+Werk
+Werks
+nowiki
+precompiled
+changelog
+robotmk
+md
+IdP

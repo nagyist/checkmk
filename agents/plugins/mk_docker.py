@@ -3,7 +3,7 @@
 # Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
-r"""Check_MK Agent Plugin: mk_docker.py
+r"""Check_MK Agent Plug-in: mk_docker.py
 
 This plugin is configured using an ini-style configuration file,
 i.e. a file with lines of the form 'key: value'.
@@ -11,15 +11,18 @@ At 'agents/cfg_examples/mk_docker.cfg' (relative to the check_mk
 source code directory ) you should find some example configuration
 files. For more information on possible configurations refer to the
 file docker.cfg in said directory.
-The docker library must be installed on the system executing the
-plugin ("pip install docker").
+The Python docker package is required to run this plugin.
+Depending on the system, there are different ways to install it.
+Installation options:
+    - pip: pip install docker
+    - apt: apt install python3-docker  # Debian/Ubuntu
 
 This plugin it will be called by the agent without any arguments.
 """
 
 from __future__ import with_statement
 
-__version__ = "2.3.0b1"
+__version__ = "2.5.0b1"
 
 # NOTE: docker is available for python versions from 2.6 / 3.3
 
@@ -34,11 +37,6 @@ import pathlib
 import struct
 import sys
 import time
-
-try:
-    from typing import Dict, Tuple, Union  # noqa: F401 # pylint: disable=unused-import
-except ImportError:
-    pass
 
 
 def which(prg):
@@ -59,7 +57,7 @@ if (
     sys.exit(1)
 
 try:
-    import docker  # type: ignore[import]
+    import docker  # type: ignore[import-untyped]
 except ImportError:
     sys.stdout.write(
         "<<<docker_node_info:sep(124)>>>\n"
@@ -140,7 +138,7 @@ def get_config(cfg_file):
     files_read = config.read(cfg_file)
     LOGGER.info("read configration file(s): %r", files_read)
     section_name = "DOCKER" if config.sections() else "DEFAULT"
-    conf_dict = dict(config.items(section_name))  # type: Dict[str, Union[str, Tuple]]
+    conf_dict = dict(config.items(section_name))  # type: dict[str, str | tuple]
     skip_sections = conf_dict.get("skip_sections", "")
     if isinstance(skip_sections, str):
         skip_list = skip_sections.split(",")
@@ -166,10 +164,10 @@ class Section(list):
         if piggytarget is not None:
             self.append("<<<<%s>>>>" % piggytarget)
         if name is not None:
-            self.append("<<<docker_%s:sep(124)>>>" % name)
+            self.append("<<<%s:sep(124)>>>" % name)
             version_json = json.dumps(Section.version_info)
             self.append("@docker_version_info|%s" % version_json)
-            self.append("<<<docker_%s:sep(0)>>>" % name)
+            self.append("<<<%s:sep(0)>>>" % name)
 
     def write(self):
         if self[0].startswith("<<<<"):
@@ -182,8 +180,8 @@ class Section(list):
 
 def report_exception_to_server(exc, location):
     LOGGER.info("handling exception: %s", exc)
-    msg = "Plugin exception in %s: %s" % (location, exc)
-    sec = Section("node_info")
+    msg = "Plug-in exception in %s: %s" % (location, exc)
+    sec = Section("docker_node_info")
     sec.append(json.dumps({"Unknown": msg}))
     sec.write()
 
@@ -251,7 +249,12 @@ class ParallelDfCall:
     def _write_df_result(self, data):
         with self._my_tmp_file.open("wb") as file_:
             file_.write(json.dumps(data).encode("utf-8"))
-        self._my_tmp_file.rename(self._spool_file)
+        try:
+            self._my_tmp_file.rename(self._spool_file)
+        except OSError:
+            # CMK-12642: It can happen that two df calls succeed almost at the same time. Then, one
+            # process attempts to move while the other one already deleted all temp files.
+            pass
 
     def _read_df_result(self):
         """read from the spool file
@@ -262,7 +265,7 @@ class ParallelDfCall:
             return json.loads(file_.read())
 
 
-class MKDockerClient(docker.DockerClient):
+class MKDockerClient(docker.DockerClient):  # type: ignore[misc]
     """a docker.DockerClient that caches containers and node info"""
 
     API_VERSION = "auto"
@@ -294,8 +297,10 @@ class MKDockerClient(docker.DockerClient):
 
             self._device_map = {}
             for device in os.listdir("/sys/block"):
-                with open("/sys/block/%s/dev" % device) as handle:
-                    self._device_map[handle.read().strip()] = device
+                dev_path = "/sys/block/%s/dev" % device
+                if os.path.exists(dev_path):
+                    with open(dev_path) as handle:
+                        self._device_map[handle.read().strip()] = device
 
         return self._device_map
 
@@ -405,7 +410,7 @@ def is_disabled_section(config, section_name):
 @time_it
 def section_node_info(client):
     LOGGER.debug(client.node_info)
-    section = Section("node_info")
+    section = Section("docker_node_info")
     section.append(json.dumps(client.node_info))
     section.write()
 
@@ -413,7 +418,7 @@ def section_node_info(client):
 @time_it
 def section_node_disk_usage(client):
     """docker system df"""
-    section = Section("node_disk_usage")
+    section = Section("docker_node_disk_usage")
     try:
         data = client.df()
     except docker.errors.APIError as exc:
@@ -491,7 +496,7 @@ def _robust_inspect(client, docker_object):
 @time_it
 def section_node_images(client):
     """in subsections list [[[images]]] and [[[containers]]]"""
-    section = Section("node_images")
+    section = Section("docker_node_images")
 
     images = _robust_inspect(client, "images")
     LOGGER.debug(images)
@@ -510,14 +515,14 @@ def section_node_images(client):
 @time_it
 def section_node_network(client):
     networks = client.networks.list(filters={"driver": "bridge"})
-    section = Section("node_network")
+    section = Section("docker_node_network")
     section += [json.dumps(n.attrs) for n in networks]
     section.write()
 
 
 def section_container_node_name(client, container_id):
     node_name = client.node_info.get("Name")
-    section = Section("container_node_name", piggytarget=container_id)
+    section = Section("docker_container_node_name", piggytarget=container_id)
     section.append(json.dumps({"NodeName": node_name}))
     section.write()
 
@@ -540,14 +545,14 @@ def section_container_status(client, container_id):
         pass
     status["NodeName"] = client.node_info.get("Name")
 
-    section = Section("container_status", piggytarget=container_id)
+    section = Section("docker_container_status", piggytarget=container_id)
     section.append(json.dumps(status))
     section.write()
 
 
 def section_container_labels(client, container_id):
     container = client.all_containers[container_id]
-    section = Section("container_labels", piggytarget=container_id)
+    section = Section("docker_container_labels", piggytarget=container_id)
     section.append(json.dumps(container.labels))
     section.write()
 
@@ -555,7 +560,7 @@ def section_container_labels(client, container_id):
 def section_container_network(client, container_id):
     container = client.all_containers[container_id]
     network = container.attrs.get("NetworkSettings", {})
-    section = Section("container_network", piggytarget=container_id)
+    section = Section("docker_container_network", piggytarget=container_id)
     section.append(json.dumps(network))
     section.write()
 
@@ -598,7 +603,7 @@ def section_container_mem(client, container_id):
     if stats is None:  # container not running
         return
     container_mem = stats["memory_stats"]
-    section = Section("container_mem", piggytarget=container_id)
+    section = Section("docker_container_mem", piggytarget=container_id)
     section.append(json.dumps(container_mem))
     section.write()
 
@@ -608,7 +613,7 @@ def section_container_cpu(client, container_id):
     if stats is None:  # container not running
         return
     container_cpu = stats["cpu_stats"]
-    section = Section("container_cpu", piggytarget=container_id)
+    section = Section("docker_container_cpu", piggytarget=container_id)
     section.append(json.dumps(container_cpu))
     section.write()
 
@@ -620,7 +625,7 @@ def section_container_diskstat(client, container_id):
     container_blkio = stats["blkio_stats"]
     container_blkio["time"] = time.time()
     container_blkio["names"] = client.device_map()
-    section = Section("container_diskstat", piggytarget=container_id)
+    section = Section("docker_container_diskstat", piggytarget=container_id)
     section.append(json.dumps(container_blkio))
     section.write()
 
@@ -655,7 +660,14 @@ def call_node_sections(client, config):
         except Exception as exc:
             if DEBUG:
                 raise
+            # The section is already always written. Prevent duplicate @docker_version_info
+            if name != "docker_node_info":
+                write_empty_section(name)
             report_exception_to_server(exc, section.__name__)
+
+
+def write_empty_section(name, piggytarget=None):
+    Section(name, piggytarget).write()
 
 
 def call_container_sections(client, config):

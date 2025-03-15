@@ -1,0 +1,24 @@
+title: HPE BladeSystem Enclosures: Health of Blades
+agents: snmp
+catalog: hw/server/hpe
+license: GPLv2
+distribution: check_mk
+description:
+ This check monitors the health of blades in HPE BladeSysten enclosures.
+
+ It uses the state reported by SNMP and prints the product name and serial
+ number reported of each blade.
+
+ Each blade which is present while the Checkmk service discovery will result in an
+ own service. If the blade is not available anymore this service will be shown
+ as CRITICAL service.
+
+ Note: It seems that the MIB is not fully implemented on all systems so the
+ check needs to show a "fake" OK when no status information is available. The
+ other information like serial number and product name are printed anyway.
+
+item:
+ Number of the blade
+
+discovery:
+ One service is created for each blade with the state "present".

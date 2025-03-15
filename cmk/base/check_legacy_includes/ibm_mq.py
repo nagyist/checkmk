@@ -4,11 +4,13 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 import re
+from collections.abc import Mapping
+from typing import Any
 
-from cmk.base.check_api import MKCounterWrapped
+from cmk.agent_based.v2 import IgnoreResultsError
 
 
-def is_ibm_mq_service_vanished(item, parsed) -> bool:  # type: ignore[no-untyped-def]
+def is_ibm_mq_service_vanished(item: str, parsed: Mapping[str, Any]) -> bool:
     """
     Returns true if queue or channel is not contained anymore in the agent
     output but queue manager is known as RUNNING. Throws MKCounterWrapped to
@@ -24,7 +26,7 @@ def is_ibm_mq_service_vanished(item, parsed) -> bool:  # type: ignore[no-untyped
 
     if qmgr_status == "RUNNING":
         return True
-    raise MKCounterWrapped("Stale because queue manager %s" % qmgr_status)
+    raise IgnoreResultsError("Stale because queue manager %s" % qmgr_status)
 
 
 def ibm_mq_check_version(actual_version, params, label):

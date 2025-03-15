@@ -5,7 +5,7 @@
 
 import pytest
 
-import cmk.utils.escaping as escaping
+from cmk.utils import escaping
 
 
 def test_empty() -> None:
@@ -22,6 +22,7 @@ def test_empty() -> None:
         ("<tt>abc</tt>", None),
         ("<i>abc</i>", None),
         ("<u>abc</u>", None),
+        ("<hr>", None),
         ("<br>", None),
         ("<nobr></nobr>", None),
         ("<pre></pre>", None),
@@ -52,6 +53,10 @@ def test_empty() -> None:
         (
             '<a href="javascript:alert(1)">abc</a>',
             "&lt;a href=&quot;javascript:alert(1)&quot;&gt;abc&lt;/a&gt;",
+        ),
+        (
+            "<b/onclick=alert(1)>abc</b>",
+            "&lt;b/onclick=alert(1)&gt;abc</b>",
         ),
     ],
 )
@@ -88,6 +93,10 @@ def test_escape_text(inp: str, out: str | None) -> None:
         ('<a href="https://checkmk.com/">abc</a>', None),
         ('<a href="HTTP://CHECKMK.COM/">abc</a>', None),
         (
+            '<a/href="http://checkmk.com/">abc</a>',
+            "&lt;a/href=&quot;http://checkmk.com/&quot;&gt;abc</a>",
+        ),
+        (
             'Please download it manually and send it to <a href="mailto:feedback@checkmk.com?subject=Checkmk+Crash+Report+-+2021.11.12">feedback@checkmk.com</a>',
             'Please download it manually and send it to <a href="mailto:feedback@checkmk.com?subject=Checkmk+Crash+Report+-+2021.11.12">feedback@checkmk.com</a>',
         ),
@@ -109,7 +118,8 @@ def test_escape_text_with_links(inp: str, out: str | None) -> None:
 
 
 @pytest.mark.parametrize(
-    "tagname", ("h1", "h2", "b", "tt", "i", "u", "br", "nobr", "pre", "sup", "p", "li", "ul", "ol")
+    "tagname",
+    ("h1", "h2", "b", "tt", "i", "u", "hr", "br", "nobr", "pre", "sup", "p", "li", "ul", "ol"),
 )
 def test_permissive_tags(tagname: str) -> None:
     """test for which tags are 'allowed' aka unescaped after escaping"""

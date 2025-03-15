@@ -13,7 +13,7 @@
 
 # Disable unused variable error (needed to keep track of version)
 # shellcheck disable=SC2034
-CMK_VERSION="2.3.0b1"
+CMK_VERSION="2.5.0b1"
 
 _load_config() {
     # defaults:
@@ -45,7 +45,7 @@ _get_epoch() {
 
 _insert_persist_option() {
     # insert the persist(...) option, if it is not already present.
-    sed -e '/^<<<.*\(:persist(\).*>>>/{p;d;}; s/^<<<\([^>]*\)>>>$/<<<\1:persist('"${1}"')>>>/'
+    sed -e '/^<<<.*\(:persist(\).*>>>/{p;d;}' -e 's/^<<<\([^>]*\)>>>$/<<<\1:persist('"${1}"')>>>/'
 }
 
 run_persisted() {
@@ -91,8 +91,18 @@ sections_mk_inventory() {
 }
 
 section_solaris_uname() {
-    echo "<<<solaris_uname:sep(61)>>>"
-    uname -X
+    # SUP-22439: try and output the uname information from the uname
+    # found on the path. If not available, fallback to the full path
+    # because some users may override their PATH. If the underlying
+    # binary is for whatever not there, the sections will not be
+    # added to agent output.
+    if uname -X &>/dev/null; then
+        echo "<<<solaris_uname:sep(61)>>>"
+        uname -X
+    elif /usr/bin/uname -X &>/dev/null; then
+        echo "<<<solaris_uname:sep(61)>>>"
+        /usr/bin/uname -X
+    fi
 }
 
 section_solaris_prtdiag() {

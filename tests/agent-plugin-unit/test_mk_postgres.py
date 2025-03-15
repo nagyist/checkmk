@@ -4,24 +4,22 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-# pylint: disable=protected-access,redefined-outer-name
 
 import copy
 import sys
 
 import pytest
-from mock import Mock, patch
+from _pytest.monkeypatch import MonkeyPatch
 
 if sys.version_info[0] == 2:
-    import agents.plugins.mk_postgres_2 as mk_postgres  # pylint: disable=syntax-error
-else:
-    import agents.plugins.mk_postgres as mk_postgres
+    from mock import Mock, patch
 
-try:
-    from typing import Dict, Optional  # noqa: F401
-except ImportError:
-    # We need typing only for testing
-    pass
+    import agents.plugins.mk_postgres_2 as mk_postgres
+else:
+    from unittest.mock import Mock, patch
+
+    from agents.plugins import mk_postgres
+
 
 #   .--defines-------------------------------------------------------------.
 #   |                      _       __ _                                    |
@@ -42,9 +40,13 @@ VALID_CONFIG_WITH_INSTANCES = [
     "",
     "not a comment but trash",
     "DBUSER=user_yz",
-    "INSTANCE=/home/postgres/db1.env{sep}USER_NAME{sep}/PATH/TO/.pgpass",
+    "INSTANCE=/home/postgres/db1.env{sep}USER_NAME{sep}/PATH/TO/.pgpass{sep}",
 ]
-PG_PASSFILE = ["myhost:myport:mydb:myusr:mypw"]
+VALID_CONFIG_WITH_PG_BINARY_PATH = [
+    "PG_BINARY_PATH=C:\\PostgreSQL\\15\\bin\\psql.exe",
+    "",
+    "DBUSER=user_xy",
+]
 
 #   .--tests---------------------------------------------------------------.
 #   |                        _            _                                |
@@ -58,7 +60,7 @@ PG_PASSFILE = ["myhost:myport:mydb:myusr:mypw"]
 
 class TestNotImplementedOS:
     @pytest.fixture(autouse=True)
-    def is_not_implemented_os(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def is_not_implemented_os(self, monkeypatch: MonkeyPatch) -> None:
         monkeypatch.setattr(mk_postgres, "IS_WINDOWS", False)
         monkeypatch.setattr(mk_postgres, "IS_LINUX", False)
 
@@ -73,7 +75,7 @@ class TestNotImplementedOS:
 
 class TestLinux:
     @pytest.fixture(autouse=True)
-    def is_linux(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def is_linux(self, monkeypatch: MonkeyPatch) -> None:
         monkeypatch.setattr(mk_postgres, "IS_WINDOWS", False)
         monkeypatch.setattr(mk_postgres, "IS_LINUX", True)
         monkeypatch.setattr(
@@ -98,7 +100,10 @@ class TestLinux:
     @patch("subprocess.Popen")
     def test_postgres_binary_path_fallback(self, mock_Popen):
         process_mock = Mock()
-        attrs = {"communicate.side_effect": [("usr/mydb-12.3/bin", None)]}
+        attrs = {
+            "communicate.side_effect": [("usr/mydb-12.3/bin", None)],
+            "returncode": 0,
+        }
         process_mock.configure_mock(**attrs)
         mock_Popen.return_value = process_mock
         instance = {
@@ -108,8 +113,8 @@ class TestLinux:
             "pg_user": "myuser",
             "pg_passfile": "/home/.pgpass",
             "pg_version": "12.3",
-        }  # type: Dict[str, Optional[str]]
-        myPostgresOnLinux = mk_postgres.postgres_factory("postgres", instance)
+        }  # type: dict[str, str | None]
+        myPostgresOnLinux = mk_postgres.postgres_factory("postgres", None, instance)
 
         assert myPostgresOnLinux.psql_binary_path == "usr/mydb-12.3/bin"
 
@@ -117,9 +122,21 @@ class TestLinux:
         self,
     ):
         sep = mk_postgres.helper_factory().get_conf_sep()
-        dbuser, instances = mk_postgres.parse_postgres_cfg(VALID_CONFIG_WITHOUT_INSTANCE, sep)
+        dbuser, _pg_path, instances = mk_postgres.parse_postgres_cfg(
+            VALID_CONFIG_WITHOUT_INSTANCE, sep
+        )
         assert dbuser == "user_xy"
         assert len(instances) == 0
+
+    def test_config_with_binary_path(
+        self,
+    ):
+        sep = mk_postgres.helper_factory().get_conf_sep()
+        dbuser, pg_binary, _instances = mk_postgres.parse_postgres_cfg(
+            VALID_CONFIG_WITH_PG_BINARY_PATH, sep
+        )
+        assert dbuser == "user_xy"
+        assert pg_binary == "C:\\PostgreSQL\\15\\bin\\psql.exe"
 
     def test_config_with_instance(
         self,
@@ -127,7 +144,7 @@ class TestLinux:
         config = copy.deepcopy(VALID_CONFIG_WITH_INSTANCES)
         config[-1] = config[-1].format(sep=SEP_LINUX)
         sep = mk_postgres.helper_factory().get_conf_sep()
-        dbuser, instances = mk_postgres.parse_postgres_cfg(config, sep)
+        dbuser, _pg_path, instances = mk_postgres.parse_postgres_cfg(config, sep)
         assert dbuser == "user_yz"
         assert len(instances) == 1
         assert instances[0]["pg_port"] == "5432"
@@ -146,7 +163,8 @@ class TestLinux:
                 ("/usr/lib/postgres/psql", None),
                 ("postgres\x00db1".encode("utf-8"), None),
                 ("12.3", None),
-            ]
+            ],
+            "returncode": 0,
         }
         process_mock.configure_mock(**attrs)
         mock_Popen.return_value = process_mock
@@ -156,8 +174,8 @@ class TestLinux:
             "pg_database": "postgres",
             "pg_port": "5432",
             "pg_passfile": "",
-        }  # type: Dict[str, Optional[str]]
-        myPostgresOnLinux = mk_postgres.postgres_factory("postgres", instance)
+        }  # type: dict[str, str | None]
+        myPostgresOnLinux = mk_postgres.postgres_factory("postgres", None, instance)
 
         assert isinstance(myPostgresOnLinux, mk_postgres.PostgresLinux)
         assert myPostgresOnLinux.psql_binary_path == "/usr/lib/postgres/psql"
@@ -182,17 +200,18 @@ class TestLinux:
             "pg_user": "myuser",
             "pg_passfile": "/home/.pgpass",
             "pg_version": "12.3",
-        }  # type: Dict[str, Optional[str]]
+        }  # type: dict[str, str | None]
         process_mock = Mock()
         attrs = {
             "communicate.side_effect": [
                 ("postgres\x00db1".encode("utf-8"), None),
                 ("12.3.6", None),
-            ]
+            ],
+            "returncode": 0,
         }
         process_mock.configure_mock(**attrs)
         mock_Popen.return_value = process_mock
-        myPostgresOnLinux = mk_postgres.postgres_factory("postgres", instance)
+        myPostgresOnLinux = mk_postgres.postgres_factory("postgres", None, instance)
 
         assert isinstance(myPostgresOnLinux, mk_postgres.PostgresLinux)
         assert myPostgresOnLinux.psql_binary_path == "/mydb/12.3/bin/psql"
@@ -218,18 +237,19 @@ class TestLinux:
             "pg_user": "myuser",
             "pg_passfile": "/home/.pgpass",
             "version": "12.3",
-        }  # type: Dict[str, Optional[str]]
+        }  # type: dict[str, str | None]
         process_mock = Mock()
         attrs = {
             "communicate.side_effect": [
                 ("/usr/lib/postgres/psql", None),
                 ("postgres\x00db1".encode("utf-8"), None),
                 ("12.3.6", None),
-            ]
+            ],
+            "returncode": 0,
         }
         process_mock.configure_mock(**attrs)
         mock_Popen.return_value = process_mock
-        myPostgresOnLinux = mk_postgres.postgres_factory("postgres", instance)
+        myPostgresOnLinux = mk_postgres.postgres_factory("postgres", None, instance)
 
         process_mock = Mock()
         attrs = {
@@ -245,6 +265,7 @@ class TestLinux:
                     None,
                 ),
             ],
+            "returncode": 0,
         }
         process_mock.configure_mock(**attrs)
         mock_Popen.return_value = process_mock
@@ -283,12 +304,13 @@ class TestLinux:
                 ("/usr/lib/postgres/psql", None),
                 ("postgres\ndb1", None),
                 ("12.3.6", None),
-            ]
+            ],
+            "returncode": 0,
         }
         process_mock.configure_mock(**attrs)
         mock_Popen.return_value = process_mock
 
-        myPostgresOnLinux = mk_postgres.postgres_factory("postgres", instance)
+        myPostgresOnLinux = mk_postgres.postgres_factory("postgres", None, instance)
         process_mock = Mock()
 
         proc_list = []
@@ -300,7 +322,10 @@ class TestLinux:
                     % ps_instance,
                 ]
             )
-        attrs = {"communicate.side_effect": [("\n".join(proc_list), None)]}
+        attrs = {
+            "communicate.side_effect": [("\n".join(proc_list), None)],
+            "returncode": 0,
+        }
         process_mock.configure_mock(**attrs)
         mock_Popen.return_value = process_mock
 
@@ -312,10 +337,41 @@ class TestLinux:
             ]
         )
 
+    def test_parse_INSTANCE_value(self) -> None:
+        # Legacy format, deprecated in Werk 16016, but kept around to not force updating the configuration.
+        got = mk_postgres._parse_INSTANCE_value(
+            "/home/postgres/db2.env:USER_NAME:/PATH/TO/.pgpass", SEP_LINUX
+        )
+        expected = ("/home/postgres/db2.env", "USER_NAME", "/PATH/TO/.pgpass", "db2")
+        assert got == expected
+
+        # Legacy format, deprecated in Werk 16016, but kept around to not force updating the configuration.
+        # This is a weird edge case, that was broken in 2.1.0p30 and 2.2.0p4 .
+        got = mk_postgres._parse_INSTANCE_value(
+            "/home/postgres/.env:USER_NAME:/PATH/TO/.pgpass", SEP_LINUX
+        )
+        expected = ("/home/postgres/.env", "USER_NAME", "/PATH/TO/.pgpass", "")
+        assert got == expected
+
+        # Bad configuration, we keep this around to migrate users from old to new config format
+        # But instance_name should really empty, or we should disallow this
+        got = mk_postgres._parse_INSTANCE_value(
+            "/home/postgres/db2.env:USER_NAME:/PATH/TO/.pgpass:", SEP_LINUX
+        )
+        expected = ("/home/postgres/db2.env", "USER_NAME", "/PATH/TO/.pgpass", "db2")
+        assert got == expected
+
+        # Correct configuration
+        got = mk_postgres._parse_INSTANCE_value(
+            "/home/postgres/db2.env:USER_NAME:/PATH/TO/.pgpass:hi", SEP_LINUX
+        )
+        expected = ("/home/postgres/db2.env", "USER_NAME", "/PATH/TO/.pgpass", "hi")
+        assert got == expected
+
 
 class TestWindows:
     @pytest.fixture(autouse=True)
-    def is_windows(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def is_windows(self, monkeypatch: MonkeyPatch) -> None:
         monkeypatch.setattr(mk_postgres, "IS_WINDOWS", True)
         monkeypatch.setattr(mk_postgres, "IS_LINUX", False)
         monkeypatch.setattr(
@@ -349,7 +405,7 @@ class TestWindows:
         config = copy.deepcopy(VALID_CONFIG_WITH_INSTANCES)
         config[-1] = config[-1].format(sep=SEP_WINDOWS)
         sep = mk_postgres.helper_factory().get_conf_sep()
-        dbuser, instances = mk_postgres.parse_postgres_cfg(config, sep)
+        dbuser, _pg_path, instances = mk_postgres.parse_postgres_cfg(config, sep)
         assert len(instances) == 1
         assert dbuser == "user_yz"
         assert instances[0]["pg_port"] == "5432"
@@ -360,15 +416,14 @@ class TestWindows:
 
     @patch("os.path.isfile", return_value=True)
     @patch("subprocess.Popen")
-    def test_factory_without_instance(  # type: ignore[no-untyped-def]
-        self, mock_Popen, mock_isfile
-    ) -> None:
+    def test_factory_without_instance(self, mock_Popen: Mock, mock_isfile: Mock) -> None:
         process_mock = Mock()
         attrs = {
             "communicate.side_effect": [
                 ("postgres\x00db1\x00".encode("utf-8"), b"ok"),
                 (b"12.1", b"ok"),
-            ]
+            ],
+            "returncode": 0,
         }
         process_mock.configure_mock(**attrs)
         mock_Popen.return_value = process_mock
@@ -378,8 +433,8 @@ class TestWindows:
             "name": "data",
             "pg_user": "myuser",
             "pg_passfile": "/home/.pgpass",
-        }  # type: Dict[str, Optional[str]]
-        myPostgresOnWin = mk_postgres.postgres_factory("postgres", instance)
+        }  # type: dict[str, str | None]
+        myPostgresOnWin = mk_postgres.postgres_factory("postgres", None, instance)
 
         mock_isfile.assert_called_with("C:\\Program Files\\PostgreSQL\\12\\bin\\psql.exe")
         assert isinstance(myPostgresOnWin, mk_postgres.PostgresWin)
@@ -391,6 +446,36 @@ class TestWindows:
         assert myPostgresOnWin.get_server_version() == 12.1
         assert myPostgresOnWin.pg_database == "postgres"
         assert myPostgresOnWin.pg_port == "5432"
+
+    @patch("os.path.isfile", return_value=True)
+    @patch("subprocess.Popen")
+    def test_factory_do_not_overwrite_PG_PASSFILE(
+        self,
+        mock_Popen,
+        mock_isfile,
+    ):
+        instance = {
+            "pg_database": "mydb",
+            "pg_port": "1234",
+            "name": "mydb",
+            "pg_user": "myuser",
+            "pg_version": "12.1",
+        }  # type: dict[str, str | None]
+        process_mock = Mock()
+        attrs = {
+            "communicate.side_effect": [
+                (b"postgres\x00db1\x00", b"ok"),
+                (b"12.1.5\x00", b"ok"),
+            ],
+            "returncode": 0,
+        }
+        process_mock.configure_mock(**attrs)
+        mock_Popen.return_value = process_mock
+
+        myPostgresOnWin = mk_postgres.postgres_factory("postgres", None, instance)
+
+        mock_isfile.assert_called_with("C:\\Program Files\\PostgreSQL\\12\\bin\\psql.exe")
+        assert "PGPASSFILE" not in myPostgresOnWin.my_env
 
     @patch("os.path.isfile", return_value=True)
     @patch("subprocess.Popen")
@@ -406,18 +491,19 @@ class TestWindows:
             "pg_user": "myuser",
             "pg_passfile": "c:\\User\\.pgpass",
             "pg_version": "12.1",
-        }  # type: Dict[str, Optional[str]]
+        }  # type: dict[str, str | None]
         process_mock = Mock()
         attrs = {
             "communicate.side_effect": [
                 (b"postgres\x00db1\x00", b"ok"),
                 (b"12.1.5\x00", b"ok"),
-            ]
+            ],
+            "returncode": 0,
         }
         process_mock.configure_mock(**attrs)
         mock_Popen.return_value = process_mock
 
-        myPostgresOnWin = mk_postgres.postgres_factory("postgres", instance)
+        myPostgresOnWin = mk_postgres.postgres_factory("postgres", None, instance)
 
         mock_isfile.assert_called_with("C:\\Program Files\\PostgreSQL\\12\\bin\\psql.exe")
         assert isinstance(myPostgresOnWin, mk_postgres.PostgresWin)
@@ -432,3 +518,120 @@ class TestWindows:
         assert myPostgresOnWin.pg_user == "myuser"
         assert myPostgresOnWin.my_env["PGPASSFILE"] == "c:\\User\\.pgpass"
         assert myPostgresOnWin.name == "mydb"
+
+    def test_parse_INSTANCE_value(self) -> None:
+        # Legacy format, deprecated in Werk 16016, but kept around to not force updating the configuration.
+        got = mk_postgres._parse_INSTANCE_value(
+            "/home/postgres/db2.env|USER_NAME|/PATH/TO/.pgpass", SEP_WINDOWS
+        )
+        expected = ("/home/postgres/db2.env", "USER_NAME", "/PATH/TO/.pgpass", "db2")
+        assert got == expected
+
+        # Legacy format, deprecated in Werk 16016, but kept around to not force updating the configuration.
+        # This is a weird edge case, that was broken in 2.1.0p30 and 2.2.0p4 .
+        got = mk_postgres._parse_INSTANCE_value(
+            "/home/postgres/.env|USER_NAME|/PATH/TO/.pgpass", SEP_WINDOWS
+        )
+        expected = ("/home/postgres/.env", "USER_NAME", "/PATH/TO/.pgpass", "")
+        assert got == expected
+
+        # Bad configuration, we keep this around to migrate users from old to new config format
+        # But instance_name should really empty, or we should disallow this
+        got = mk_postgres._parse_INSTANCE_value(
+            "/home/postgres/db2.env|USER_NAME|/PATH/TO/.pgpass|", SEP_WINDOWS
+        )
+        expected = ("/home/postgres/db2.env", "USER_NAME", "/PATH/TO/.pgpass", "db2")
+        assert got == expected
+
+        # Correct configuration
+        got = mk_postgres._parse_INSTANCE_value(
+            "/home/postgres/db2.env|USER_NAME|/PATH/TO/.pgpass|hi", SEP_WINDOWS
+        )
+        expected = ("/home/postgres/db2.env", "USER_NAME", "/PATH/TO/.pgpass", "hi")
+        assert got == expected
+        # Legacy format, deprecated in Werk 16016, but kept around to not force updating the configuration.
+        got = mk_postgres._parse_INSTANCE_value(
+            "/home/postgres/db2.env|USER_NAME|/PATH/TO/.pgpass", SEP_WINDOWS
+        )
+        expected = ("/home/postgres/db2.env", "USER_NAME", "/PATH/TO/.pgpass", "db2")
+        assert got == expected
+
+        # Legacy format, deprecated in Werk 16016, but kept around to not force updating the configuration.
+        # This is a weird edge case, that was broken in 2.1.0p30 and 2.2.0p4 .
+        got = mk_postgres._parse_INSTANCE_value(
+            "/home/postgres/.env|USER_NAME|/PATH/TO/.pgpass", SEP_WINDOWS
+        )
+        expected = ("/home/postgres/.env", "USER_NAME", "/PATH/TO/.pgpass", "")
+        assert got == expected
+
+        # Bad configuration, we keep this around to migrate users from old to new config format
+        # But instance_name should really empty, or we should disallow this
+        got = mk_postgres._parse_INSTANCE_value(
+            "/home/postgres/db2.env|USER_NAME|/PATH/TO/.pgpass|", SEP_WINDOWS
+        )
+        expected = ("/home/postgres/db2.env", "USER_NAME", "/PATH/TO/.pgpass", "db2")
+        assert got == expected
+
+        # Correct configuration
+        got = mk_postgres._parse_INSTANCE_value(
+            "/home/postgres/db2.env|USER_NAME|/PATH/TO/.pgpass|hi", SEP_WINDOWS
+        )
+        expected = ("/home/postgres/db2.env", "USER_NAME", "/PATH/TO/.pgpass", "hi")
+        assert got == expected
+
+
+def test_parse_env_file(tmp_path):
+    path = tmp_path / ".env"
+    with open(str(path), "wb") as fo:
+        fo.write(
+            (
+                "export PGDATABASE='ut_pg_database'\n"
+                "PGPORT=ut_pg_port  # missing export, but still parsed... \n"
+                'export PGVERSION="some version"   \n'
+            ).encode("utf-8")
+        )
+    assert mk_postgres.parse_env_file(str(path)) == (
+        "'ut_pg_database'",  # this double quoting seems to be funny.
+        # but this is the expected behaviour (and we want to make a minimal change)
+        # the value will be used on the commandline, so bash will handle the quoting...
+        "ut_pg_port",
+        '"some version"',  # same as above
+    )
+
+
+def test_parse_env_file_comments(tmp_path):
+    path = tmp_path / ".env"
+    with open(str(path), "wb") as fo:
+        fo.write(
+            (
+                "export PGDATABASE=ut_pg_database\n"
+                "# export PGDATABASE=ut_some_other_database\n"
+                "PGPORT=123\n"
+                "#PGPORT=345\n"
+            ).encode("utf-8")
+        )
+    assert mk_postgres.parse_env_file(str(path)) == (
+        "ut_pg_database",
+        "123",
+        None,
+    )
+
+
+def test_parse_env_file_parser(tmp_path):
+    path = tmp_path / ".env"
+    with open(str(path), "wb") as fo:
+        fo.write(
+            (
+                "# this is a comment\n"
+                " # t = is a comment\n"
+                "\t#\tt =s a comment\n"
+                "\n"  # empty line
+                "export PGDATABASE=ut_pg_database\n"
+                "PGPORT=123\n"
+            ).encode("utf-8")
+        )
+    assert mk_postgres.parse_env_file(str(path)) == (
+        "ut_pg_database",
+        "123",
+        None,
+    )

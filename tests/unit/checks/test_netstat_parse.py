@@ -7,9 +7,9 @@ from collections.abc import Sequence
 
 import pytest
 
-from tests.testlib import Check
+from cmk.agent_based.v1.type_defs import StringTable
 
-from cmk.base.api.agent_based.type_defs import StringTable
+from .checktestlib import Check
 
 pytestmark = pytest.mark.checks
 
@@ -31,6 +31,17 @@ pytestmark = pytest.mark.checks
         (
             [["udp", "-", "-", "*.*", "0.0.0.0:*"]],
             [("UDP", ["*", "*"], ["0.0.0.0", "*"], "LISTENING")],
+        ),
+        # The ss command has a different order of columns
+        (
+            [
+                ["tcp", "LISTENING", "0", "4096", "127.0.0.1:8888", "0.0.0.0:*"],
+                ["udp", "UNCONN", "0", "0", "127.0.0.1:778", "0.0.0.0:*"],
+            ],
+            [
+                ("TCP", ["127.0.0.1", "8888"], ["0.0.0.0", "*"], "LISTENING"),
+                ("UDP", ["127.0.0.1", "778"], ["0.0.0.0", "*"], "LISTENING"),
+            ],
         ),
     ],
 )

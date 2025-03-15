@@ -6,9 +6,10 @@
 
 Cares about the main navigation of our GUI. This is a) the small sidebar and b) the mega menu
 """
+
 from typing import NamedTuple
 
-import cmk.gui.message as message
+from cmk.gui import message
 from cmk.gui.config import active_config
 from cmk.gui.exceptions import MKAuthException
 from cmk.gui.htmllib.generator import HTMLWriter
@@ -17,7 +18,7 @@ from cmk.gui.http import request, response
 from cmk.gui.i18n import _, ungettext
 from cmk.gui.logged_in import user
 from cmk.gui.main_menu import any_show_more_items, mega_menu_registry
-from cmk.gui.pages import AjaxPage, page_registry, PageResult, register
+from cmk.gui.pages import AjaxPage, PageResult
 from cmk.gui.type_defs import Icon, MegaMenu, TopicMenuItem, TopicMenuTopic
 from cmk.gui.utils.html import HTML
 from cmk.gui.utils.output_funnel import output_funnel
@@ -112,26 +113,24 @@ class MainMenuRenderer:
             return output_funnel.drain()
 
 
-@register("sidebar_message_read")
 def ajax_message_read():
     response.set_content_type("application/json")
     try:
         message.delete_gui_message(request.get_str_input_mandatory("id"))
-        html.write_text("OK")
+        html.write_text_permissive("OK")
     except Exception:
         if active_config.debug:
             raise
-        html.write_text("ERROR")
+        html.write_text_permissive("ERROR")
 
 
-@page_registry.register_page("ajax_sidebar_get_messages")
-class ModeAjaxSidebarGetMessages(AjaxPage):
+class PageAjaxSidebarGetMessages(AjaxPage):
     def page(self) -> PageResult:
         popup_msg: list = []
         hint_msg: int = 0
 
         for msg in message.get_gui_messages():
-            if "gui_hint" in msg["methods"]:
+            if "gui_hint" in msg["methods"] and not msg.get("acknowledged"):
                 hint_msg += 1
             if "gui_popup" in msg["methods"]:
                 popup_msg.append({"id": msg["id"], "text": msg["text"]})
@@ -139,14 +138,14 @@ class ModeAjaxSidebarGetMessages(AjaxPage):
         return {
             "popup_messages": popup_msg,
             "hint_messages": {
-                "text": ungettext("message", "messages", hint_msg),
+                "title": _("User message"),
+                "text": _("new"),
                 "count": hint_msg,
             },
         }
 
 
-@page_registry.register_page("ajax_sidebar_get_unack_incomp_werks")
-class ModeAjaxSidebarGetUnackIncompWerks(AjaxPage):
+class PageAjaxSidebarGetUnackIncompWerks(AjaxPage):
     def page(self) -> PageResult:
         if not may_acknowledge():
             raise MKAuthException(_("You are not allowed to acknowlegde werks"))
@@ -225,7 +224,7 @@ class MegaMenuRenderer:
         html.open_h2()
         html.open_a(
             class_="show_all_topics",
-            href="",
+            href=None,
             onclick="cmk.popup_menu.mega_menu_show_all_topics('%s')" % topic_id,
         )
         html.icon(icon="collapse_arrow", title=_("Show all %s topics") % menu_id)
@@ -240,10 +239,10 @@ class MegaMenuRenderer:
         for item in sorted(topic.items, key=lambda g: g.sort_index):
             self._show_item(item)
         html.open_li(class_="show_all_items")
-        html.open_a(href="", onclick="cmk.popup_menu.mega_menu_show_all_items('%s')" % topic_id)
+        html.open_a(href=None, onclick="cmk.popup_menu.mega_menu_show_all_items('%s')" % topic_id)
         if user.get_attribute("icons_per_item"):
             html.icon("trans")
-        html.write_text(_("Show all"))
+        html.write_text_permissive(_("Show all"))
         html.close_a()
         html.close_li()
         html.close_ul()
@@ -264,7 +263,7 @@ class MegaMenuRenderer:
     def _show_item_title(self, item: TopicMenuItem) -> None:
         item_title: HTML | str = item.title
         if not item.button_title:
-            html.write_text(item_title)
+            html.write_text_permissive(item_title)
             return
         html.span(item.title)
         html.button(item.name, item.button_title)

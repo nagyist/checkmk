@@ -3,23 +3,27 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-from cmk.utils.site import omd_site
+from cmk.ccc.site import omd_site
+
 from cmk.utils.urls import is_allowed_url
 
-import cmk.gui.pages
 from cmk.gui.config import active_config
 from cmk.gui.exceptions import HTTPRedirect
 from cmk.gui.htmllib.generator import HTMLWriter
 from cmk.gui.http import request, response
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
+from cmk.gui.pages import PageRegistry
 from cmk.gui.sidebar import SidebarRenderer
 from cmk.gui.site_config import get_site_config
 from cmk.gui.utils.mobile import is_mobile
 from cmk.gui.utils.urls import makeuri
 
 
-@cmk.gui.pages.register("index")
+def register(page_registry: PageRegistry) -> None:
+    page_registry.register_page_handler("index", page_index)
+
+
 def page_index() -> None:
     # Redirect to mobile GUI if we are a mobile device and the index is requested
     if is_mobile(request, response):
@@ -40,5 +44,7 @@ def _get_start_url() -> str:
 
 def get_page_heading() -> str:
     if "%s" in active_config.page_heading:
-        return active_config.page_heading % (get_site_config(omd_site()).get("alias", _("GUI")))
+        return active_config.page_heading % (
+            get_site_config(active_config, omd_site()).get("alias", _("GUI"))
+        )
     return active_config.page_heading

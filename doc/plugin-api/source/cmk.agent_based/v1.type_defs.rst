@@ -1,0 +1,7 @@
+============================
+cmk.agent_based.v1.type_defs
+============================
+
+.. automodule:: cmk.agent_based.v1.type_defs
+   :members:
+   :show-inheritance:

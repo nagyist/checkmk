@@ -48,7 +48,6 @@ _WMI_SECTIONS: Final = {
 _INTERNAL_SECTIONS: Final = _NOT_WMI_SECTIONS.union(_WMI_SECTIONS)
 
 
-@pytest.mark.skip
 @pytest.mark.parametrize(
     "only_from, description",
     [
@@ -78,9 +77,9 @@ def test_check_mk_base(
     assert sections[0] == "<<<check_mk>>>"
     assert sections[1] == "<<<cmk_agent_ctl_status:sep(0)>>>"
     assert sections.count("<<<>>>") == 2
-    assert _INTERNAL_SECTIONS.issubset(
-        set(sections)
-    ), f"Missing sections: {_INTERNAL_SECTIONS.difference((set(sections)))}"
+    assert _INTERNAL_SECTIONS.issubset(set(sections)), (
+        f"Missing sections: {_INTERNAL_SECTIONS.difference(set(sections))}"
+    )
     assert sections[-1] == "<<<systemtime>>>"
     assert len(sections) == SECTION_COUNT
 
@@ -100,12 +99,11 @@ def config_no_wmi_fixture(default_yaml_config: YamlDict) -> YamlDict:
     return default_yaml_config
 
 
-@pytest.mark.skip
-def test_check_mk_no_wmi(  # type: ignore[no-untyped-def]
+def test_check_mk_no_wmi(
     main_exe: Path,
     config_no_wmi: YamlDict,
     data_dir: Path,
-):
+) -> None:
     output = obtain_agent_data(
         config_no_wmi,
         main_exe=main_exe,

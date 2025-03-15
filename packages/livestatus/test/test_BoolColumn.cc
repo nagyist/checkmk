@@ -5,11 +5,10 @@
 
 #include <functional>
 #include <initializer_list>
-#include <memory>
 #include <string>
-#include <variant>  // IWYU pragma: keep
 
 #include "gtest/gtest.h"
+#include "livestatus/Column.h"
 #include "livestatus/IntColumn.h"
 #include "livestatus/Row.h"
 #include "livestatus/User.h"

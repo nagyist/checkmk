@@ -7,14 +7,14 @@
 
 #include <ranges>
 
-#include "cfg.h"
 #include "common/wtools.h"
 #include "providers/check_mk.h"
 #include "providers/df.h"
 #include "providers/wmi.h"
-#include "service_processor.h"
-#include "test_tools.h"
 #include "tools/_misc.h"
+#include "watest/test_tools.h"
+#include "wnx/cfg.h"
+#include "wnx/service_processor.h"
 
 namespace fs = std::filesystem;
 namespace rs = std::ranges;
@@ -324,12 +324,11 @@ TEST(WmiProviderTest, SimulationComponent) {
     {
         Wmi dotnet_clr(kDotNetClrMemory, wmi::kSepChar);
         EXPECT_EQ(dotnet_clr.subsectionMode(), SubSection::Mode::standard);
-        EXPECT_EQ(dotnet_clr.delayOnFail(), cma::cfg::G_DefaultDelayOnFail);
+        EXPECT_EQ(dotnet_clr.delayOnFail(), 0s);
         EXPECT_EQ(dotnet_clr.object(),
                   L"Win32_PerfRawData_NETFramework_NETCLRMemory");
         EXPECT_TRUE(dotnet_clr.isAllowedByCurrentConfig());
         EXPECT_TRUE(dotnet_clr.isAllowedByTime());
-        EXPECT_EQ(dotnet_clr.delayOnFail(), 3600s);
 
         EXPECT_EQ(dotnet_clr.nameSpace(), L"Root\\Cimv2");
         std::string body;
@@ -378,7 +377,7 @@ TEST(WmiProviderTest, SimulationComponent) {
         Wmi cpu(kWmiCpuLoad, wmi::kSepChar);
         EXPECT_EQ(cpu.subsectionMode(), SubSection::Mode::standard);
         ASSERT_FALSE(cpu.headerless());
-        EXPECT_EQ(cpu.delayOnFail(), cma::cfg::G_DefaultDelayOnFail);
+        EXPECT_EQ(cpu.delayOnFail(), 0s);
 
         // this is empty section
         EXPECT_EQ(cpu.object(), L"");
@@ -398,7 +397,7 @@ TEST(WmiProviderTest, SimulationComponent) {
         // other:
         EXPECT_TRUE(cpu.isAllowedByCurrentConfig());
         EXPECT_TRUE(cpu.isAllowedByTime());
-        EXPECT_EQ(cpu.delayOnFail(), 3600s);
+        EXPECT_EQ(cpu.delayOnFail(), 0s);
     }
     {
         Wmi msexch(kMsExch, wmi::kSepChar);
@@ -513,10 +512,14 @@ TEST(WmiProviderTest, BasicWmi) {
 }
 
 TEST(WmiProviderTest, DelayOnFailDefault) {
-    for (const auto name :
-         {kOhm, kWmiCpuLoad, kWmiWebservices, kDotNetClrMemory, kMsExch}) {
+    for (const auto name : {kOhm, kWmiWebservices, kMsExch}) {
         Wmi b(name, ',');
         EXPECT_EQ(b.delayOnFail(), 3600s)
+            << "bad delay for section by default " << name;
+    }
+    for (const auto name : {kWmiCpuLoad, kDotNetClrMemory}) {
+        Wmi b(name, ',');
+        EXPECT_EQ(b.delayOnFail(), 0s)
             << "bad delay for section by default " << name;
     }
 }
@@ -596,9 +599,7 @@ private:
 };
 
 TEST_F(WmiProviderTestFixture, WmiMsExch) {
-    auto table = execWmiProvider(
-        kMsExch,
-        ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    auto table = execWmiProvider(kMsExch, tst::GetUnitTestName());
     if (table.empty()) {
         return;
     }
@@ -613,9 +614,7 @@ TEST_F(WmiProviderTestFixture, WmiWebServicesAbsentComponent) {
         GTEST_SKIP() << fmt::format(L"'{}' is presented", web_services_service);
     }
 
-    const auto table = execWmiProvider(
-        kWmiWebservices,
-        ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    const auto table = execWmiProvider(kWmiWebservices, tst::GetUnitTestName());
     ASSERT_TRUE(table.empty());
 }
 
@@ -624,18 +623,14 @@ TEST_F(WmiProviderTestFixture, WmiWebServicesPresentedComponent) {
         GTEST_SKIP() << fmt::format(L"'{}' is absent", web_services_service);
     }
 
-    const auto table = execWmiProvider(
-        kWmiWebservices,
-        ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    const auto table = execWmiProvider(kWmiWebservices, tst::GetUnitTestName());
     ASSERT_GT(table.size(), 3U);
     EXPECT_EQ(table[0] + "\n",
               section::MakeHeader(kWmiWebservices, wmi::kSepChar));
 }
 
 TEST_F(WmiProviderTestFixture, WmiCpu) {
-    auto table = execWmiProvider(
-        kWmiCpuLoad,
-        ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    auto table = execWmiProvider(kWmiCpuLoad, tst::GetUnitTestName());
 
     ASSERT_TRUE(table.size() >= 5);  // header, two subheaders and two lines
     EXPECT_EQ(table[0] + "\n", section::MakeHeader(kWmiCpuLoad, wmi::kSepChar));

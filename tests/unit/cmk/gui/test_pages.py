@@ -7,7 +7,9 @@ import sys
 
 import pytest
 
-import cmk.utils.version as cmk_version
+import cmk.ccc.version as cmk_version
+
+from cmk.utils import paths
 
 import cmk.gui.pages
 
@@ -15,6 +17,7 @@ import cmk.gui.pages
 def test_registered_pages() -> None:
     expected_pages = [
         "add_bookmark",
+        "ajax_acknowledge_user_message",
         "ajax_figure_dashlet_data",
         "ajax_bi_rule_preview",
         "ajax_bi_aggregation_preview",
@@ -31,6 +34,7 @@ def test_registered_pages() -> None:
         "ajax_nagvis_maps_snapin",
         "ajax_popup_action_menu",
         "ajax_popup_host_action_menu",
+        "ajax_popup_service_action_menu",
         "ajax_popup_add_visual",
         "ajax_popup_icon_selector",
         "ajax_popup_move_to_folder",
@@ -48,19 +52,16 @@ def test_registered_pages() -> None:
         "ajax_switch_help",
         "ajax_ui_theme",
         "ajax_userdb_sync",
+        "ajax_validate_filter",
         "ajax_visual_filter_list_get_choice",
         "ajax_vs_autocomplete",
         "ajax_vs_unit_resolver",
         "ajax_fetch_aggregation_data",
-        "ajax_save_bi_template_layout",
         "ajax_save_bi_aggregation_layout",
         "ajax_sidebar_get_messages",
-        "ajax_load_bi_template_layout",
         "ajax_load_bi_aggregation_layout",
-        "ajax_delete_bi_template_layout",
         "ajax_delete_bi_aggregation_layout",
         "ajax_fetch_topology",
-        "ajax_get_all_bi_template_layouts",
         "automation_login",
         "bi_map",
         "bi_render_tree",
@@ -85,7 +86,6 @@ def test_registered_pages() -> None:
         "download_agent_output",
         "download_crash_report",
         "download_diagnostics_dump",
-        "download_robotmk_report",
         "edit_bookmark_list",
         "edit_dashboard",
         "edit_dashboards",
@@ -107,12 +107,10 @@ def test_registered_pages() -> None:
         "mobile",
         "mobile_view",
         "noauth:automation",
-        "noauth:run_cron",
         "message",
         "prediction_graph",
         "parent_child_topology",
-        "robotmk",
-        "robotmk_report",
+        "network_topology",
         "search_open",
         "set_all_sites",
         "side",
@@ -135,7 +133,9 @@ def test_registered_pages() -> None:
         "user_profile",
         "user_profile_replicate",
         "user_webauthn_register_begin",
+        "user_totp_register",
         "user_two_factor_overview",
+        "user_two_factor_enforce",
         "user_two_factor_edit_credential",
         "user_webauthn_register_complete",
         "user_login_two_factor",
@@ -154,10 +154,11 @@ def test_registered_pages() -> None:
         "ajax_initial_dashboard_filters",
         "ajax_initial_view_filters",
         "ajax_initial_topology_filters",
-        "noauth:ajax_graph_images",
+        "ajax_graph_images",
+        "gui_timings",
     ]
 
-    if not cmk_version.is_raw_edition():
+    if cmk_version.edition(paths.omd_root) is not cmk_version.Edition.CRE:
         expected_pages += [
             "ajax_host_overview_tooltip",
             "ajax_pagetype_add_element",
@@ -224,6 +225,20 @@ def test_registered_pages() -> None:
             "noauth:saml_acs",
             "noauth:saml_metadata",
             "noauth:saml_sso",
+            "robotmk_suite_log",
+            "robotmk_suite_report",
+            "download_robotmk_suite_report",
+        ]
+
+    if cmk_version.edition(paths.omd_root) is cmk_version.Edition.CSE:
+        expected_pages += [
+            "ajax_saas_onboarding_button_toggle",
+            "noauth:cognito_sso",
+            "noauth:cognito_callback",
+            "cognito_logout",
+            "noauth:download_license_request",
+            "noauth:upload_license_response",
+            "noauth:download_license_usage",
         ]
 
     # TODO: Depending on how we call the test (single test or whole package) we
@@ -237,22 +252,6 @@ def test_registered_pages() -> None:
         sys.stdout.write("Expected but missing: %s\n" % ", ".join(expected_set - actual_set))
         sys.stdout.write("Unknown new pages: %s\n" % ", ".join(actual_set - expected_set))
     assert len(differences) == 0
-
-
-def test_pages_register(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setattr(cmk.gui.pages, "page_registry", cmk.gui.pages.PageRegistry())
-
-    @cmk.gui.pages.register("123handler")
-    def page_handler():  # pylint: disable=unused-variable
-        sys.stdout.write("123")
-
-    handler = cmk.gui.pages.get_page_handler("123handler")
-    assert callable(handler)
-
-    handler()
-    assert capsys.readouterr()[0] == "123"
 
 
 @pytest.mark.usefixtures("monkeypatch")

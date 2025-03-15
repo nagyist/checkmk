@@ -1,58 +1,48 @@
 #!/usr/bin/env python3
-#
-#       U  ___ u  __  __   ____
-#        \/"_ \/U|' \/ '|u|  _"\
-#        | | | |\| |\/| |/| | | |
-#    .-,_| |_| | | |  | |U| |_| |\
-#     \_)-\___/  |_|  |_| |____/ u
-#          \\   <<,-,,-.   |||_
-#         (__)   (./  \.) (__)_)
-#
-# This file is part of OMD - The Open Monitoring Distribution.
-# The official homepage is at <http://omdistro.org>.
-#
-# OMD  is  free software;  you  can  redistribute it  and/or modify it
-# under the  terms of the  GNU General Public License  as published by
-# the  Free Software  Foundation  in  version 2.  OMD  is  distributed
-# in the hope that it will be useful, but WITHOUT ANY WARRANTY;  with-
-# out even the implied warranty of  MERCHANTABILITY  or  FITNESS FOR A
-# PARTICULAR PURPOSE. See the  GNU General Public License for more de-
-# ails.  You should have  received  a copy of the  GNU  General Public
-# License along with GNU Make; see the file  COPYING.  If  not,  write
-# to the Free Software Foundation, Inc., 51 Franklin St,  Fifth Floor,
-# Boston, MA 02110-1301 USA.
+# Copyright (C) 2023 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
 """Handling of site-internal init scripts"""
 
+import contextlib
 import logging
 import os
 import subprocess
 import sys
+from typing import Literal
 
-from omdlib.utils import chdir
-
-import cmk.utils.tty as tty
+from cmk.utils import tty
+from cmk.utils.local_secrets import SiteInternalSecret
 from cmk.utils.log import VERBOSE
+from cmk.utils.log.security_event import log_security_event, SiteStartStoppedEvent
 
 logger = logging.getLogger("cmk.omd")
 
 
 def call_init_scripts(
     site_dir: str,
-    command: str,
+    command: Literal["start", "stop", "restart", "reload", "status"],
     daemon: str | None = None,
     exclude_daemons: list[str] | None = None,
-) -> int:
+) -> Literal[0, 2]:
     # Restart: Do not restart each service after another,
     # but first do stop all, then start all again! This
     # preserves the order.
     if command == "restart":
-        # TODO: Why is the result of call_init_scripts not returned?
-        call_init_scripts(site_dir, "stop", daemon)
-        call_init_scripts(site_dir, "start", daemon)
-        return 0
+        log_security_event(SiteStartStoppedEvent(event="restart", daemon=daemon))
+        code_stop = call_init_scripts(site_dir, "stop", daemon)
+        code_start = call_init_scripts(site_dir, "start", daemon)
+        return 0 if (code_stop, code_start) == (0, 0) else 2
 
     # OMD guarantees OMD_ROOT to be the current directory
-    with chdir(site_dir):
+    with contextlib.chdir(site_dir):
+        if command == "start":
+            log_security_event(SiteStartStoppedEvent(event="start", daemon=daemon))
+            SiteInternalSecret().regenerate()
+        elif command == "stop":
+            log_security_event(SiteStartStoppedEvent(event="stop", daemon=daemon))
+
         if daemon:
             success = _call_init_script(f"{site_dir}/etc/init.d/{daemon}", command)
 
@@ -71,12 +61,10 @@ def call_init_scripts(
                 if not _call_init_script(f"{rc_dir}/{script}", command):
                     success = False
 
-    if success:
-        return 0
-    return 2
+    return 0 if success else 2
 
 
-def check_status(  # pylint: disable=too-many-branches
+def check_status(
     site_dir: str, display: bool = True, daemon: str | None = None, bare: bool = False
 ) -> int:
     num_running = 0
@@ -104,7 +92,7 @@ def check_status(  # pylint: disable=too-many-branches
             if bare:
                 sys.stdout.write(komponent + " ")
             else:
-                sys.stdout.write("%-16s" % (komponent + ":"))
+                sys.stdout.write("%-20s" % (komponent + ":"))
                 sys.stdout.write(tty.bold)
 
         if bare:
@@ -142,8 +130,8 @@ def check_status(  # pylint: disable=too-many-branches
         if bare:
             sys.stdout.write("OVERALL %d\n" % exit_code)
         else:
-            sys.stdout.write("-----------------------\n")
-            sys.stdout.write("Overall state:  %s\n" % (tty.bold + ovstate + tty.normal))
+            sys.stdout.write("---------------------------\n")
+            sys.stdout.write("Overall state:      %s\n" % (tty.bold + ovstate + tty.normal))
     return exit_code
 
 

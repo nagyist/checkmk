@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from tests.testlib import is_cloud_repo, is_enterprise_repo
+from tests.testlib.common.repo import is_cloud_repo, is_enterprise_repo
 
 from cmk.post_rename_site import main
 from cmk.post_rename_site.registry import rename_action_registry
@@ -17,11 +17,13 @@ from cmk.post_rename_site.registry import rename_action_registry
 def fixture_expected_plugins() -> list[str]:
     expected = [
         "sites",
+        "messaging",
         "hosts_and_folders",
         "update_core_config",
         "warn_remote_site",
         "warn_about_network_ports",
         "warn_about_configs_to_review",
+        "compute_api_spec",
     ]
 
     # ATTENTION. The edition related code below is confusing and incorrect. The reason we need it
@@ -29,13 +31,13 @@ def fixture_expected_plugins() -> list[str]:
     # We cannot fix that in the short (or even mid) term because the
     # precondition is a more cleanly separated structure.
     if is_enterprise_repo():
-        # The CEE plugins are loaded when the CEE plugins are available, i.e.
+        # The CEE plug-ins are loaded when the CEE plug-ins are available, i.e.
         # when the "enterprise/" path is present.
         expected.append("dcd_connections")
 
     if is_cloud_repo():
-        # The CCE plugins are loaded when the CCE plugins are available
-        expected.append("agent_controller_connections")
+        # The CCE plug-ins are loaded when the CCE plug-ins are available
+        expected.extend(["agent_controller_connections", "otel"])
 
     return expected
 

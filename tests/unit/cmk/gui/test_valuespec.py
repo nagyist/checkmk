@@ -3,11 +3,13 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+import datetime
+from binascii import unhexlify
 from collections.abc import Sequence
+from zoneinfo import ZoneInfo
 
 import pytest
-
-from tests.testlib import on_time
+import time_machine
 
 import cmk.gui.valuespec as vs
 from cmk.gui.config import active_config
@@ -28,7 +30,7 @@ from cmk.gui.http import request
     ],
 )
 def test_timehelper_add(args: tuple[int, int, str], result: int) -> None:
-    with on_time("2019-09-05", "UTC"):
+    with time_machine.travel(datetime.datetime(2019, 9, 5, tzinfo=ZoneInfo("UTC"))):
         assert vs.TimeHelper.add(*args) == result
 
 
@@ -42,7 +44,7 @@ def test_timehelper_add(args: tuple[int, int, str], result: int) -> None:
     ],
 )
 def test_absolutedate_value_to_json_conversion(value: int, result: str) -> None:
-    with on_time("2020-03-02", "UTC"):
+    with time_machine.travel(datetime.datetime(2020, 3, 2, tzinfo=ZoneInfo("UTC"))):
         assert vs.AbsoluteDate().value_to_html(value) == result
         json_value = vs.AbsoluteDate().value_to_json(value)
         assert vs.AbsoluteDate().value_from_json(json_value) == value
@@ -146,7 +148,7 @@ def test_timerange_value_to_html_conversion(
 
 @pytest.mark.usefixtures("request_context")
 def test_timerange_value_to_json_conversion() -> None:
-    with on_time("2020-03-02", "UTC"):
+    with time_machine.travel(datetime.datetime(2020, 3, 2, tzinfo=ZoneInfo("UTC"))):
         for ident, title, _vs in vs.Timerange().choices():
             choice_value: vs.CascadingDropdownChoiceValue = ident
             if ident == "age":
@@ -175,6 +177,39 @@ def test_timerange_value_to_json_conversion() -> None:
 )
 def test_email_validation(address: str) -> None:
     vs.EmailAddress().validate_value(address, "")
+
+
+def _example_image_data():
+    """A tiny but valid PNG image"""
+    return unhexlify(
+        b"89504e470d0a1a0a0000000d494844520000000100"
+        b"0000010802000000907753de000000037342495408"
+        b"0808dbe14fe00000000c49444154089963b876f51a"
+        b"0005060282db61224c0000000049454e44ae426082"
+    )
+
+
+@pytest.mark.parametrize(
+    "filedata",
+    [
+        # Should raise is when trying to be opened
+        ("file.png", "image/png", b"\x89PNG"),
+        ("OneByOne.png", "image/jpeg", _example_image_data()),
+        ("OneByOne.jpg", "image/png", _example_image_data()),
+        ("OneByOne.png.jpg", "image/png", _example_image_data()),
+        ("OneByOne.png", "!image/png", _example_image_data()),
+        ("OneByOne.png", "image/pngA", _example_image_data()),
+        ("OneByOne.png%20", "image/png", _example_image_data()),
+    ],
+)
+def test_imageupload_non_compliance(filedata: vs.FileUploadModel) -> None:
+    with pytest.raises(MKUserError):
+        vs.ImageUpload(mime_types=["image/png"]).validate_value(filedata, "prefix")
+
+
+@pytest.mark.parametrize("filedata", [("OneByOne.png", "image/png", _example_image_data())])
+def test_imageupload_compliance(filedata: vs.FileUploadModel) -> None:
+    vs.ImageUpload(mime_types=["image/png"]).validate_value(filedata, "prefix")
 
 
 @pytest.mark.parametrize(
@@ -349,3 +384,18 @@ class TestAlternative:
                     vs.Integer(),
                 ]
             ).transform_value("strange")
+
+
+@pytest.mark.parametrize(
+    "hostname",
+    (
+        "",  # empty
+        "../../foo",  # invalid char, path traversal
+        "a" * 255,  # too long
+    ),
+)
+def test_nvalid_hostnames_rejected(hostname: str) -> None:
+    """test that certain hostnames fail validation"""
+
+    with pytest.raises(MKUserError):
+        vs.Hostname().validate_value(hostname, "varprefix")

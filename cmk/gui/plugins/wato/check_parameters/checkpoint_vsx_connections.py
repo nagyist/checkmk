@@ -15,8 +15,7 @@ from cmk.gui.valuespec import Dictionary, Integer, Percentage, TextInput, Tuple
 def _parameter_valuespec_checkpoint_vsx_connections():
     return Dictionary(
         help=_(
-            "This rule allows you to configure the number of maximum "
-            "connections for a given VSID."
+            "This rule allows you to configure the number of maximum connections for a given VSID."
         ),
         elements=[
             (
@@ -57,6 +56,6 @@ rulespec_registry.register(
         group=RulespecGroupCheckParametersNetworking,
         item_spec=lambda: TextInput(title=_("VSID")),
         parameter_valuespec=_parameter_valuespec_checkpoint_vsx_connections,
-        title=lambda: _("Checkpoint VSID connections"),
+        title=lambda: _("Check Point VSID connections"),
     )
 )

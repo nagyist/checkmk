@@ -8,16 +8,16 @@
 
 #include <iostream>
 
-#include "cfg.h"
-#include "cma_core.h"
 #include "common/cfg_info.h"
 #include "common/cmdline_info.h"
 #include "cstdint"  // for int64_t, uint32_t, uint64_t
-#include "install_api.h"
-#include "logger.h"
-#include "on_start.h"  // for AppType, OnStartApp, AppType::exe, AppType::srv
 #include "providers/perf_counters_cl.h"
-#include "windows_service_api.h"
+#include "wnx/cfg.h"
+#include "wnx/cma_core.h"
+#include "wnx/install_api.h"
+#include "wnx/logger.h"
+#include "wnx/on_start.h"  // for AppType, OnStartApp, AppType::exe, AppType::srv
+#include "wnx/windows_service_api.h"
 
 using namespace std::chrono_literals;
 using XLOG::Colors;
@@ -27,7 +27,7 @@ namespace cma::cmdline {
 void PrintBlock(std::string_view title, Colors title_color,
                 const std::function<std::string()> &formatter) {
     xlog::sendStringToStdio(title.data(), title_color);
-    auto out = formatter();
+    const auto out = formatter();
     printf("%s", out.data());
 }
 
@@ -67,7 +67,7 @@ void PrintSelfCheck() {
             "\t{2:<{0}} - check test\n"
             "\t\t{3:<{0}} - main thread test\n"
             "\t\t{4:<{0}} - simple self test of internal and external transport\n"
-            "\t\t{5:<{0}} - simulates periodical connection from Check MK Site, for example '{1} {2} {5} 13'\n",
+            "\t\t{5:<{0}} - simulates periodical connection from Checkmk Site, for example '{1} {2} {5} 13'\n",
             kParamShift, kServiceExeName, kCheckParam, kCheckParamMt,
             kCheckParamIo, kCheckParamSelf);
     });

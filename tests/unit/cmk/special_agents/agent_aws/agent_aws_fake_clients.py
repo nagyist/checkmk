@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import abc
 import random
-from collections.abc import Callable, Container, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from typing import Any, TypedDict
 
-from cmk.utils.aws_constants import AWSEC2InstTypes
+from cmk.plugins.aws.constants import AWSEC2InstTypes
 
 #   .--entities------------------------------------------------------------.
 #   |                             _   _ _   _                              |
@@ -144,7 +144,7 @@ class Bytes(Str):
 
 
 class InstanceBuilder(abc.ABC):
-    def __init__(self, idx: int, amount: int, skip_entities: Container[str] = ()) -> None:
+    def __init__(self, idx: int, amount: int, skip_entities: Collection[str] = ()) -> None:
         self._idx = idx
         self._amount = amount
         self._skip_entities = [] if not skip_entities else skip_entities
@@ -762,6 +762,7 @@ class ELBDescribeTagsIB(InstanceBuilder):
     def _fill_instance(self) -> Iterable[Entity]:
         return [
             Str("LoadBalancerName"),
+            Str("LoadBalancerArn"),
             List(
                 "Tags",
                 [
@@ -2504,49 +2505,6 @@ class EC2DescribeVolumeStatusIB(InstanceBuilder):
         ]
 
 
-class EC2DescribeTagsIB(InstanceBuilder):
-    def _fill_instance(self) -> Iterable[Entity]:
-        return [
-            Str("Key"),
-            Str("ResourceId"),
-            Choice(
-                "ResourceType",
-                [
-                    "client-vpn-endpoint",
-                    "customer-gateway",
-                    "dedicated-host",
-                    "dhcp-options",
-                    "elastic-ip",
-                    "fleet",
-                    "fpga-image",
-                    "host-reservation",
-                    "image",
-                    "instance",
-                    "internet-gateway",
-                    "launch-template",
-                    "natgateway",
-                    "network-acl",
-                    "network-interface",
-                    "reserved-instances",
-                    "route-table",
-                    "security-group",
-                    "snapshot",
-                    "spot-instances-request",
-                    "subnet",
-                    "transit-gateway",
-                    "transit-gateway-attachment",
-                    "transit-gateway-route-table",
-                    "volume",
-                    "vpc",
-                    "vpc-peering-connection",
-                    "vpn-connection",
-                    "vpn-gateway",
-                ],
-            ),
-            Str("Value"),
-        ]
-
-
 # .
 #   .--DynamoDB-------------------------------------------------------------
 
@@ -2878,12 +2836,88 @@ class WAFV2GetWebACLIB(InstanceBuilder):
                                 [
                                     Int("Limit"),
                                     Str("AggregateKeyType"),
-                                    Dict("ScopeDownStatement", []),
+                                    Dict(
+                                        "ScopeDownStatement",
+                                        [
+                                            Dict(
+                                                "ByteMatchStatement",
+                                                [
+                                                    Bytes("SearchString"),
+                                                    self._field_to_match(),
+                                                    self._text_transformations(),
+                                                    Choice(
+                                                        "PositionalConstraint",
+                                                        [
+                                                            "EXACTLY",
+                                                            "STARTS_WITH",
+                                                            "ENDS_WITH",
+                                                            "CONTAINS",
+                                                            "CONTAINS_WORD",
+                                                        ],
+                                                    ),
+                                                ],
+                                            ),
+                                        ],
+                                    ),
                                 ],
                             ),
-                            Dict("AndStatement", [List("Statements", [])]),
+                            Dict(
+                                "AndStatement",
+                                [
+                                    List(
+                                        "Statements",
+                                        [
+                                            Dict(
+                                                "ByteMatchStatement",
+                                                [
+                                                    Bytes("SearchString"),
+                                                    self._field_to_match(),
+                                                    self._text_transformations(),
+                                                    Choice(
+                                                        "PositionalConstraint",
+                                                        [
+                                                            "EXACTLY",
+                                                            "STARTS_WITH",
+                                                            "ENDS_WITH",
+                                                            "CONTAINS",
+                                                            "CONTAINS_WORD",
+                                                        ],
+                                                    ),
+                                                ],
+                                            ),
+                                        ],
+                                    )
+                                ],
+                            ),
                             Dict("OrStatement", [List("Statements", [])]),
-                            Dict("NotStatement", [Dict("ScopeDownStatement", [])]),
+                            Dict(
+                                "NotStatement",
+                                [
+                                    Dict(
+                                        "ScopeDownStatement",
+                                        [
+                                            Dict(
+                                                "ByteMatchStatement",
+                                                [
+                                                    Bytes("SearchString"),
+                                                    self._field_to_match(),
+                                                    self._text_transformations(),
+                                                    Choice(
+                                                        "PositionalConstraint",
+                                                        [
+                                                            "EXACTLY",
+                                                            "STARTS_WITH",
+                                                            "ENDS_WITH",
+                                                            "CONTAINS",
+                                                            "CONTAINS_WORD",
+                                                        ],
+                                                    ),
+                                                ],
+                                            ),
+                                        ],
+                                    )
+                                ],
+                            ),
                             Dict(
                                 "Statement",
                                 [
@@ -2928,14 +2962,19 @@ class WAFV2ListTagsForResourceIB(InstanceBuilder):
 #   |         |_|  \__,_|_|\_\___|  \___|_|_|\___|_| |_|\__|___/           |
 #   |                                                                      |
 #   '----------------------------------------------------------------------'
-
-
-class FakeCloudwatchClient:
-    def describe_alarms(self, AlarmNames=None):
+class FakeCloudwatchClientDescribeAlarmsPaginator:
+    def paginate(self, AlarmNames=None):
         alarms = CloudwatchDescribeAlarmsIB.create_instances(amount=2)
         if AlarmNames:
             alarms = [alarm for alarm in alarms if alarm["AlarmName"] in AlarmNames]
-        return {"MetricAlarms": alarms, "NextToken": "string"}
+        yield {"MetricAlarms": alarms, "NextToken": "string"}
+
+
+class FakeCloudwatchClient:
+    def get_paginator(self, api_call):
+        if api_call == "describe_alarms":
+            return FakeCloudwatchClientDescribeAlarmsPaginator()
+        raise NotImplementedError(f"Please implement the paginator for {api_call}")
 
     def get_metric_data(self, MetricDataQueries, StartTime="START", EndTime="END"):
         results = []
@@ -3068,21 +3107,85 @@ class FakeCloudwatchClientLogsClient:
         raise NotImplementedError(f"Please implement the paginator for {api_call}")
 
 
-class FakeServiceQuotasClient:
-    def list_service_quotas(self, ServiceCode):
-        q_val = Float("Value")
-        return {
-            "Quotas": [
-                {"QuotaName": name, "Value": q_val.create(None, None)}
-                for name in [
-                    "Running On-Demand F instances",
-                    "Running On-Demand G instances",
-                    "Running On-Demand P instances",
-                    "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances",
-                    "Running On-Demand X instances",
+class QuotaPaginator:
+    def paginate(self, ServiceCode: str = "") -> Iterator[Mapping[str, object]]:
+        if ServiceCode == "ec2":
+            q_val = Float("Value")
+            yield {
+                "Quotas": [
+                    {"QuotaName": name, "Value": q_val.create(None, None)}
+                    for name in [
+                        "Running On-Demand F instances",
+                        "Running On-Demand G instances",
+                        "Running On-Demand P instances",
+                        "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances",
+                        "Running On-Demand X instances",
+                    ]
                 ]
-            ]
-        }
+            }
+        elif ServiceCode == "ecs":
+            yield {
+                "Quotas": [
+                    {
+                        "ServiceCode": "ecs",
+                        "ServiceName": "Amazon Elastic Container Service (Amazon ECs)",
+                        "QuotaArn": "arn:aws:servicequotas:us-east-1:710145618630:ecs/L-85EED4F7",
+                        "QuotaCode": "L-85EED4F7",
+                        "QuotaName": "Container instances per cluster",
+                        "Value": 20,
+                        "Unit": "None",
+                        "Adjustable": True,
+                        "GlobalQuota": False,
+                    }
+                ],
+                "ResponseMetadata": {
+                    "RequestId": "3158f3b7-9788-4394-8d8c-ede95a113476",
+                    "HTTPStatusCode": 200,
+                    "HTTPHeaders": {
+                        "date": "Thu, 20 Oct 2022 08:10:44 GMT",
+                        "content-type": "application/x-amz-json-1.1",
+                        "content-length": "13",
+                        "connection": "keep-alive",
+                        "x-amzn-requestid": "3158f3b7-9788-4394-8d8c-ede95a113476",
+                    },
+                    "RetryAttempts": 0,
+                },
+            }
+        elif ServiceCode == "elasticache":
+            yield {
+                "Quotas": [
+                    {
+                        "ServiceCode": "elasticache",
+                        "ServiceName": "Amazon ElastiCache",
+                        "QuotaArn": "arn:aws:servicequotas:us-east-1:710145618630:elasticache/L-85EED4F7",
+                        "QuotaCode": "L-85EED4F7",
+                        "QuotaName": "Nodes per cluster per instance type (Redis cluster mode enabled)",
+                        "Value": 5,
+                        "Unit": "None",
+                        "Adjustable": True,
+                        "GlobalQuota": False,
+                    }
+                ],
+                "ResponseMetadata": {
+                    "RequestId": "3158f3b7-9788-4394-8d8c-ede95a113476",
+                    "HTTPStatusCode": 200,
+                    "HTTPHeaders": {
+                        "date": "Thu, 20 Oct 2022 08:10:44 GMT",
+                        "content-type": "application/x-amz-json-1.1",
+                        "content-length": "13",
+                        "connection": "keep-alive",
+                        "x-amzn-requestid": "3158f3b7-9788-4394-8d8c-ede95a113476",
+                    },
+                    "RetryAttempts": 0,
+                },
+            }
+
+
+class FakeServiceQuotasClient:
+    def get_paginator(self, function: str) -> QuotaPaginator:
+        assert function == "list_service_quotas"
+
+        return QuotaPaginator()
 
 
 #   .--Lambda----------------------------------

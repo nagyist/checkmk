@@ -7,17 +7,18 @@
 import time
 from collections.abc import Collection
 
-import cmk.utils.store as store
+from cmk.ccc import store
 
-import cmk.gui.userdb as userdb
+from cmk.gui import userdb
 from cmk.gui.breadcrumb import Breadcrumb
 from cmk.gui.config import active_config
 from cmk.gui.htmllib.html import html
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
 from cmk.gui.page_menu import make_simple_form_page_menu, PageMenu
-from cmk.gui.plugins.wato.utils import flash, mode_registry, mode_url, redirect, WatoMode
 from cmk.gui.type_defs import ActionResult, PermissionName
+from cmk.gui.utils.csrf_token import check_csrf_token
+from cmk.gui.utils.flashed_messages import flash
 from cmk.gui.valuespec import (
     AbsoluteDate,
     Alternative,
@@ -27,10 +28,14 @@ from cmk.gui.valuespec import (
     TextAreaUnicode,
     Tuple,
 )
+from cmk.gui.watolib.mode import mode_url, ModeRegistry, redirect, WatoMode
 from cmk.gui.watolib.utils import multisite_dir
 
 
-@mode_registry.register
+def register(mode_registry: ModeRegistry) -> None:
+    mode_registry.register(ModeManageReadOnly)
+
+
 class ModeManageReadOnly(WatoMode):
     @classmethod
     def name(cls) -> str:
@@ -53,6 +58,8 @@ class ModeManageReadOnly(WatoMode):
         )
 
     def action(self) -> ActionResult:
+        check_csrf_token()
+
         settings = self._vs().from_html_vars("_read_only")
         self._vs().validate_value(settings, "_read_only")
         self._settings = settings
@@ -77,10 +84,9 @@ class ModeManageReadOnly(WatoMode):
                 "read only can disable it again when another permitted user enabled it before."
             )
         )
-        html.begin_form("read_only", method="POST")
-        self._vs().render_input("_read_only", self._settings)
-        html.hidden_fields()
-        html.end_form()
+        with html.form_context("read_only", method="POST"):
+            self._vs().render_input("_read_only", self._settings)
+            html.hidden_fields()
 
     def _vs(self):
         return Dictionary(

@@ -56,6 +56,7 @@ data_source_cache_dir = _omd_path_str("tmp/check_mk/data_source_cache")
 snmp_scan_cache_dir = _omd_path_str("tmp/check_mk/snmp_scan_cache")
 include_cache_dir = _omd_path_str("tmp/check_mk/check_includes")
 tmp_dir = _omd_path("tmp/check_mk")
+tmp_run_dir = _omd_path("tmp/run")
 logwatch_dir = _omd_path_str("var/check_mk/logwatch")
 nagios_objects_file = _omd_path_str("etc/nagios/conf.d/check_mk_objects.cfg")
 nagios_command_pipe_path = _omd_path_str("tmp/run/nagios.cmd")
@@ -74,17 +75,20 @@ inventory_archive_dir = _omd_path_str("var/check_mk/inventory_archive")
 inventory_delta_cache_dir = _omd_path_str("var/check_mk/inventory_delta_cache")
 autoinventory_dir = _omd_path_str("var/check_mk/autoinventory")
 status_data_dir = _omd_path_str("tmp/check_mk/status_data")
-robotmk_html_log_dir = _omd_path_str("var/robotmk")
 base_discovered_host_labels_dir = _omd_path("var/check_mk/discovered_host_labels")
 discovered_host_labels_dir = base_discovered_host_labels_dir
-autodiscovery_dir = _omd_path_str("var/check_mk/autodiscovery")
-piggyback_dir = Path(tmp_dir, "piggyback")
-piggyback_source_dir = Path(tmp_dir, "piggyback_sources")
+autodiscovery_dir = _omd_path("var/check_mk/autodiscovery")
 profile_dir = Path(var_dir, "web")
 crash_dir = Path(var_dir, "crashes")
 diagnostics_dir = Path(var_dir, "diagnostics")
 site_config_dir = Path(var_dir, "site_configs")
 visuals_cache_dir = Path(tmp_dir, "visuals_cache")
+predictions_dir = Path(var_dir, "prediction")
+ec_main_config_file = Path(default_config_dir, "mkeventd.mk")
+ec_config_dir = Path(default_config_dir, "mkeventd.d")
+diskspace_config_dir = Path(default_config_dir, "diskspace.d/wato/")
+
+configuration_lockfile = Path(default_config_dir, "multisite.mk")
 
 # persisted secret files
 # avoid using these paths directly; use wrappers in cmk.util.crypto.secrets instead
@@ -93,13 +97,15 @@ visuals_cache_dir = Path(tmp_dir, "visuals_cache")
 auth_secret_file = omd_root / "etc/auth.secret"
 # the path for password_store.secret is also duplicated in omd cmk_password_store.h!
 password_store_secret_file = omd_root / "etc/password_store.secret"
+site_internal_secret_file = omd_root / "etc/site_internal.secret"
 
 share_dir = _omd_path_str("share/check_mk")
 checks_dir = _omd_path_str("share/check_mk/checks")
 notifications_dir = _omd_path("share/check_mk/notifications")
 inventory_dir = _omd_path_str("share/check_mk/inventory")
-check_manpages_dir = _omd_path_str("share/check_mk/checkman")
+legacy_check_manpages_dir = _omd_path_str("share/check_mk/checkman")
 agents_dir = _omd_path_str("share/check_mk/agents")
+special_agents_dir = _omd_path("share/check_mk/agents/special")
 web_dir = _omd_path_str("share/check_mk/web")
 pnp_templates_dir = _omd_path("share/check_mk/pnp-templates")
 doc_dir = _omd_path("share/doc/check_mk")
@@ -117,6 +123,7 @@ _base_plugins_dir = Path(lib_dir, "check_mk", "base", "plugins")
 agent_based_plugins_dir = _base_plugins_dir / "agent_based"
 
 gui_plugins_dir = Path(lib_dir, "check_mk", "gui", "plugins")
+nagios_plugins_dir = Path(lib_dir, "nagios", "plugins")
 
 local_root = _local_path(omd_root)
 local_share_dir = _local_path(share_dir)
@@ -124,14 +131,16 @@ local_checks_dir = _local_path(checks_dir)
 local_agent_based_plugins_dir = _local_path(agent_based_plugins_dir)
 local_notifications_dir = _local_path(notifications_dir)
 local_inventory_dir = _local_path(inventory_dir)
-local_check_manpages_dir = _local_path(check_manpages_dir)
+local_legacy_check_manpages_dir = _local_path(legacy_check_manpages_dir)
 local_agents_dir = _local_path(agents_dir)
+local_special_agents_dir = _local_path(special_agents_dir)
 local_web_dir = _local_path(web_dir)
 local_pnp_templates_dir = _local_path(pnp_templates_dir)
 local_doc_dir = _local_path(doc_dir)
 local_locale_dir = _local_path(locale_dir)
 local_bin_dir = _local_path(bin_dir)
 local_lib_dir = _local_path(lib_dir)
+local_nagios_plugins_dir = _local_path(nagios_plugins_dir)
 local_mib_dir = _local_path(mib_dir)
 local_alert_handlers_dir = _local_path(alert_handlers_dir)
 local_optional_packages_dir = _omd_path("var/check_mk/packages_local")
@@ -163,3 +172,6 @@ def make_experimental_config_file() -> Path:
     config_storage_format = "raw"
     """
     return Path(default_config_dir) / "experimental.mk"
+
+
+cse_config_dir = Path("/etc/cse")

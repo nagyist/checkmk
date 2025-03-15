@@ -10,7 +10,7 @@ import sys
 from email.mime.text import MIMEText
 from typing import NoReturn
 
-from cmk.utils.mail import default_from_address, send_mail_sendmail, set_mail_headers
+from cmk.utils.mail import default_from_address, MailString, send_mail_sendmail, set_mail_headers
 
 from cmk.notification_plugins import utils
 
@@ -43,7 +43,7 @@ Handler output: $ALERTHANDLEROUTPUT$
 tmpl_alerthandler_service_body = "Service:  $SERVICEDESC$\n" + tmpl_alerthandler_host_body
 
 
-def construct_content(context: dict[str, str]) -> str:  # pylint: disable=too-many-branches
+def construct_content(context: dict[str, str]) -> str:
     # Create a notification summary in a new context variable
     # Note: This code could maybe move to cmk --notify in order to
     # make it available every in all notification scripts
@@ -126,30 +126,27 @@ def construct_content(context: dict[str, str]) -> str:  # pylint: disable=too-ma
 
 def main() -> NoReturn:
     if bulk_mode:
-        content_txt = ""
         parameters, contexts = utils.read_bulk_contexts()
-        hosts = set()
-        mailto = ""
-        subject = ""
-        for context in contexts:
-            context.update(parameters)
-            content_txt += construct_content(context)
-            mailto = context["CONTACTEMAIL"]  # Assume the same in each context
-            subject = context["SUBJECT"]
-            hosts.add(context["HOSTNAME"])
+        content_txt = "".join(construct_content(context) for context in contexts)
+        hosts = {context["HOSTNAME"] for context in contexts}
+
+        # Take last context as all contexts share the same key/value pairs needed for sending mail.
+        context = contexts.pop()
+        context.update(parameters)
 
         # Use the single context subject in case there is only one context in the bulk
-        if len(contexts) > 1:
+        if len(hosts) > 1:
             subject = utils.get_bulk_notification_subject(contexts, hosts)
+        else:
+            subject = context["SUBJECT"]
 
     else:
         # gather all options from env
         context = utils.collect_context()
         content_txt = construct_content(context)
-        mailto = context["CONTACTEMAIL"]
         subject = context["SUBJECT"]
 
-    if not mailto:  # e.g. empty field in user database
+    if not (mailto := context["CONTACTEMAIL"]):  # e.g. empty field in user database
         sys.stdout.write("Cannot send ASCII email: empty destination email address\n")
         sys.exit(2)
 
@@ -163,10 +160,14 @@ def main() -> NoReturn:
         context.get("PARAMETER_REPLY_TO_ADDRESS", ""),
     )
     m = set_mail_headers(
-        mailto, subject, from_address, reply_to, MIMEText(content_txt, "plain", _charset="utf-8")
+        MailString(mailto),
+        MailString(subject),
+        MailString(from_address),
+        MailString(reply_to),
+        MIMEText(content_txt, "plain", _charset="utf-8"),
     )
     try:
-        send_mail_sendmail(m, mailto, from_address)
+        send_mail_sendmail(m, MailString(mailto), MailString(from_address))
         sys.stdout.write("Spooled mail to local mail transmission agent\n")
         sys.exit(0)
     except Exception as e:

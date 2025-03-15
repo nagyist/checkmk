@@ -3,25 +3,36 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+import json
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, NamedTuple, TypeVar
 
 from livestatus import SiteId
 
+import cmk.ccc.version as cmk_version
+
 from cmk.utils.diagnostics import DiagnosticsCLParameters
-from cmk.utils.exceptions import MKGeneralException
-from cmk.utils.type_defs import HostName, ServiceName
+from cmk.utils.hostaddress import HostName
+from cmk.utils.labels import HostLabel, Labels
+from cmk.utils.rulesets.ruleset_matcher import RuleSpec
+from cmk.utils.servicename import Item, ServiceName
+
+from cmk.events.event_context import EventContext
 
 from cmk.automations import results
-from cmk.automations.results import DiscoveredHostLabelsDict, SetAutochecksTable
+from cmk.automations.results import SetAutochecksInput
 
+from cmk.checkengine.checking import CheckPluginName
+
+from cmk.gui.config import active_config
+from cmk.gui.hooks import request_memoize
 from cmk.gui.i18n import _
 from cmk.gui.site_config import site_is_local
 from cmk.gui.watolib.activate_changes import sync_changes_before_remote_automation
 from cmk.gui.watolib.automations import (
     check_mk_local_automation_serialized,
     check_mk_remote_automation_serialized,
-    local_automation_failure,
+    get_local_automation_failure_message,
     MKAutomationException,
 )
 
@@ -43,17 +54,19 @@ def _automation_serialized(
     timeout: int | None = None,
     sync: bool = True,
     non_blocking_http: bool = False,
+    force_cli_interface: bool = False,
 ) -> AutomationResponse:
     if args is None:
         args = []
 
-    if not siteid or site_is_local(siteid):
+    if not siteid or site_is_local(active_config, siteid):
         cmdline, serialized_result = check_mk_local_automation_serialized(
             command=command,
             args=args,
             indata=indata,
             stdin_data=stdin_data,
             timeout=timeout,
+            force_cli_interface=force_cli_interface,
         )
         return AutomationResponse(
             command=command,
@@ -82,14 +95,15 @@ def _automation_serialized(
 def _automation_failure(
     response: AutomationResponse,
     exception: SyntaxError,
-) -> MKGeneralException:
+) -> MKAutomationException:
     if response.local:
-        return local_automation_failure(
+        msg = get_local_automation_failure_message(
             command=response.command,
             cmdline=response.cmdline,
             out=response.serialized_result,
             exc=exception,
         )
+        return MKAutomationException(msg)
     return MKAutomationException(
         "%s: <pre>%s</pre>"
         % (
@@ -115,8 +129,28 @@ def _deserialize(
         )
 
 
+def local_discovery(
+    mode: str,
+    host_names: Iterable[HostName],
+    *,
+    scan: bool,
+    raise_errors: bool,
+    timeout: int | None = None,
+    non_blocking_http: bool = False,
+) -> results.ServiceDiscoveryResult:
+    return discovery(
+        None,
+        mode,
+        host_names,
+        scan=scan,
+        raise_errors=raise_errors,
+        timeout=timeout,
+        non_blocking_http=non_blocking_http,
+    )
+
+
 def discovery(
-    site_id: SiteId,
+    site_id: SiteId | None,
     mode: str,
     host_names: Iterable[HostName],
     *,
@@ -142,8 +176,28 @@ def discovery(
     )
 
 
-def discovery_preview(
+def special_agent_discovery_preview(
     site_id: SiteId,
+    special_agent_preview_input: results.DiagSpecialAgentInput,
+) -> results.SpecialAgentDiscoveryPreviewResult:
+    return _deserialize(
+        _automation_serialized(
+            "special-agent-discovery-preview",
+            siteid=site_id,
+            args=None,
+            stdin_data=special_agent_preview_input.serialize(
+                cmk_version.Version.from_str(cmk_version.__version__)
+            ),
+            force_cli_interface=True,
+            # the special agent discovery preview can take a long time depending on the underlying
+            # datasource agent which can be problematic for remote setups
+            timeout=5 * 60,
+        ),
+        results.SpecialAgentDiscoveryPreviewResult,
+    )
+
+
+def local_discovery_preview(
     host_name: HostName,
     *,
     prevent_fetching: bool,
@@ -152,7 +206,7 @@ def discovery_preview(
     return _deserialize(
         _automation_serialized(
             "service-discovery-preview",
-            siteid=site_id,
+            siteid=None,
             args=[
                 *(("@nofetch",) if prevent_fetching else ()),
                 *(("@raiseerrors",) if raise_errors else ()),
@@ -163,33 +217,39 @@ def discovery_preview(
     )
 
 
-def set_autochecks(
+def autodiscovery(site_id: SiteId) -> results.AutodiscoveryResult:
+    return _deserialize(
+        _automation_serialized("autodiscovery", siteid=site_id),
+        results.AutodiscoveryResult,
+    )
+
+
+def set_autochecks_v2(
     site_id: SiteId,
-    host_name: HostName,
-    checks: SetAutochecksTable,
-) -> results.SetAutochecksResult:
+    checks: SetAutochecksInput,
+) -> results.SetAutochecksV2Result:
     return _deserialize(
         _automation_serialized(
-            "set-autochecks",
+            "set-autochecks-v2",
             siteid=site_id,
-            args=[host_name],
-            indata=checks,
+            args=None,
+            stdin_data=checks.serialize(),
         ),
-        results.SetAutochecksResult,
+        results.SetAutochecksV2Result,
     )
 
 
 def update_host_labels(
     site_id: SiteId,
     host_name: HostName,
-    host_labels: DiscoveredHostLabelsDict,
+    host_labels: Sequence[HostLabel],
 ) -> results.UpdateHostLabelsResult:
     return _deserialize(
         _automation_serialized(
             "update-host-labels",
             siteid=site_id,
             args=[host_name],
-            indata=host_labels,
+            indata={label.name: label.to_dict() for label in host_labels},
         ),
         results.UpdateHostLabelsResult,
     )
@@ -225,6 +285,17 @@ def get_services_labels(
     )
 
 
+def get_service_name(
+    host_name: HostName, check_plugin_name: CheckPluginName, item: Item
+) -> results.GetServiceNameResult:
+    return _deserialize(
+        _automation_serialized(
+            "get-service-name", args=[host_name, str(check_plugin_name), repr(item)]
+        ),
+        results.GetServiceNameResult,
+    )
+
+
 def analyse_service(
     site_id: SiteId,
     host_name: HostName,
@@ -254,6 +325,31 @@ def analyse_host(
     )
 
 
+def analyze_host_rule_matches(
+    host_name: HostName, rules: Sequence[Sequence[RuleSpec]]
+) -> results.AnalyzeHostRuleMatchesResult:
+    return _deserialize(
+        _automation_serialized("analyze-host-rule-matches", args=[host_name], indata=rules),
+        results.AnalyzeHostRuleMatchesResult,
+    )
+
+
+def analyze_service_rule_matches(
+    host_name: HostName,
+    service_or_item: str,
+    service_labels: Labels,
+    rules: Sequence[Sequence[RuleSpec]],
+) -> results.AnalyzeServiceRuleMatchesResult:
+    return _deserialize(
+        _automation_serialized(
+            "analyze-service-rule-matches",
+            args=[host_name, service_or_item],
+            indata=(rules, service_labels),
+        ),
+        results.AnalyzeServiceRuleMatchesResult,
+    )
+
+
 def delete_hosts(
     site_id: SiteId,
     host_names: Sequence[HostName],
@@ -268,14 +364,14 @@ def delete_hosts(
     )
 
 
-def restart(hosts_to_update: list[HostName] | None = None) -> results.RestartResult:
+def restart(hosts_to_update: Sequence[HostName] | None = None) -> results.RestartResult:
     return _deserialize(
         _automation_serialized("restart", args=hosts_to_update),
         results.RestartResult,
     )
 
 
-def reload(hosts_to_update: list[HostName] | None = None) -> results.ReloadResult:
+def reload(hosts_to_update: Sequence[HostName] | None = None) -> results.ReloadResult:
     return _deserialize(
         _automation_serialized("reload", args=hosts_to_update),
         results.ReloadResult,
@@ -287,8 +383,20 @@ def get_configuration(*config_var_names: str) -> results.GetConfigurationResult:
         _automation_serialized(
             "get-configuration",
             indata=list(config_var_names),
+            # We must not call this through the automation helper,
+            # see automation call execution.
+            force_cli_interface=True,
         ),
         results.GetConfigurationResult,
+    )
+
+
+def update_merged_password_file() -> results.UpdatePasswordsMergedFileResult:
+    return _deserialize(
+        _automation_serialized(
+            "update-passwords-merged-file",
+        ),
+        results.UpdatePasswordsMergedFileResult,
     )
 
 
@@ -297,6 +405,12 @@ def get_check_information() -> results.GetCheckInformationResult:
         _automation_serialized("get-check-information"),
         results.GetCheckInformationResult,
     )
+
+
+@request_memoize()
+def get_check_information_cached() -> Mapping[CheckPluginName, Mapping[str, str]]:
+    raw_check_dict = get_check_information().plugin_infos
+    return {CheckPluginName(name): info for name, info in sorted(raw_check_dict.items())}
 
 
 def get_section_information() -> results.GetSectionInformationResult:
@@ -318,6 +432,23 @@ def scan_parents(
             args=[*params, host_name],
         ),
         results.ScanParentsResult,
+    )
+
+
+def diag_special_agent(
+    site_id: SiteId,
+    diag_special_agent_input: results.DiagSpecialAgentInput,
+) -> results.DiagSpecialAgentResult:
+    return _deserialize(
+        _automation_serialized(
+            "diag-special-agent",
+            siteid=site_id,
+            args=None,
+            stdin_data=diag_special_agent_input.serialize(
+                cmk_version.Version.from_str(cmk_version.__version__)
+            ),
+        ),
+        results.DiagSpecialAgentResult,
     )
 
 
@@ -399,6 +530,16 @@ def notification_analyse(notification_number: int) -> results.NotificationAnalys
     )
 
 
+def notification_test(raw_context: EventContext, dispatch: str) -> results.NotificationTestResult:
+    return _deserialize(
+        _automation_serialized(
+            "notification-test",
+            args=[json.dumps(raw_context), dispatch],
+        ),
+        results.NotificationTestResult,
+    )
+
+
 def notification_get_bulks(only_ripe: bool) -> results.NotificationGetBulksResult:
     return _deserialize(
         _automation_serialized(
@@ -426,11 +567,15 @@ def create_diagnostics_dump(
     )
 
 
-def bake_agents(indata: Mapping[str, Any] | None = None) -> results.BakeAgentsResult:
+def bake_agents(
+    indata: Mapping[str, Any] | None = None,
+    force_automation_cli_interface: bool = False,
+) -> results.BakeAgentsResult:
     return _deserialize(
         _automation_serialized(
             "bake-agents",
             indata="" if indata is None else indata,
+            force_cli_interface=force_automation_cli_interface,
         ),
         results.BakeAgentsResult,
     )

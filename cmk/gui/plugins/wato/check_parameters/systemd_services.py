@@ -2,6 +2,9 @@
 # Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
+from collections.abc import Container
+from typing import Literal
+
 from cmk.gui.i18n import _
 from cmk.gui.plugins.wato.utils import (
     CheckParameterRulespecWithItem,
@@ -12,11 +15,14 @@ from cmk.gui.plugins.wato.utils import (
 )
 from cmk.gui.valuespec import (
     Dictionary,
+    Filesize,
     ListChoice,
     ListOf,
     MonitoringState,
     TextInput,
     TextOrRegExp,
+    TimeSpan,
+    Tuple,
 )
 
 
@@ -214,6 +220,12 @@ rulespec_registry.register(
     )
 )
 
+MIN_SEC_MS: Container[Literal["minutes", "seconds", "milliseconds"]] = [
+    "minutes",
+    "seconds",
+    "milliseconds",
+]
+
 
 def _parameter_valuespec_systemd_units() -> Dictionary:
     return Dictionary(
@@ -261,6 +273,55 @@ def _parameter_valuespec_systemd_units() -> Dictionary:
                     default_value=2,
                 ),
             ),
+            # TODO: add these to the plugins default parameters upon migration to the ruleset API!
+            (
+                "memory",
+                Tuple(
+                    title=_("Memory upper levels"),
+                    help=_("Define the upper levels for memory usage."),
+                    elements=[
+                        Filesize(title=_("Warning at")),
+                        Filesize(title=_("Critical at")),
+                    ],
+                ),
+            ),
+            (
+                "cpu_time",
+                Tuple(
+                    title=_("CPU time upper levels"),
+                    help=_("Define the upper levels for the consumed CPU time."),
+                    elements=[
+                        TimeSpan(title=_("Warning at"), display=MIN_SEC_MS),
+                        TimeSpan(title=_("Critical at"), display=MIN_SEC_MS),
+                    ],
+                ),
+            ),
+            (
+                "active_since_lower",
+                Tuple(
+                    title=_("Lower levels for the time the service is active"),
+                    help=_(
+                        "Define the lower levels for the time, the systemd service is active since."
+                    ),
+                    elements=[
+                        TimeSpan(title=_("Warning at"), display=MIN_SEC_MS),
+                        TimeSpan(title=_("Critical at"), display=MIN_SEC_MS),
+                    ],
+                ),
+            ),
+            (
+                "active_since_upper",
+                Tuple(
+                    title=_("Upper levels for the time the service is active"),
+                    help=_(
+                        "Define the upper levels for the time, the systemd service is active since."
+                    ),
+                    elements=[
+                        TimeSpan(title=_("Warning at"), display=MIN_SEC_MS),
+                        TimeSpan(title=_("Critical at"), display=MIN_SEC_MS),
+                    ],
+                ),
+            ),
         ],
         help=_(
             "This ruleset only applies when individual Systemd units are discovered. "
@@ -273,7 +334,7 @@ rulespec_registry.register(
     CheckParameterRulespecWithItem(
         check_group_name="systemd_units_services",
         group=RulespecGroupCheckParametersApplications,
-        item_spec=lambda: TextInput(title=_("Name of the service")),
+        item_spec=lambda: TextInput(title=_("Name of the service"), allow_empty=False),
         match_type="dict",
         parameter_valuespec=_parameter_valuespec_systemd_units,
         title=lambda: _("Systemd single service"),
@@ -283,7 +344,7 @@ rulespec_registry.register(
     CheckParameterRulespecWithItem(
         check_group_name="systemd_units_sockets",
         group=RulespecGroupCheckParametersApplications,
-        item_spec=lambda: TextInput(title=_("Name of the socket")),
+        item_spec=lambda: TextInput(title=_("Name of the socket"), allow_empty=False),
         match_type="dict",
         parameter_valuespec=_parameter_valuespec_systemd_units,
         title=lambda: _("Systemd single socket"),

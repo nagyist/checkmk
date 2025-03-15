@@ -1,23 +1,14 @@
 #!/bin/bash
 set -e
 
-SITE="${SITE:-$(until [ "$PWD" == / ]; do if [ -e .site ]; then
+SITE=${SITE:-$(until [ "$PWD" == / ]; do if [ -e .site ]; then
     cat .site
     break
-else cd ..; fi; done)}"
-SITE="${SITE:-$(omd sites --bare | head -n 1)}"
-ROOT="/omd/sites/${SITE}"
+else cd ..; fi; done)}
+SITE=${SITE:-$(omd sites --bare | head -n 1)}
 
-echo "Updating compiled protobuf files..."
-make -C ../.. protobuf-files
-sudo rsync -rlpgoD --delete-after ../../enterprise/cmc_proto "$ROOT/lib/python3/"
+(cd .. && bash .f12)
 
-echo "TARGET: $ROOT/share/check_mk/checks"
-# NOTE: The -a flag is equivalent to -rlptgoD, but we do *not* want -t, as it
-# would screw up our include caching mechanism!
-sudo rsync -rlpgoD --delete-after ../../checks/ "$ROOT/share/check_mk/checks/"
-
-(
-    cd ..
-    bash .f12
-)
+if [ -z "$ONLY_COPY" ]; then
+    sudo --login -u "$SITE" -- bash -c "omd restart automation-helper"
+fi

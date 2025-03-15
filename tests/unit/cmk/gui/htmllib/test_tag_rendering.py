@@ -6,11 +6,13 @@
 import pytest
 
 from cmk.gui.htmllib.tag_rendering import (
+    HTMLTagName,
     normalize_css_spec,
     render_element,
     render_end_tag,
     render_start_tag,
 )
+from cmk.gui.type_defs import CSSSpec
 from cmk.gui.utils.html import HTML
 
 
@@ -40,10 +42,15 @@ def test_render_start_tag_keep_empty_values() -> None:
     assert str(tag) == "<div name=''>"
 
 
-@pytest.mark.parametrize("value", [["1", "2"], "1 2", ["1", None, "2"]])
 @pytest.mark.parametrize("key", ["class_", "css", "cssclass", "class"])
-def test_render_start_tag_class_variants(key, value) -> None:  # type: ignore[no-untyped-def]
-    tag = render_start_tag("div", **{key: value})
+def test_render_start_tag_class_variants(key: HTMLTagName) -> None:
+    tag = render_start_tag("div", close_tag=False, **{key: ["1", "2"]})
+    assert str(tag) == '<div class="1 2">'
+
+    tag = render_start_tag("div", close_tag=False, **{key: "1 2"})
+    assert str(tag) == '<div class="1 2">'
+
+    tag = render_start_tag("div", close_tag=False, **{key: ["1", None, "2"]})  # type: ignore[arg-type]
     assert str(tag) == '<div class="1 2">'
 
 
@@ -107,11 +114,11 @@ def test_render_element_escape_content() -> None:
 
 
 def test_render_element_do_not_escape_html() -> None:
-    tag = render_element("a", HTML("b<script>alert(1)</script>la"), href="ding")
+    tag = render_element("a", HTML.without_escaping("b<script>alert(1)</script>la"), href="ding")
     assert isinstance(tag, HTML)
     assert str(tag) == '<a href="ding">b<script>alert(1)</script>la</a>'
 
 
 @pytest.mark.parametrize("value", [["1"], "1", ["1", None]])
-def test_normalize_css_spec_skip_nones(value) -> None:  # type: ignore[no-untyped-def]
+def test_normalize_css_spec_skip_nones(value: CSSSpec) -> None:
     assert normalize_css_spec(value) == ["1"]

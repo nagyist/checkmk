@@ -16,14 +16,13 @@
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
-#include <variant>  // IWYU pragma: keep
 
-#include "livestatus/Column.h"
 #include "livestatus/ColumnFilter.h"
 #include "livestatus/DoubleColumn.h"
 #include "livestatus/EventConsoleConnection.h"
 #include "livestatus/Filter.h"
-#include "livestatus/MonitoringCore.h"
+#include "livestatus/ICore.h"
+#include "livestatus/Interface.h"
 #include "livestatus/Query.h"
 #include "livestatus/Row.h"
 #include "livestatus/StringColumn.h"
@@ -32,10 +31,13 @@
 #include "livestatus/User.h"
 #include "livestatus/opids.h"
 
+using row_type = ECRow;
+
 using namespace std::chrono_literals;
 
 namespace {
 // NOTE: Keep this in sync with EC code. Ugly...
+// NOLINTNEXTLINE(cert-err58-cpp)
 const std::vector<std::string> grepping_filters = {
     "event_id",        "event_text",        "event_comment", "event_host",
     "event_contact",   "event_application", "event_rule_id", "event_owner",
@@ -45,13 +47,13 @@ const std::vector<std::string> grepping_filters = {
 
 class ECTableConnection : public EventConsoleConnection {
 public:
-    ECTableConnection(MonitoringCore *mc, const Table &table, Query &query,
-                      std::function<bool(const ECRow &)> is_authorized)
-        : EventConsoleConnection(mc->loggerLivestatus(),
-                                 mc->paths()->event_console_status_socket())
-        , mc_{mc}
-        , table_{table}
-        , query_{query}
+    ECTableConnection(const ICore &mc, const Table &table, Query &query,
+                      std::function<bool(const row_type &)> is_authorized)
+        : EventConsoleConnection{mc.loggerLivestatus(),
+                                 mc.paths()->event_console_status_socket()}
+        , mc_{&mc}
+        , table_{&table}
+        , query_{&query}
         , is_authorized_{std::move(is_authorized)} {}
 
 private:
@@ -62,12 +64,12 @@ private:
         emitColumnsHeader(os);
         emitTimeRangeFilter(os);
         emitGreppingFilter(os);
-        os << std::endl;
+        os << "\n";
     }
 
     void emitGET(std::ostream &os) const {
         // skip "eventconsole" prefix :-P
-        os << "GET " << table_.name().substr(12);
+        os << "GET " << table_->name().substr(12);
     }
 
     static void emitOutputFormat(std::ostream &os) {
@@ -77,7 +79,7 @@ private:
     void emitColumnsHeader(std::ostream &os) {
         os << "\nColumns:";
         // Initially we consider all columns used in the query...
-        auto all = query_.allColumns();
+        auto column_names = query_->allColumnNames();
         // ... then we add some special columns which we might need irrespective
         // of the actual query...
         static std::unordered_set<std::string> special_columns{
@@ -87,26 +89,26 @@ private:
             "event_contact_groups_precedence",
             // see  isAuthorizedForEventViaContactGroups
             "event_contact_groups"};
-        table_.any_column([&](const auto &col) {
-            if (special_columns.find(col->name()) != special_columns.end()) {
-                all.insert(col);
+        table_->any_column([&](const auto &col) {
+            if (special_columns.contains(col->name())) {
+                column_names.insert(col->name());
             }
             return false;
         });
         // .. and then we ignore all host-related columns, they are implicitly
         // joined later via ECRow._host later.
-        for (const auto &c : all) {
-            if (!mk::starts_with(c->name(), "host_")) {
-                os << " " << c->name();
+        for (const auto &name : column_names) {
+            if (!name.starts_with("host_")) {
+                os << " " << name;
             }
         }
     }
 
     void emitTimeRangeFilter(std::ostream &os) {
-        if (auto glb = query_.greatestLowerBoundFor("history_time")) {
+        if (auto glb = query_->greatestLowerBoundFor("history_time")) {
             os << "\nFilter: history_time >= " << *glb;
         }
-        if (auto lub = query_.leastUpperBoundFor("history_time")) {
+        if (auto lub = query_->leastUpperBoundFor("history_time")) {
             os << "\nFilter: history_time <= " << *lub;
         }
     }
@@ -115,7 +117,7 @@ private:
         for (const auto &column_name : grepping_filters) {
             auto conjuncts =
                 query_
-                    .partialFilter(
+                    ->partialFilter(
                         column_name,
                         [&column_name](const std::string &columnName) {
                             return column_name == columnName;
@@ -146,11 +148,11 @@ private:
                     }
                 }
             }
-            if (auto svr = query_.stringValueRestrictionFor(column_name)) {
+            if (auto svr = query_->stringValueRestrictionFor(column_name)) {
                 os << "\nFilter: " << column_name << " = " << *svr;
             } else {
-                auto glb = query_.greatestLowerBoundFor(column_name);
-                auto lub = query_.leastUpperBoundFor(column_name);
+                auto glb = query_->greatestLowerBoundFor(column_name);
+                auto lub = query_->leastUpperBoundFor(column_name);
                 if (glb && lub && glb == lub) {
                     os << "\nFilter: " << column_name << " = " << *glb;
                 }
@@ -164,7 +166,7 @@ private:
     void receiveReply(std::istream &is) override {
         bool is_header = true;
         std::vector<std::string> headers;
-        do {
+        while (true) {
             std::string line;
             std::getline(is, line);
             if (!is || line.empty()) {
@@ -175,22 +177,22 @@ private:
                 headers = std::move(columns);
                 is_header = false;
             } else {
-                ECRow row{mc_, headers, columns};
-                if (is_authorized_(row) && !query_.processDataset(Row{&row})) {
+                row_type row{mc_, headers, columns};
+                if (is_authorized_(row) && !query_->processDataset(Row{&row})) {
                     return;
                 }
             }
-        } while (true);
+        }
     }
 
-    MonitoringCore *mc_;
-    const Table &table_;
-    Query &query_;
-    const std::function<bool(const ECRow &)> is_authorized_;
+    const ICore *mc_;
+    const Table *table_;
+    Query *query_;
+    std::function<bool(const row_type &)> is_authorized_;
 };
 }  // namespace
 
-ECRow::ECRow(MonitoringCore *mc, const std::vector<std::string> &headers,
+ECRow::ECRow(const ICore *mc, const std::vector<std::string> &headers,
              const std::vector<std::string> &columns) {
     auto column_it = columns.cbegin();
     for (const auto &header : headers) {
@@ -203,50 +205,50 @@ ECRow::ECRow(MonitoringCore *mc, const std::vector<std::string> &headers,
 }
 
 // static
-std::unique_ptr<StringColumn<ECRow>> ECRow::makeStringColumn(
+std::unique_ptr<StringColumn<row_type>> ECRow::makeStringColumn(
     const std::string &name, const std::string &description,
     const ColumnOffsets &offsets) {
-    return std::make_unique<StringColumn<ECRow>>(
+    return std::make_unique<StringColumn<row_type>>(
         name, description, offsets,
-        [name](const ECRow &r) { return r.getString(name); });
+        [name](const row_type &row) { return row.getString(name); });
 }
 
 // static
-std::unique_ptr<IntColumn<ECRow>> ECRow::makeIntColumn(
+std::unique_ptr<IntColumn<row_type>> ECRow::makeIntColumn(
     const std::string &name, const std::string &description,
     const ColumnOffsets &offsets) {
-    return std::make_unique<IntColumn<ECRow>>(
+    return std::make_unique<IntColumn<row_type>>(
         name, description, offsets,
-        [name](const ECRow &r) { return r.getInt(name); });
+        [name](const row_type &row) { return row.getInt(name); });
 }
 
 // static
-std::unique_ptr<DoubleColumn<ECRow>> ECRow::makeDoubleColumn(
+std::unique_ptr<DoubleColumn<row_type>> ECRow::makeDoubleColumn(
     const std::string &name, const std::string &description,
     const ColumnOffsets &offsets) {
-    return std::make_unique<DoubleColumn<ECRow>>(
+    return std::make_unique<DoubleColumn<row_type>>(
         name, description, offsets,
-        [name](const ECRow &r) { return r.getDouble(name); });
+        [name](const row_type &row) { return row.getDouble(name); });
 }
 
 // static
-std::unique_ptr<TimeColumn<ECRow>> ECRow::makeTimeColumn(
+std::unique_ptr<TimeColumn<row_type>> ECRow::makeTimeColumn(
     const std::string &name, const std::string &description,
     const ColumnOffsets &offsets) {
-    return std::make_unique<TimeColumn<ECRow>>(
-        name, description, offsets, [name](const ECRow &r) {
+    return std::make_unique<TimeColumn<row_type>>(
+        name, description, offsets, [name](const row_type &row) {
             return std::chrono::system_clock::from_time_t(
-                static_cast<std::time_t>(r.getDouble(name)));
+                static_cast<std::time_t>(row.getDouble(name)));
         });
 }
 
 // static
-std::unique_ptr<ListColumn<ECRow>> ECRow::makeListColumn(
+std::unique_ptr<ListColumn<row_type>> ECRow::makeListColumn(
     const std::string &name, const std::string &description,
     const ColumnOffsets &offsets) {
-    return std::make_unique<ListColumn<ECRow>>(
-        name, description, offsets, [name](const ECRow &r) {
-            return mk::ec::split_list(r.getString(name));
+    return std::make_unique<ListColumn<row_type>>(
+        name, description, offsets, [name](const row_type &row) {
+            return mk::ec::split_list(row.getString(name));
         });
 }
 
@@ -268,31 +270,30 @@ std::string ECRow::get(const std::string &column_name,
     return it == map_.end() ? default_value : it->second;
 }
 
-const IHost *ECRow::host() const { return host_ ? host_.get() : nullptr; }
-
-TableEventConsole::TableEventConsole(MonitoringCore *mc) : Table{mc} {}
+const IHost *ECRow::host() const { return host_; }
 
 namespace {
-std::function<bool(const ECRow &)> get_authorizer(const Table &table,
-                                                  const User &user) {
+std::function<bool(const row_type &)> get_authorizer(const Table &table,
+                                                     const User &user) {
     if (table.any_column([](const auto &c) {
             return c->name() == "event_contact_groups_precedence";
         })) {
-        return [&user](const ECRow &row) {
+        return [&user](const row_type &row) {
             const auto *host = row.host();
             return user.is_authorized_for_event(
                 row.getString("event_contact_groups_precedence"),
                 row.getString("event_contact_groups"), host);
         };
     }
-    return [](const ECRow & /*row*/) { return true; };
+    return [](const row_type & /*row*/) { return true; };
 }
 }  // namespace
 
-void TableEventConsole::answerQuery(Query &query, const User &user) {
-    if (core()->mkeventdEnabled()) {
+void TableEventConsole::answerQuery(Query &query, const User &user,
+                                    const ICore &core) {
+    if (core.mkeventdEnabled()) {
         try {
-            ECTableConnection{core(), *this, query, get_authorizer(*this, user)}
+            ECTableConnection{core, *this, query, get_authorizer(*this, user)}
                 .run();
         } catch (const std::runtime_error &err) {
             query.badGateway(err.what());

@@ -3,12 +3,14 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+import json
+from collections.abc import Sequence
 from typing import Any
 
 from livestatus import SiteId
 
 from cmk.gui.watolib.appendstore import ABCAppendStore
-from cmk.gui.watolib.objref import ObjectRef, ObjectRefType
+from cmk.gui.watolib.objref import ObjectRef
 from cmk.gui.watolib.paths import wato_var_dir
 
 ChangeSpec = dict[str, Any]
@@ -30,18 +32,16 @@ class SiteChanges(ABCAppendStore[ChangeSpec]):
     def _deserialize(raw: object) -> ChangeSpec:
         if not isinstance(raw, dict):
             raise ValueError("expected a dictionary")
-        # TODO: Parse raw's entries, too, below we have our traditional 'wishful typing'... :-P
-        if isinstance(raw["object"], tuple):
-            # Migrate the pre 2.0 change entries (Two element tuple: ("Folder/Host", "ident"))
-            type_name, ident = raw["object"]
-            if type_name in ("CMEHost", "CREHost"):
-                type_name = "Host"
-            elif type_name in ("CMEFolder", "CREFolder"):
-                type_name = "Folder"
-            raw["object"] = ObjectRef(ObjectRefType(type_name), ident)
-        else:
-            raw["object"] = ObjectRef.deserialize(raw["object"]) if raw["object"] else None
+        raw["object"] = ObjectRef.deserialize(raw["object"]) if raw["object"] else None
         return raw
 
     def clear(self) -> None:
         self._path.unlink(missing_ok=True)
+
+    @staticmethod
+    def to_json(entries: Sequence[ChangeSpec]) -> str:
+        return json.dumps([SiteChanges._serialize(entry) for entry in entries])
+
+    @staticmethod
+    def from_json(raw: str) -> Sequence[ChangeSpec]:
+        return [SiteChanges._deserialize(entry) for entry in json.loads(raw)]

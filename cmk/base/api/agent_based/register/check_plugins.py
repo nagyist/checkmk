@@ -2,34 +2,35 @@
 # Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
-"""Background tools required to register a check plugin
-"""
+"""Background tools required to register a check plug-in"""
+
 import functools
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from typing import Any
 
-from cmk.utils.type_defs import ParsedSectionName, RuleSetName
+from cmk.utils.check_utils import ParametersTypeAlias
+from cmk.utils.rulesets import RuleSetName
 
-from cmk.checkers.checking import CheckPluginName
+from cmk.checkengine.checking import CheckPluginName
+from cmk.checkengine.sectionparser import ParsedSectionName
 
-from cmk.base.api.agent_based.checking_classes import (
+from cmk.base.api.agent_based.plugin_classes import (
     CheckFunction,
     CheckPlugin,
     DiscoveryFunction,
-    IgnoreResults,
-    Metric,
-    Result,
-    Service,
+    LegacyPluginLocation,
 )
 from cmk.base.api.agent_based.register.utils import (
     create_subscribed_sections,
     ITEM_VARIABLE,
-    RuleSetType,
     validate_default_parameters,
     validate_function_arguments,
     validate_ruleset_type,
 )
-from cmk.base.api.agent_based.type_defs import ParametersTypeAlias
+
+from cmk.agent_based.v1 import IgnoreResults, Metric, Result, Service
+from cmk.agent_based.v1.register import RuleSetType
+from cmk.discover_plugins import PluginLocation
 
 MANAGEMENT_DESCR_PREFIX = "Management Interface: "
 
@@ -46,7 +47,7 @@ def _validate_service_name(plugin_name: CheckPluginName, service_name: str) -> N
         raise ValueError(
             "service name and description inconsistency: Please neither have your plugins "
             "name start with %r, nor the description with %r. In the rare case that you want to "
-            "implement a check plugin explicitly designed for management boards (and nothing else),"
+            "implement a check plug-in explicitly designed for management boards (and nothing else),"
             " you must do both of the above."
             % (CheckPluginName.MANAGEMENT_PREFIX, MANAGEMENT_DESCR_PREFIX)
         )
@@ -64,7 +65,6 @@ def _requires_item(service_name: str) -> bool:
 def _filter_discovery(
     generator: Callable[..., Generator[Any, None, None]],
     requires_item: bool,
-    validate_item: bool,
 ) -> DiscoveryFunction:
     """Only let Services through
 
@@ -76,7 +76,7 @@ def _filter_discovery(
         for element in generator(*args, **kwargs):
             if not isinstance(element, Service):
                 raise TypeError("unexpected type in discovery: %r" % type(element))
-            if validate_item and requires_item is (element.item is None):
+            if requires_item is (element.item is None):
                 raise TypeError("unexpected type of item discovered: %r" % type(element.item))
             yield element
 
@@ -171,8 +171,7 @@ def create_check_plugin(
     check_default_parameters: ParametersTypeAlias | None = None,
     check_ruleset_name: str | None = None,
     cluster_check_function: Callable | None = None,
-    module: str | None = None,
-    validate_item: bool = True,
+    location: PluginLocation | LegacyPluginLocation,
     validate_kwargs: bool = True,
 ) -> CheckPlugin:
     """Return an CheckPlugin object after validating and converting the arguments one by one
@@ -202,7 +201,7 @@ def create_check_plugin(
             cluster_check_function=cluster_check_function,
         )
 
-    disco_func = _filter_discovery(discovery_function, requires_item, validate_item)
+    disco_func = _filter_discovery(discovery_function, requires_item)
     disco_ruleset_name = RuleSetName(discovery_ruleset_name) if discovery_ruleset_name else None
 
     cluster_check_function = (
@@ -223,11 +222,11 @@ def create_check_plugin(
         check_default_parameters=check_default_parameters,
         check_ruleset_name=RuleSetName(check_ruleset_name) if check_ruleset_name else None,
         cluster_check_function=cluster_check_function,
-        module=module,
+        location=location,
     )
 
 
-def management_plugin_factory(original_plugin: CheckPlugin) -> CheckPlugin:
+def _management_plugin_factory(original_plugin: CheckPlugin) -> CheckPlugin:
     return CheckPlugin(
         original_plugin.name.create_management_name(),
         original_plugin.sections,
@@ -240,5 +239,25 @@ def management_plugin_factory(original_plugin: CheckPlugin) -> CheckPlugin:
         original_plugin.check_default_parameters,
         original_plugin.check_ruleset_name,
         original_plugin.cluster_check_function,
-        original_plugin.module,
+        original_plugin.location,
+    )
+
+
+def get_check_plugin(
+    plugin_name: CheckPluginName, registered_check_plugins: Mapping[CheckPluginName, CheckPlugin]
+) -> CheckPlugin | None:
+    """Returns the registered check plug-in
+
+    Management plugins may be created on the fly.
+    """
+    plugin = registered_check_plugins.get(plugin_name)
+    if plugin is not None or not plugin_name.is_management_name():
+        return plugin
+
+    return (
+        None
+        if (non_mgmt_plugin := registered_check_plugins.get(plugin_name.create_basic_name()))
+        is None
+        # create management board plug-in on the fly:
+        else _management_plugin_factory(non_mgmt_plugin)
     )

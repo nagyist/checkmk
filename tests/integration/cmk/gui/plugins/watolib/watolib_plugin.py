@@ -4,16 +4,15 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 import cmk.utils.paths
+from cmk.utils.config_warnings import ConfigurationWarnings
 
-from cmk.gui.plugins.watolib.utils import (
+from cmk.gui.watolib.config_domain_name import (
     ABCConfigDomain,
     config_domain_registry,
-    ConfigurationWarnings,
     SerializedSettings,
 )
 
 
-@config_domain_registry.register
 class ConfigDomainTest(ABCConfigDomain):
     needs_sync = True
     needs_activation = True
@@ -30,3 +29,6 @@ class ConfigDomainTest(ABCConfigDomain):
 
     def default_globals(self):
         return {}
+
+
+config_domain_registry.register(ConfigDomainTest())

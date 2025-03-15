@@ -11,22 +11,18 @@ from typing import Any, Literal
 
 from livestatus import SiteId
 
+from cmk.ccc import store
+from cmk.ccc.site import omd_site
+
 import cmk.utils.render
-import cmk.utils.store as store
-from cmk.utils.crypto import HashAlgorithm
-from cmk.utils.crypto.certificate import (
-    CertificateWithPrivateKey,
-    InvalidPEMError,
-    WrongPasswordError,
-)
-from cmk.utils.crypto.password import Password as PasswordType
-from cmk.utils.site import omd_site
-from cmk.utils.type_defs import UserId
+from cmk.utils.certs import CertManagementEvent
+from cmk.utils.log.security_event import log_security_event
+from cmk.utils.user import UserId
 
 from cmk.gui.breadcrumb import Breadcrumb
 from cmk.gui.exceptions import FinalizeRequest, HTTPRedirect, MKUserError
 from cmk.gui.htmllib.html import html
-from cmk.gui.http import request, response
+from cmk.gui.http import ContentDispositionType, request, response
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
 from cmk.gui.page_menu import (
@@ -39,6 +35,7 @@ from cmk.gui.page_menu import (
 )
 from cmk.gui.table import table_element
 from cmk.gui.type_defs import ActionResult, Key
+from cmk.gui.utils.csrf_token import check_csrf_token
 from cmk.gui.utils.transaction_manager import transactions
 from cmk.gui.utils.urls import make_confirm_delete_link, makeactionuri, makeuri_contextless
 from cmk.gui.valuespec import (
@@ -49,6 +46,11 @@ from cmk.gui.valuespec import (
     TextAreaUnicode,
     TextInput,
 )
+
+from cmk.crypto.certificate import Certificate, CertificateWithPrivateKey
+from cmk.crypto.hash import HashAlgorithm
+from cmk.crypto.password import Password as PasswordType
+from cmk.crypto.pem import PEMDecodingError
 
 
 class KeypairStore:
@@ -63,7 +65,7 @@ class KeypairStore:
 
         variables: dict[str, dict[int, dict[str, Any]]] = {self._attr: {}}
         with self._path.open("rb") as f:
-            exec(f.read(), variables, variables)
+            exec(f.read(), variables, variables)  # nosec B102 # BNS:aee528
         return self._parse(variables[self._attr])
 
     def save(self, keys: Mapping[int, Key]) -> None:
@@ -74,10 +76,10 @@ class KeypairStore:
             )
 
     def _parse(self, raw_keys: Mapping[int, dict[str, Any]]) -> dict[int, Key]:
-        return {key_id: Key.parse_obj(raw_key) for key_id, raw_key in raw_keys.items()}
+        return {key_id: Key.model_validate(raw_key) for key_id, raw_key in raw_keys.items()}
 
     def _unparse(self, keys: Mapping[int, Key]) -> dict[int, dict[str, Any]]:
-        return {key_id: key.dict() for key_id, key in keys.items()}
+        return {key_id: key.model_dump() for key_id, key in keys.items()}
 
     def choices(self) -> list[tuple[str, str]]:
         choices = []
@@ -134,7 +136,7 @@ class PageKeyManagement:
                             title=_("Add key"),
                             entries=[
                                 PageMenuEntry(
-                                    title=_("Add key"),
+                                    title=_("Generate key"),
                                     icon_name="new",
                                     item=make_simple_link(
                                         makeuri_contextless(request, [("mode", self.edit_mode)])
@@ -163,6 +165,8 @@ class PageKeyManagement:
         return True
 
     def action(self) -> ActionResult:
+        check_csrf_token()
+
         if self._may_edit_config() and request.has_var("_delete"):
             key_id_as_str = request.var("_delete")
             if key_id_as_str is None:
@@ -182,8 +186,19 @@ class PageKeyManagement:
             self.key_store.save(keys)
         return None
 
+    @property
+    def component_name(self) -> CertManagementEvent.ComponentType:
+        raise NotImplementedError()
+
     def _log_delete_action(self, key_id: int, key: Key) -> None:
-        pass
+        log_security_event(
+            CertManagementEvent(
+                event="certificate removed",
+                component=self.component_name,
+                actor=user.id,
+                cert=key.to_certificate(),
+            )
+        )
 
     def _delete_confirm_msg(self) -> str:
         raise NotImplementedError()
@@ -202,7 +217,7 @@ class PageKeyManagement:
             for nr, (key_id, key) in enumerate(sorted(self.key_store.load().items())):
                 table.row()
                 table.cell("#", css=["narrow nowrap"])
-                html.write_text(nr)
+                html.write_text_permissive(nr)
                 table.cell(_("Actions"), css=["buttons"])
                 if self._may_edit_config():
                     message = self._delete_confirm_msg()
@@ -229,13 +244,14 @@ class PageKeyManagement:
                 table.cell(_("Created"), cmk.utils.render.date(key.date))
                 table.cell(_("By"), key.owner)
                 table.cell(_("Digest (MD5)"), key.fingerprint(HashAlgorithm.MD5))
+                table.cell(_("Key ID"), key_id)
 
 
 class PageEditKey:
     back_mode: str
 
-    def __init__(self, key_store: KeypairStore, passphrase_min_len: int | None = None) -> None:
-        self._minlen = passphrase_min_len
+    def __init__(self, key_store: KeypairStore) -> None:
+        self._minlen = 12
         self.key_store = key_store
 
     def page_menu(self, breadcrumb: Breadcrumb) -> PageMenu:
@@ -244,6 +260,8 @@ class PageEditKey:
         )
 
     def action(self) -> ActionResult:
+        check_csrf_token()
+
         if transactions.check_transaction():
             value = self._vs_key().from_html_vars("key")
             # Remove the secret key from known URL vars. Otherwise later constructed URLs
@@ -252,15 +270,9 @@ class PageEditKey:
             request.del_var("key_p_passphrase")
             self._vs_key().validate_value(value, "key")
             self._create_key(value["alias"], PasswordType(value["passphrase"]))
-            # FIXME: This leads to a circular import otherwise. This module (cmk.gui.key_mgmt) is
-            #  clearly outside of either cmk.gui.plugins.wato and cmk.gui.cee.plugins.wato so this
-            #  is obviously a very simple module-layer violation. This whole module should either
-            #    * be moved into cmk.gui.cee.plugins.wato
-            #    * or cmk.gui.cee.plugins.wato.module_registry should be moved up
-            #  Either way, this is outside my scope right now and shall be fixed.
-            from cmk.gui.plugins.wato.utils.base_modes import mode_url
-
-            return HTTPRedirect(mode_url(self.back_mode))
+            return HTTPRedirect(
+                makeuri_contextless(request, [("mode", self.back_mode)], filename="wato.py")
+            )
         return None
 
     def _create_key(self, alias: str, passphrase: PasswordType) -> None:
@@ -271,17 +283,32 @@ class PageEditKey:
             new_id = max(new_id, key_id + 1)
 
         assert user.id is not None
-        keys[new_id] = generate_key(alias, passphrase, user.id, omd_site())
+        key = generate_key(alias, passphrase, user.id, omd_site())
+        self._log_create_key(key.to_certificate())
+        keys[new_id] = key
         self.key_store.save(keys)
+
+    @property
+    def component_name(self) -> CertManagementEvent.ComponentType:
+        raise NotImplementedError()
+
+    def _log_create_key(self, cert: Certificate) -> None:
+        log_security_event(
+            CertManagementEvent(
+                event="certificate created",
+                component=self.component_name,
+                actor=user.id,
+                cert=cert,
+            )
+        )
 
     def page(self) -> None:
         # Currently only "new" is supported
-        html.begin_form("key", method="POST")
-        html.prevent_password_auto_completion()
-        self._vs_key().render_input("key", {})
-        self._vs_key().set_focus("key")
-        html.hidden_fields()
-        html.end_form()
+        with html.form_context("key", method="POST"):
+            html.prevent_password_auto_completion()
+            self._vs_key().render_input("key", {})
+            self._vs_key().set_focus("key")
+            html.hidden_fields()
 
     def _vs_key(self) -> Dictionary:
         return Dictionary(
@@ -328,6 +355,8 @@ class PageUploadKey:
         )
 
     def action(self) -> ActionResult:
+        check_csrf_token()
+
         if transactions.check_transaction():
             value = self._vs_key().from_html_vars("key")
             request.del_var("key_p_passphrase")
@@ -337,39 +366,41 @@ class PageUploadKey:
             if not key_file:
                 raise MKUserError(None, _("You need to provide a key file."))
 
-            try:
-                self._upload_key(key_file, value["alias"], PasswordType(value["passphrase"]))
-            except InvalidPEMError:
-                raise MKUserError(None, _("The file does not look like a valid key file."))
+            self._upload_key(key_file, value["alias"], PasswordType(value["passphrase"]))
 
-            # FIXME: This leads to a circular import otherwise. This module (cmk.gui.key_mgmt) is
-            #  clearly outside of either cmk.gui.plugins.wato and cmk.gui.cee.plugins.wato so this
-            #  is obviously a very simple module-layer violation. This whole module should either
-            #    * be moved into cmk.gui.cee.plugins.wato
-            #    * or cmk.gui.cee.plugins.wato.module_registry should be moved up
-            #  Either way, this is outside my scope right now and shall be fixed.
-            from cmk.gui.plugins.wato.utils.base_modes import mode_url
-
-            return HTTPRedirect(mode_url(self.back_mode), code=302)
+            return HTTPRedirect(
+                makeuri_contextless(request, [("mode", self.back_mode)], filename="wato.py"),
+                code=302,
+            )
         return None
 
     def _get_uploaded(
         self,
-        cert_spec: (tuple[Literal["upload"], tuple[str, str, bytes]] | tuple[Literal["text"], str]),
+        cert_spec: tuple[Literal["upload"], tuple[str, str, bytes]] | tuple[Literal["text"], str],
     ) -> str:
         if cert_spec[0] == "upload":
-            return cert_spec[1][2].decode("ascii")
+            try:
+                return cert_spec[1][2].decode("ascii")
+            except UnicodeDecodeError:
+                raise MKUserError(None, _("Could not decode key file"))
         return cert_spec[1]
 
     def _upload_key(self, key_file: str, alias: str, passphrase: PasswordType) -> None:
-        # This will raise various ValueErrors, if the cert is not valid, if the passphrase is wrong, etc.
         try:
             key_pair = CertificateWithPrivateKey.load_combined_file_content(key_file, passphrase)
-        except WrongPasswordError:
-            raise MKUserError("key_p_passphrase", "Invalid pass phrase")
+        except PEMDecodingError:
+            raise MKUserError(None, _("The key file is invalid or the password is wrong."))
 
+        try:
+            # check if the key is an RSA key, which is assumed by backup encryption at the moment
+            _rsa_key = key_pair.private_key.get_raw_rsa_key()
+        except ValueError:
+            raise MKUserError("key_p_key_file_0", "Only RSA keys are supported at this time")
+
+        cert = key_pair.certificate
+        self._log_upload_key(cert)
         key = Key(
-            certificate=key_pair.certificate.dump_pem().str,
+            certificate=cert.dump_pem().str,
             private_key=key_pair.private_key.dump_pem(passphrase).str,
             alias=alias,
             owner=user.ident,
@@ -378,13 +409,42 @@ class PageUploadKey:
         )
         self.key_store.add(key)
 
+    @property
+    def component_name(self) -> CertManagementEvent.ComponentType:
+        raise NotImplementedError()
+
+    def _log_upload_key(self, cert: Certificate) -> None:
+        log_security_event(
+            CertManagementEvent(
+                event="certificate uploaded",
+                component=self.component_name,
+                actor=user.id,
+                cert=cert,
+            )
+        )
+
     def page(self) -> None:
-        html.begin_form("key", method="POST")
-        html.prevent_password_auto_completion()
-        self._vs_key().render_input("key", {})
-        self._vs_key().set_focus("key")
-        html.hidden_fields()
-        html.end_form()
+        # Note about the cert/key requirements:
+        # * The private key has to be an RSA key because both backup encryption and agent signing
+        #   currently assume that. The algorithms are still hardcoded.
+        # * For historical reasons we expect a "combined PEM" file, with the key and cert
+        #   concatenated. In fact we don't really use the certificate, so a public/private key pair
+        #   would be sufficient.
+        # * Since we provide the passphrase to load_combined_file_content, the private key must be
+        #   encrypted (using that passphrase) and have the '-----BEGIN ENCRYPTED PRIVATE KEY-----'
+        #   form. The positive side effect is that the user proves that they know the passphrase
+        #   now, rather than later whenever the key is used.
+        html.write_text_permissive(
+            _(
+                "Here you can upload an existing certificate and private key. "
+                "The key must be an RSA key and it must be password protected."
+            )
+        )
+        with html.form_context("key", method="POST"):
+            html.prevent_password_auto_completion()
+            self._vs_key().render_input("key", {})
+            self._vs_key().set_focus("key")
+            html.hidden_fields()
 
     def _vs_key(self) -> Dictionary:
         return Dictionary(
@@ -405,16 +465,31 @@ class PageUploadKey:
                         help=self._passphrase_help(),
                         allow_empty=False,
                         is_stored_plain=False,
-                        password_meter=True,
+                        password_meter=False,
                     ),
                 ),
                 (
                     "key_file",
                     CascadingDropdown(
-                        title=_("Key"),
+                        title=_("Certificate and key file"),
+                        help=_(
+                            'Upload either the file or the file content. A "combined PEM" format,'
+                            " containing both the encrypted key and the certificate, is expected."
+                        ),
                         choices=[
-                            ("upload", _("Upload CRT/PEM File"), FileUpload()),
-                            ("text", _("Paste PEM Content"), TextAreaUnicode()),
+                            (
+                                "upload",
+                                _("Upload CRT/PEM File"),
+                                FileUpload(
+                                    allowed_extensions=[".pem", ".crt"],
+                                    mime_types=[
+                                        "application/x-x509-user-cert",
+                                        "application/x-x509-ca-cert",
+                                        "application/pkix-cert",
+                                    ],
+                                ),
+                            ),
+                            ("text", _("Paste CRT/PEM Contents"), TextAreaUnicode()),
                         ],
                     ),
                 ),
@@ -440,6 +515,8 @@ class PageDownloadKey:
         )
 
     def action(self) -> ActionResult:
+        check_csrf_token()
+
         if transactions.check_transaction():
             keys = self.key_store.load()
 
@@ -459,7 +536,7 @@ class PageDownloadKey:
 
             try:
                 keys[key_id].to_certificate_with_private_key(PasswordType(value["passphrase"]))
-            except ValueError:
+            except (PEMDecodingError, ValueError):
                 raise MKUserError("key_p_passphrase", _("Invalid pass phrase"))
 
             self._send_download(keys, key_id)
@@ -468,10 +545,10 @@ class PageDownloadKey:
 
     def _send_download(self, keys: dict[int, Key], key_id: int) -> None:
         key = keys[key_id]
-        response.headers["Content-Disposition"] = "Attachment; filename=%s" % self._file_name(
-            key_id, key
+        response.set_content_type("application/x-pem-file")
+        response.set_content_disposition(
+            ContentDispositionType.ATTACHMENT, self._file_name(key_id, key)
         )
-        response.headers["Content-type"] = "application/x-pem-file"
         response.set_data(key.private_key + key.certificate)
 
     def _file_name(self, key_id: int, key: Key) -> str:
@@ -485,12 +562,11 @@ class PageDownloadKey:
                 "The key will be downloaded in encrypted form."
             )
         )
-        html.begin_form("key", method="POST")
-        html.prevent_password_auto_completion()
-        self._vs_key().render_input("key", {})
-        self._vs_key().set_focus("key")
-        html.hidden_fields()
-        html.end_form()
+        with html.form_context("key", method="POST"):
+            html.prevent_password_auto_completion()
+            self._vs_key().render_input("key", {})
+            self._vs_key().set_focus("key")
+            html.hidden_fields()
 
     def _vs_key(self) -> Dictionary:
         return Dictionary(
@@ -510,10 +586,20 @@ class PageDownloadKey:
         )
 
 
-def generate_key(alias: str, passphrase: PasswordType, user_id: UserId, site_id: SiteId) -> Key:
+def generate_key(
+    alias: str,
+    passphrase: PasswordType,
+    user_id: UserId,
+    site_id: SiteId,
+    key_size: int = 4096,
+) -> Key:
+    # Note: Verification of the signatures makes assumptions about the key (RSA) and the padding
+    # scheme (PKCS1v15). Make sure this is adjusted before changing it here.
     key_pair = CertificateWithPrivateKey.generate_self_signed(
         common_name=alias,
-        organizational_unit_name=user_id,
+        organization=f"Checkmk Site {site_id}",
+        organizational_unit=user_id,
+        key_size=key_size,
     )
     return Key(
         certificate=key_pair.certificate.dump_pem().str,

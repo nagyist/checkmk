@@ -6,21 +6,21 @@
 from pathlib import Path
 
 import cmk.utils.paths
-from cmk.utils.crypto import password_hashing
-from cmk.utils.crypto.password import Password, PasswordHash
-from cmk.utils.crypto.secrets import AutomationUserSecret
-from cmk.utils.store.htpasswd import Htpasswd
-from cmk.utils.type_defs import UserId
+from cmk.utils.user import UserId
 
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.i18n import _
-from cmk.gui.plugins.userdb.utils import (
+from cmk.gui.type_defs import UserSpec
+from cmk.gui.userdb import (
     CheckCredentialsResult,
     ConnectorType,
-    user_connector_registry,
+    HtpasswdUserConnectionConfig,
     UserConnector,
 )
-from cmk.gui.type_defs import UserSpec
+from cmk.gui.utils.htpasswd import Htpasswd
+
+from cmk.crypto import password_hashing
+from cmk.crypto.password import Password
 
 
 # Checkmk supports different authentication frontends for verifying the
@@ -36,9 +36,8 @@ from cmk.gui.type_defs import UserSpec
 #
 # See:
 # - https://httpd.apache.org/docs/2.4/misc/password_encryptions.html
-# - https://passlib.readthedocs.io/en/stable/lib/passlib.apache.html
 #
-def hash_password(password: Password) -> PasswordHash:
+def hash_password(password: Password) -> password_hashing.PasswordHash:
     """Hash a password
 
     Invalid inputs raise MKUserError.
@@ -54,8 +53,7 @@ def hash_password(password: Password) -> PasswordHash:
         raise MKUserError(None, "Password could not be hashed.")
 
 
-@user_connector_registry.register
-class HtpasswdUserConnector(UserConnector):
+class HtpasswdUserConnector(UserConnector[HtpasswdUserConnectionConfig]):
     @classmethod
     def type(cls) -> str:
         return ConnectorType.HTPASSWD
@@ -66,13 +64,13 @@ class HtpasswdUserConnector(UserConnector):
 
     @classmethod
     def title(cls) -> str:
-        return _("Apache Local Password File (htpasswd)")
+        return _("Apache local password file (htpasswd)")
 
     @classmethod
     def short_title(cls) -> str:
         return _("htpasswd")
 
-    def __init__(self, cfg) -> None:  # type: ignore[no-untyped-def]
+    def __init__(self, cfg: HtpasswdUserConnectionConfig) -> None:
         super().__init__(cfg)
         self._htpasswd = Htpasswd(Path(cmk.utils.paths.htpasswd_file))
 
@@ -87,9 +85,6 @@ class HtpasswdUserConnector(UserConnector):
         if not (pw_hash := self._htpasswd.get_hash(user_id)):
             return None  # not user in htpasswd, skip so other connectors can try
 
-        if self._is_automation_user(user_id):
-            raise MKUserError(None, _("Automation user rejected"))
-
         if pw_hash.startswith("!"):
             raise MKUserError(None, _("User is locked"))
 
@@ -98,9 +93,6 @@ class HtpasswdUserConnector(UserConnector):
         except (password_hashing.PasswordInvalidError, ValueError):
             return False
         return user_id
-
-    def _is_automation_user(self, user_id: UserId) -> bool:
-        return AutomationUserSecret(user_id).exists()
 
     def save_users(self, users: dict[UserId, UserSpec]) -> None:
         # Apache htpasswd. We only store passwords here. During
@@ -116,8 +108,8 @@ class HtpasswdUserConnector(UserConnector):
                 continue
 
             if user.get("password"):
-                entries[uid] = PasswordHash(
-                    "{}{}".format("!" if user.get("locked", False) else "", user["password"])
+                entries[uid] = password_hashing.PasswordHash(
+                    "{}{}".format("!" if user["locked"] else "", user["password"])
                 )
 
         self._htpasswd.save_all(entries)

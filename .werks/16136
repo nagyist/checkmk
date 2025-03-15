@@ -1,0 +1,17 @@
+Title: api-docs: include explanation of the special character * for the If-Match header
+Class: fix
+Compatible: compat
+Component: rest-api
+Date: 1695723736
+Edition: cre
+Knowledge: doc
+Level: 1
+Version: 2.3.0b1
+
+
+Most PUT requests to the REST API require an If-Match header containing
+an ETag. With this Werk we make it possible to provide "*" instead of an
+ETag, like this: "If-Match": "*"
+
+This Werk also adds a short explanation to the REST API documentation.
+See the section "Updating values" for more information.

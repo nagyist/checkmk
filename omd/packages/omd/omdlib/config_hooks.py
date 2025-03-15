@@ -1,26 +1,8 @@
 #!/usr/bin/env python3
-#
-#       U  ___ u  __  __   ____
-#        \/"_ \/U|' \/ '|u|  _"\
-#        | | | |\| |\/| |/| | | |
-#    .-,_| |_| | | |  | |U| |_| |\
-#     \_)-\___/  |_|  |_| |____/ u
-#          \\   <<,-,,-.   |||_
-#         (__)   (./  \.) (__)_)
-#
-# This file is part of OMD - The Open Monitoring Distribution.
-# The official homepage is at <http://omdistro.org>.
-#
-# OMD  is  free software;  you  can  redistribute it  and/or modify it
-# under the  terms of the  GNU General Public License  as published by
-# the  Free Software  Foundation  in  version 2.  OMD  is  distributed
-# in the hope that it will be useful, but WITHOUT ANY WARRANTY;  with-
-# out even the implied warranty of  MERCHANTABILITY  or  FITNESS FOR A
-# PARTICULAR PURPOSE. See the  GNU General Public License for more de-
-# ails.  You should have  received  a copy of the  GNU  General Public
-# License along with GNU Make; see the file  COPYING.  If  not,  write
-# to the Free Software Foundation, Inc., 51 Franklin St,  Fifth Floor,
-# Boston, MA 02110-1301 USA.
+# Copyright (C) 2023 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
 """Site configuration and config hooks
 
 Hooks are scripts in lib/omd/hooks that are being called with one
@@ -32,22 +14,28 @@ choices - available choices for enumeration hooks
 depends - exits with 1, if this hook misses its dependent hook settings
 """
 
+import dataclasses
 import logging
 import os
 import re
 import subprocess
 import sys
 from collections.abc import Iterable
-from ipaddress import ip_network
+from ipaddress import ip_network, IPv4Address, IPv6Address
 from pathlib import Path
 from re import Pattern
-from typing import TYPE_CHECKING
+from typing import override, TYPE_CHECKING
 
-from omdlib.type_defs import ConfigChoiceHasError
+import pydantic
 
-from cmk.utils.exceptions import MKTerminate
+from omdlib.type_defs import Config, ConfigChoiceHasError
+
+from cmk.ccc.exceptions import MKTerminate
+from cmk.ccc.version import edition
+
+import cmk.utils.resulttype as result
+from cmk.utils import paths
 from cmk.utils.log import VERBOSE
-from cmk.utils.type_defs import result
 
 if TYPE_CHECKING:
     from omdlib.contexts import SiteContext
@@ -55,13 +43,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger("cmk.omd")
 
 ConfigHookChoiceItem = tuple[str, str]
-ConfigHookChoices = Pattern | list[ConfigHookChoiceItem] | ConfigChoiceHasError | None
-ConfigHook = dict[str, str | bool | ConfigHookChoices]
-ConfigHooks = dict[str, ConfigHook]
+ConfigHookChoices = Pattern | list[ConfigHookChoiceItem] | ConfigChoiceHasError
 ConfigHookResult = tuple[int, str]
 
 
+@dataclasses.dataclass(frozen=True)
+class ConfigHook:
+    choices: ConfigHookChoices
+    name: str
+    description: str
+    alias: str
+    menu: str
+    unstructured: dict[str, bool]
+
+
+ConfigHooks = dict[str, ConfigHook]
+
+
 class IpAddressListHasError(ConfigChoiceHasError):
+    @override
     def __call__(self, value: str) -> result.Result[None, str]:
         ip_addresses = value.split()
         if not ip_addresses:
@@ -72,6 +72,59 @@ class IpAddressListHasError(ConfigChoiceHasError):
             except ValueError:
                 return result.Error(f"The IP address {ip_address} does match the expected format.")
         return result.OK(None)
+
+
+class IpListenAddressHasError(ConfigChoiceHasError):
+    @override
+    def __call__(self, value: str) -> result.Result[None, str]:
+        if not value:
+            return result.Error("Empty address")
+
+        if value.startswith("[") and value.endswith("]"):
+            try:
+                IPv6Address(value[1:-1])
+                return result.OK(None)
+            except ValueError:
+                return result.Error("Invalid IPv6 address")
+
+        try:
+            IPv4Address(value)
+        except ValueError:
+            return result.Error("Invalid IPv4 address")
+
+        return result.OK(None)
+
+
+class NetworkPortHasError(ConfigChoiceHasError):
+    @override
+    def __call__(self, value: str) -> result.Result[None, str]:
+        try:
+            port = int(value)
+        except ValueError:
+            return result.Error("Invalid port number")
+
+        if port < 1024 or port > 65535:
+            return result.Error("Invalid port number")
+
+        return result.OK(None)
+
+
+class ApacheTCPAddrHasError(ConfigChoiceHasError):
+    @override
+    def __call__(self, value: str) -> result.Result[None, str]:
+        class _Parser(pydantic.RootModel):
+            root: pydantic.HttpUrl
+
+        url = f"http://{value}:80"
+        try:
+            _Parser.model_validate(url)
+            return result.OK(None)
+        except pydantic.ValidationError as e:
+            message = f"""OMD uses APACHE_TCP_ADDR and APACHE_TCP_PORT to construct an Apache
+Listen directive. For example, setting APACHE_TCP_PORT to 80 results in: {url}.
+This is invalid because of: """
+            message += ", ".join([error["ctx"]["error"] for error in e.errors()])
+            return result.Error(message)
 
 
 # Put all site configuration (explicit and defaults) into environment
@@ -105,7 +158,7 @@ def load_config_hooks(site: "SiteContext") -> ConfigHooks:
             if hook_name[0] != ".":
                 hook = _config_load_hook(site, hook_name)
                 # only load configuration hooks
-                if hook.get("choices", None) is not None:
+                if hook.choices is not None:
                     config_hooks[hook_name] = hook
         except MKTerminate:
             raise
@@ -115,40 +168,43 @@ def load_config_hooks(site: "SiteContext") -> ConfigHooks:
     return config_hooks
 
 
-def _config_load_hook(  # pylint: disable=too-many-branches
+def _config_load_hook(
     site: "SiteContext",
     hook_name: str,
 ) -> ConfigHook:
-    hook: ConfigHook = {
-        "name": hook_name,
-        "deprecated": False,
-    }
+    unstructured = {"deprecated": False}
 
     if not site.hook_dir:
         # IMHO this should be unreachable...
         raise MKTerminate("Site has no version and therefore no hooks")
 
     description = ""
+    menu = "Other"
     description_active = False
     with Path(site.hook_dir, hook_name).open() as hook_file:
         for line in hook_file:
             if line.startswith("# Alias:"):
-                hook["alias"] = line[8:].strip()
+                alias = line[8:].strip()
             elif line.startswith("# Menu:"):
-                hook["menu"] = line[7:].strip()
+                menu = line[7:].strip()
             elif line.startswith("# Deprecated: yes"):
-                hook["deprecated"] = True
+                unstructured["deprecated"] = True
             elif line.startswith("# Description:"):
                 description_active = True
             elif line.startswith("#  ") and description_active:
                 description += line[3:].strip() + "\n"
             else:
                 description_active = False
-    hook["description"] = description
 
     hook_info = call_hook(site, hook_name, ["choices"])[1]
-    hook["choices"] = _parse_hook_choices(hook_info)
-    return hook
+    return ConfigHook(
+        choices=_parse_hook_choices(hook_info),
+        name=hook_name,
+        alias=alias,
+        menu=menu,
+        description=description,
+        unstructured=unstructured,
+    )
 
 
 def _parse_hook_choices(hook_info: str) -> ConfigHookChoices:
@@ -160,9 +216,15 @@ def _parse_hook_choices(hook_info: str) -> ConfigHookChoices:
 
     match [choice.strip() for choice in hook_info.split("\n")]:
         case [""]:
-            return None
+            raise MKTerminate("Invalid output of hook: empty output")
+        case ["@{IP_LISTEN_ADDRESS}"]:
+            return IpListenAddressHasError()
+        case ["@{NETWORK_PORT}"]:
+            return NetworkPortHasError()
         case ["@{IP_ADDRESS_LIST}"]:
             return IpAddressListHasError()
+        case ["@{APACHE_TCP_ADDR}"]:
+            return ApacheTCPAddrHasError()
         case [regextext]:
             return re.compile(regextext + "$")
         case choices_list:
@@ -174,7 +236,6 @@ def _parse_hook_choices(hook_info: str) -> ConfigHookChoices:
             except ValueError as excep:
                 raise MKTerminate(f"Invalid output of hook: {choices_list}: {excep}") from excep
             return choices
-    return None
 
 
 def load_hook_dependencies(site: "SiteContext", config_hooks: ConfigHooks) -> ConfigHooks:
@@ -182,22 +243,46 @@ def load_hook_dependencies(site: "SiteContext", config_hooks: ConfigHooks) -> Co
         hook = config_hooks[hook_name]
         exitcode, _content = call_hook(site, hook_name, ["depends"])
         if exitcode:
-            hook["active"] = False
+            hook.unstructured["active"] = False
         else:
-            hook["active"] = True
+            hook.unstructured["active"] = True
     return config_hooks
 
 
-def load_defaults(site: "SiteContext") -> dict[str, str]:
-    """Get the default values of all config hooks for the site configuration"""
-    if not site.hook_dir or not os.path.exists(site.hook_dir):
+def load_config(site: "SiteContext") -> Config:
+    """Load all variables from omd/sites.conf. These variables always begin with
+    CONFIG_. The reason is that this file can be sources with the shell.
+
+    Puts these variables into the config dict without the CONFIG_. Also
+    puts the variables into the process environment."""
+    config = read_site_config(site)
+    if site.hook_dir and os.path.exists(site.hook_dir):
+        for hook_name in sort_hooks(os.listdir(site.hook_dir)):
+            if hook_name[0] != "." and hook_name not in config:
+                config[hook_name] = call_hook(
+                    site, hook_name, ["default", edition(paths.omd_root).short]
+                )[1]
+    return config
+
+
+def read_site_config(site: "SiteContext") -> Config:
+    """Read and parse the file site.conf of a site into a dictionary and returns it"""
+    config: Config = {}
+    if not (confpath := Path(site.dir, "etc/omd/site.conf")).exists():
         return {}
 
-    return {
-        hook_name: call_hook(site, hook_name, ["default"])[1]
-        for hook_name in sort_hooks(os.listdir(site.hook_dir))
-        if hook_name[0] != "."
-    }
+    with confpath.open() as conf_file:
+        for line in conf_file:
+            line = line.strip()
+            if line == "" or line[0] == "#":
+                continue
+            var, value = line.split("=", 1)
+            if not var.startswith("CONFIG_"):
+                sys.stderr.write("Ignoring invalid variable %s.\n" % var)
+            else:
+                config[var[7:].strip()] = value.strip().strip("'")
+
+    return config
 
 
 # Always sort CORE hook to the end because it runs "cmk -U" which

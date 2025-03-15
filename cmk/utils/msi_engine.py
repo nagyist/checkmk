@@ -21,9 +21,19 @@ from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Final, NoReturn
 
+from cmk.ccc.version import __version__
+
 from cmk.utils import msi_patch
 
-PRODUCT_NAME: Final = "Check MK Agent 2.2"
+
+def _extract_major_version(version: str) -> str:
+    """converts "2.3.0b1" to "2.3" """
+    num_dot_num_pattern: Final[str] = r"(\d+\.\d+)"
+    return match.group(1) if (match := re.search(num_dot_num_pattern, version)) else "2.3"
+
+
+_MAJOR_VERSION: Final = _extract_major_version(__version__)
+PRODUCT_NAME: Final = f"Checkmk Agent {_MAJOR_VERSION}"
 AGENT_STANDARD_MSI_FILE: Final = "check_mk_agent.msi"
 AGENT_UNSIGNED_MSI_FILE: Final = "check_mk_agent_unsigned.msi"
 _APPLY_PATCH_SCRIPT: Final = "apply_unsign_msi_patch.sh"
@@ -63,7 +73,7 @@ def msi_component_table() -> list[str]:
 
 def _remove_cab(path_to_msibuild: Path, *, msi: Path) -> None:
     _verbose("Removing product.cab from %s" % msi)
-    cmd: Final = f"{path_to_msibuild/'msibuild'} {msi} -q \"DELETE FROM _Streams where Name = 'product.cab'\""
+    cmd: Final = f"{path_to_msibuild / 'msibuild'} {msi} -q \"DELETE FROM _Streams where Name = 'product.cab'\""  # nosec B608 # BNS:666c0d
 
     if (result := os.system(cmd)) != 0:  # nosec B605 # BNS:f6c1b9
         bail_out(f"msibuild is failed on remove cab, {result=}")
@@ -71,7 +81,7 @@ def _remove_cab(path_to_msibuild: Path, *, msi: Path) -> None:
 
 def _create_new_cab(work_dir: Path) -> None:
     _verbose("Generating new product.cab")
-    files = " ".join(map(lambda f: f"{work_dir/f}", msi_file_table()))
+    files = " ".join(map(lambda f: f"{work_dir / f}", msi_file_table()))
     cmd: Final = f"lcab -n {files} {work_dir}/product.cab > nul"
     if (result := os.system(cmd)) != 0:  # nosec B605 # BNS:f6c1b9
         bail_out(f"lcab is failed in create new cab, {result=}")
@@ -79,7 +89,7 @@ def _create_new_cab(work_dir: Path) -> None:
 
 def _add_cab(path_to_msibuild: Path, *, msi: Path, working_dir: Path) -> None:
     _verbose("Add modified product.cab")
-    cmd: Final = f"{path_to_msibuild/'msibuild'} {msi} -a product.cab {working_dir}/product.cab"
+    cmd: Final = f"{path_to_msibuild / 'msibuild'} {msi} -a product.cab {working_dir}/product.cab"
     if (result := os.system(cmd)) != 0:  # nosec B605 # BNS:f6c1b9
         bail_out(f"msi build is failed, {result=}")
 
@@ -209,7 +219,7 @@ def _strip_ascii_suffix(version: str) -> str:
     # Remove any traces of i, p, b versions. Windows can't handle them...
     # The revision should be enough to uniquely identify this build
     # The original version name is also still visible in the list of programs
-    match = re.search("[a-z]", version)
+    match = re.search("[A-Za-z]", version)
     if match:
         result = version[: match.start(0)]
         if result[-1] == ".":

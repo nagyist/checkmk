@@ -8,6 +8,7 @@ Send notification messages to Cisco Webex Teams
 
 Use a Cisco Webex Teams webhook to send notification messages
 """
+
 from cmk.notification_plugins.utils import (
     format_link,
     host_url_from_context,
@@ -66,4 +67,7 @@ def _cisco_webex_teams_msg(context: dict) -> dict:
 
 
 def main() -> int:
-    return process_by_status_code(post_request(_cisco_webex_teams_msg))
+    return process_by_status_code(
+        response=post_request(_cisco_webex_teams_msg),
+        success_code=204,
+    )

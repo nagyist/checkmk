@@ -28,17 +28,20 @@ import json
 import os
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import suppress
-from typing import cast, Generic, Literal, TypedDict, TypeVar
+from dataclasses import dataclass, replace
+from typing import Generic, Literal, Self, TypeVar
 
-import cmk.utils.store as store
-import cmk.utils.version as cmk_version
-from cmk.utils.exceptions import MKGeneralException
-from cmk.utils.type_defs import UserId
+from pydantic import BaseModel as PydanticBaseModel
+
+from cmk.ccc import store
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.ccc.version import Edition, edition
+
+import cmk.utils.paths
+from cmk.utils.user import UserId
 
 import cmk.gui.pages
-import cmk.gui.sites as sites
-import cmk.gui.userdb as userdb
-import cmk.gui.weblib as weblib
+from cmk.gui import sites, userdb
 from cmk.gui.breadcrumb import Breadcrumb, BreadcrumbItem, make_main_menu_breadcrumb
 from cmk.gui.config import default_authorized_builtin_role_ids
 from cmk.gui.default_name import unique_default_name_suggestion
@@ -48,10 +51,10 @@ from cmk.gui.hooks import request_memoize
 from cmk.gui.htmllib.generator import HTMLWriter
 from cmk.gui.htmllib.header import make_header
 from cmk.gui.htmllib.html import html
-from cmk.gui.http import request
+from cmk.gui.http import request, response
 from cmk.gui.i18n import _, _l, _u
-from cmk.gui.logged_in import save_user_file, user
-from cmk.gui.main_menu import mega_menu_registry
+from cmk.gui.logged_in import LoggedInUser, save_user_file, user
+from cmk.gui.main_menu import mega_menu_registry, MegaMenuRegistry
 from cmk.gui.page_menu import (
     doc_reference_to_page_menu,
     make_confirmed_form_submit_link,
@@ -82,20 +85,16 @@ from cmk.gui.type_defs import (
     PermissionName,
     TopicMenuItem,
     TopicMenuTopic,
+    Visual,
 )
 from cmk.gui.user_sites import get_configured_site_choices
 from cmk.gui.utils.flashed_messages import flash, get_flashed_messages
 from cmk.gui.utils.html import HTML
 from cmk.gui.utils.ntop import is_ntop_configured
 from cmk.gui.utils.roles import is_user_with_publish_permissions, user_may
+from cmk.gui.utils.selection_id import SelectionId
 from cmk.gui.utils.transaction_manager import transactions
-from cmk.gui.utils.urls import (
-    make_confirm_delete_link,
-    makeactionuri,
-    makeuri,
-    makeuri_contextless,
-    urlencode,
-)
+from cmk.gui.utils.urls import make_confirm_delete_link, makeactionuri, makeuri, makeuri_contextless
 from cmk.gui.utils.user_errors import user_errors
 from cmk.gui.validate import validate_id
 from cmk.gui.valuespec import (
@@ -124,48 +123,85 @@ PagetypePhrase = Literal["title", "title_plural", "add_to", "clone", "create", "
 PageMode = Literal["create", "clone", "edit"]
 
 
-class _BaseSpecMandatory(TypedDict):
+class BaseModel(PydanticBaseModel):
     name: str
     title: str
+    description: str = ""
 
 
-class BaseSpec(_BaseSpecMandatory, total=False):
-    description: str
+@dataclass(kw_only=True)
+class BaseConfig:
+    name: str
+    title: str
+    description: str = ""
 
 
-class _OverridableSpecMandatory(BaseSpec):
+class OverridableModel(BaseModel):
     owner: UserId
-    public: bool | tuple[Literal["contact_groups"], Sequence[str]]
+    public: bool | tuple[Literal["contact_groups", "sites"], Sequence[str]] | None
+    hidden: bool = False  # TODO: Seems it is not configurable through the UI. Is it OK?
 
 
-class OverridableSpec(_OverridableSpecMandatory, total=False):
-    # Seems it is not configurable through the UI. Is it OK?
-    hidden: bool
+@dataclass(kw_only=True)
+class OverridableConfig(BaseConfig):
+    owner: UserId
+    public: bool | tuple[Literal["contact_groups", "sites"], Sequence[str]] | None
+    hidden: bool = False  # TODO: Seems it is not configurable through the UI. Is it OK?
 
 
 ElementSpec = dict
 
 
-class OverridableContainerSpec(OverridableSpec):
+class OverridableContainerModel(OverridableModel):
+    # TODO: Specify element types. Can we make use of the generic typed dicts here?
+    elements: list[ElementSpec] = []
+
+
+@dataclass(kw_only=True)
+class OverridableContainerConfig(OverridableConfig):
     # TODO: Specify element types. Can we make use of the generic typed dicts here?
     elements: list[ElementSpec]
 
 
-class PageRendererSpec(OverridableContainerSpec):
+class PageRendererModel(OverridableContainerModel):
     topic: str
     sort_index: int
     is_show_more: bool
 
 
-class _PagetypeTopicSpecMandatory(OverridableSpec):
+@dataclass(kw_only=True)
+class PageRendererConfig(OverridableContainerConfig):
+    topic: str
+    sort_index: int
+    is_show_more: bool
+
+
+class PagetypeTopicModel(OverridableModel):
     icon_name: str
     sort_index: int
+    max_entries: int = 10
+    hide: bool = False  # TODO: Seems it is not configurable through the UI. Is it OK?
 
 
-class PagetypeTopicSpec(_PagetypeTopicSpecMandatory, total=False):
-    max_entries: int
-    # Seems it is not configurable through the UI. Is it OK?
-    hide: bool
+@dataclass(kw_only=True)
+class PagetypeTopicConfig(OverridableConfig):
+    icon_name: str
+    sort_index: int
+    max_entries: int = 10
+    hide: bool = False  # TODO: Seems it is not configurable through the UI. Is it OK?
+
+
+def register(mega_menu_registry_: MegaMenuRegistry) -> None:
+    mega_menu_registry_.register(
+        MegaMenu(
+            name="customize",
+            title=_l("Customize"),
+            icon="main_customize",
+            sort_index=10,
+            topics=_customize_menu_topics,
+            hide=hide_customize_menu,
+        )
+    )
 
 
 #   .--Base----------------------------------------------------------------.
@@ -180,20 +216,19 @@ class PagetypeTopicSpec(_PagetypeTopicSpecMandatory, total=False):
 #   |  or PageRenderer.                                                    |
 #   '----------------------------------------------------------------------'
 
-_T_BaseSpec = TypeVar("_T_BaseSpec", bound=BaseSpec)
+_T_BaseConfig = TypeVar("_T_BaseConfig", bound=BaseConfig)
 
 
-class Base(abc.ABC, Generic[_T_BaseSpec]):
-    def __init__(self, d: _T_BaseSpec) -> None:
-        super().__init__()
+class Base(abc.ABC, Generic[_T_BaseConfig]):
+    def __init__(self, config: _T_BaseConfig) -> None:
+        self.config = config
 
-        # The dictionary with the name _ holds all information about
-        # the page in question - as a dictionary that can be loaded
-        # and saved to files using repr().
-        self._ = d
+    @classmethod
+    @abc.abstractmethod
+    def deserialize(cls, page_dict: Mapping[str, object]) -> Self: ...
 
-    def internal_representation(self) -> _T_BaseSpec:
-        return self._
+    @abc.abstractmethod
+    def serialize(self) -> dict[str, object]: ...
 
     # You always must override the following method. Not all phrases
     # might be necessary depending on the type of you page.
@@ -217,7 +252,7 @@ class Base(abc.ABC, Generic[_T_BaseSpec]):
         """
         return [
             (
-                _("General Properties"),
+                _("General properties"),
                 [
                     (
                         1.1,
@@ -226,7 +261,7 @@ class Base(abc.ABC, Generic[_T_BaseSpec]):
                             title=_("Unique ID"),
                             help=_(
                                 "The ID will be used do identify this page in URLs. If this page has the "
-                                "same ID as a builtin page of the type <i>%s</i> then it will shadow the builtin one."
+                                "same ID as a built-in page of the type <i>%s</i> then it will shadow the built-in one."
                             )
                             % cls.phrase("title"),
                             allow_empty=False,
@@ -269,16 +304,13 @@ class Base(abc.ABC, Generic[_T_BaseSpec]):
     # that pages in question of a dictionary format that is not
     # compatible.
     def name(self) -> str:
-        return self._["name"]
+        return self.config.name
 
     def title(self) -> str:
-        return self._["title"]
+        return self.config.title
 
     def description(self) -> str:
-        try:
-            return self._["description"]
-        except KeyError:
-            return ""
+        return self.config.description
 
     def is_hidden(self) -> bool:
         return False
@@ -301,13 +333,11 @@ class Base(abc.ABC, Generic[_T_BaseSpec]):
 
     @classmethod
     @abc.abstractmethod
-    def type_name(cls) -> str:
-        ...
+    def type_name(cls) -> str: ...
 
     @classmethod
     @abc.abstractmethod
-    def type_icon(cls) -> Icon:
-        ...
+    def type_icon(cls) -> Icon: ...
 
 
 # .
@@ -324,9 +354,7 @@ class Base(abc.ABC, Generic[_T_BaseSpec]):
 #   |  Examples: views, dashboards, graphs collections                     |
 #   '----------------------------------------------------------------------'
 
-_T_OverridableSpec = TypeVar("_T_OverridableSpec", bound=OverridableSpec)
-# TODO: May be replaced with Self once we are with Python 3.11
-_Self = TypeVar("_Self", bound="Overridable")
+_T_OverridableConfig = TypeVar("_T_OverridableConfig", bound=OverridableConfig)
 _T = TypeVar("_T", bound="Overridable")
 
 InstanceId = tuple[UserId, str]
@@ -400,11 +428,17 @@ class OverridableInstances(Generic[_T]):
             return foreign
         return None
 
+    def find_foreign_page(self, owner: UserId, name: str) -> _T | None:
+        try:
+            return self.instance((UserId(owner), name))
+        except KeyError:
+            return None
+
     def pages(self) -> list[_T]:
         """Return all pages visible to the user, implements shadowing etc."""
         pages = {}
 
-        # Builtin pages
+        # Built-in pages
         for page in self.instances():
             if page.is_published_to_me() and page.may_see() and page.is_builtin():
                 pages[page.name()] = page
@@ -430,20 +464,15 @@ class OverridableInstances(Generic[_T]):
         return [(page.name(), page.title()) for page in self.pages()]
 
 
-class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
+class Overridable(Base[_T_OverridableConfig]):
     # Default values for the creation dialog can be overridden by the
     # sub class.
     @classmethod
-    def default_name(cls: type[_Self], instances: OverridableInstances[_Self]) -> str:
+    def default_name(cls, instances: OverridableInstances[Self]) -> str:
         return unique_default_name_suggestion(
             cls.type_name(),
             (instance.name() for instance in instances.instances()),
         )
-
-    def __init__(self, d: _T_OverridableSpec) -> None:
-        if "public" not in d:
-            d["public"] = False
-        super().__init__(d)
 
     @classmethod
     def parameters(cls, mode: PageMode) -> list[tuple[str, list[tuple[float, str, ValueSpec]]]]:
@@ -452,14 +481,14 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
         if is_user_with_publish_permissions("pagetype", user.id, cls.type_name()):
             vs_visibility: ValueSpec = Optional(
                 title=_("Visibility"),
-                label=_("Make this %s available for other users") % cls.phrase("title"),
+                label=_("Make this %s available for other users") % cls.phrase("title").lower(),
                 none_label=_("Don't publish to other users"),
                 valuespec=PublishTo(
                     publish_all=cls.has_overriding_permission("publish"),
                     publish_groups=cls.has_overriding_permission("publish_to_groups"),
                     publish_sites=cls.has_overriding_permission("publish_to_sites"),
-                    title="",
                     type_title=cls.phrase("title"),
+                    title="",
                     with_foreign_groups=cls.has_overriding_permission("publish_to_foreign_groups"),
                 ),
             )
@@ -471,7 +500,7 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
 
         return parameters + [
             (
-                _("General Properties"),
+                _("General properties"),
                 [
                     (2.2, "public", vs_visibility),
                 ],
@@ -479,13 +508,12 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
         ]
 
     @classmethod
-    def page_handlers(cls: type[_Self]) -> dict[str, cmk.gui.pages.PageHandlerFunc]:
+    def page_handlers(cls) -> dict[str, cmk.gui.pages.PageHandlerFunc]:
         handlers = super().page_handlers()
         handlers.update(
             {
-                "%ss" % cls.type_name(): lambda: ListPage[_Self](cls).page(),
-                "edit_%s"
-                % cls.type_name(): lambda: EditPage[_T_OverridableSpec, _Self](cls).page(),
+                "%ss" % cls.type_name(): lambda: ListPage(cls).page(),
+                "edit_%s" % cls.type_name(): lambda: EditPage(cls).page(),
             }
         )
         return handlers
@@ -501,17 +529,16 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
 
         This does not only need a flag in the page itself, but also the
         permission from its owner to publish it."""
-        if self._["public"] is False:
-            return False
-
-        return self.publish_is_allowed()
+        return False if not self.config.public else self.publish_is_allowed()
 
     def publish_is_allowed(self) -> bool:
         """Whether publishing an element to other users is allowed by the owner"""
-        return not self.owner() or user_may(self.owner(), "general.publish_" + self.type_name())
+        return not self.owner() or is_user_with_publish_permissions(
+            "pagetype", self.owner(), self.type_name()
+        )
 
     def is_public_forced(self) -> bool:
-        """Whether the user is allowed to override builtin pagetypes"""
+        """Whether the user is allowed to override built-in pagetypes"""
         return self.is_public() and user_may(self.owner(), "general.force_" + self.type_name())
 
     def is_published_to_me(self) -> bool:
@@ -519,20 +546,17 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
         if not user.may("general.see_user_%s" % self.type_name()):
             return False
 
-        if self._["public"] is True:
+        if self.config.public is True:
             return self.publish_is_allowed()
 
-        if isinstance(self._["public"], tuple) and self._["public"][0] == "contact_groups":
-            if set(user.contact_groups).intersection(self._["public"][1]):
+        if isinstance(self.config.public, tuple):
+            if set(user.contact_groups).intersection(self.config.public[1]):
                 return self.publish_is_allowed()
 
         return False
 
     def is_hidden(self) -> bool:
-        try:
-            return self._["hidden"]
-        except KeyError:
-            return False
+        return self.config.hidden
 
     def is_builtin(self) -> bool:
         return not self.owner()
@@ -543,14 +567,11 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
     def is_mine_and_may_have_own(self) -> bool:
         return self.is_mine() and user.may("general.edit_" + self.type_name())
 
-    def render_title(self, instances: OverridableInstances[_Self]) -> str | HTML:
+    def render_title(self, instances: OverridableInstances[Self]) -> str | HTML:
         return _u(self.title())
 
-    def _can_be_linked(self, instances: OverridableInstances[_Self]) -> bool:
+    def _can_be_linked(self, instances: OverridableInstances[Self]) -> bool:
         """Whether or not the thing can be linked to"""
-        if self.is_hidden():
-            return False  # don't link to hidden things
-
         if self.is_mine():
             return True
 
@@ -567,7 +588,7 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
         return "general.edit_" + cls.type_name()
 
     def owner(self) -> UserId:
-        return UserId(self._["owner"])
+        return self.config.owner
 
     # Checks if the current user is allowed to see a certain page
     # TODO: Wie is die Semantik hier genau? Umsetzung vervollständigen!
@@ -622,14 +643,13 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
         return makeuri_contextless(request, http_vars, filename="edit_%s.py" % self.type_name())
 
     def clone_url(self) -> str:
-        backurl = urlencode(makeuri(request, []))
         return makeuri_contextless(
             request,
             [
                 ("owner", self.owner()),
                 ("load_name", self.name()),
                 ("mode", "clone"),
-                ("back", backurl),
+                ("back", makeuri_contextless(request, [])),
             ],
             filename="edit_%s.py" % self.type_name(),
         )
@@ -692,7 +712,7 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
                 section=PermissionSectionGeneral,
                 name="edit_" + cls.type_name(),
                 title=_l("Customize and use %s") % title_lower,
-                description=_l("Allows to create own %s, customize builtin %s and use them.")
+                description=_l("Allows to create own %s, customize built-in %s and use them.")
                 % (title_lower, title_lower),
                 defaults=["admin", "user"],
             )
@@ -764,8 +784,8 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
             Permission(
                 section=PermissionSectionGeneral,
                 name="force_" + cls.type_name(),
-                title=_l("Modify builtin %s") % title_lower,
-                description=_l("Make own published %s override builtin %s for all users.")
+                title=_l("Modify built-in %s") % title_lower,
+                description=_l("Make own published %s override built-in %s for all users.")
                 % (title_lower, title_lower),
                 defaults=["admin"],
             )
@@ -796,28 +816,24 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
         return user.may(f"general.{how}_{cls.type_name()}")
 
     @classmethod
-    def need_overriding_permission(cls) -> None:
-        if not cls.has_overriding_permission("edit"):
+    def need_overriding_permission(cls, permission_name: Literal["edit", "see_user"]) -> None:
+        if not cls.has_overriding_permission(permission_name):
             raise MKAuthException(
                 _("Sorry, you lack the permission. Operation: %s, table: %s")
-                % ("edit", cls.phrase("title_plural"))
+                % (permission_name, cls.phrase("title_plural"))
             )
 
     @classmethod
-    def builtin_pages(cls) -> Mapping[str, _T_OverridableSpec]:
+    def builtin_pages(cls) -> Mapping[str, _T_OverridableConfig]:
         return {}
 
     @classmethod
-    def load(cls: type[_Self]) -> OverridableInstances[_Self]:
-        instances = OverridableInstances[_Self]()
+    def load_raw(cls) -> Mapping[InstanceId, dict[str, object]]:
+        # For (config) updates we need the raw data.
+        # We use 'dict' for the (inner) page_dict in order to allow in-place modifications
+        # for simplicity.
+        page_dicts_by_instance_id: dict[InstanceId, dict[str, object]] = {}
 
-        # First load builtin pages. Set username to ''
-        for name, page_dict in cls.builtin_pages().items():
-            page_dict = cls._transform_old_spec(page_dict)
-            new_page = cls(page_dict)
-            instances.add_instance((page_dict["owner"], name), new_page)
-
-        # Now scan users subdirs for files "user_$type_name.mk"
         with suppress(FileNotFoundError):
             for profile_path in cmk.utils.paths.profile_dir.iterdir():
                 try:
@@ -834,77 +850,90 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
                     if not userdb.user_exists(user_id):
                         continue
 
-                    user_pages = store.try_load_file_from_pickle_cache(path, default={})
+                    user_pages = store.try_load_file_from_pickle_cache(
+                        path,
+                        default={},
+                        temp_dir=cmk.utils.paths.tmp_dir,
+                        root_dir=cmk.utils.paths.omd_root,
+                    )
                     for name, page_dict in user_pages.items():
                         page_dict["owner"] = user_id
                         page_dict["name"] = name
-                        page_dict = cls._transform_old_spec(page_dict)
-
-                        instances.add_instance((user_id, name), cls(page_dict))
+                        page_dicts_by_instance_id[(user_id, name)] = page_dict
 
                 except SyntaxError as e:
                     raise MKGeneralException(
                         _("Cannot load %s from %s: %s") % (cls.type_name(), path, e)
                     )
 
-        cls._load(instances)
+        return page_dicts_by_instance_id
+
+    @classmethod
+    def load(cls) -> OverridableInstances[Self]:
+        instances = OverridableInstances[Self]()
+
+        # First load built-in pages. Set username to ''
+        for name, page_config in cls.builtin_pages().items():
+            new_page = cls(page_config)
+            instances.add_instance((page_config.owner, name), new_page)
+
+        # Now scan users subdirs for files "user_$type_name.mk"
+        for (user_id, name), raw_page_dict in cls.load_raw().items():
+            instances.add_instance((user_id, name), cls.deserialize(raw_page_dict))
+
         cls._declare_instance_permissions(instances)
         return instances
 
-    # TODO: Clean this up
     @classmethod
-    def _load(cls, instances: OverridableInstances[_Self]) -> None:
-        """Custom method to load e.g. old configs
-        after performing the loading of the regular files."""
-
-    @classmethod
-    def _transform_old_spec(cls, spec: dict) -> dict:
-        """May be used to transform old persisted data structures"""
-        return spec
-
-    @classmethod
-    def _declare_instance_permissions(cls, instances: OverridableInstances[_Self]) -> None:
+    def _declare_instance_permissions(cls, instances: OverridableInstances[Self]) -> None:
         for instance in instances.instances():
             if instance.is_public():
                 cls.declare_permission(instance)
 
     @classmethod
     def save_user_instances(
-        cls, instances: OverridableInstances[_Self], owner: UserId | None = None
+        cls, instances: OverridableInstances[Self], owner: UserId | None = None
     ) -> None:
         if not owner:
             owner = user.id
         assert owner is not None
 
         save_dict = {}
+        save_dict_by_owner: dict[UserId, dict[str, object]] = {}
         for page in instances.instances():
-            if page.owner() == owner:
-                save_dict[page.name()] = page.internal_representation()
+            if (page_owner := page.owner()) == owner:
+                save_dict[page.name()] = page.serialize()
+            elif LoggedInUser(owner).may("general.edit_foreign_%s" % cls.type_name()):
+                save_dict_by_owner.setdefault(page_owner, {}).setdefault(
+                    page.name(), page.serialize()
+                )
 
         save_user_file("user_%ss" % cls.type_name(), save_dict, owner)
+        for page_owner, save_dict_of_owner in save_dict_by_owner.items():
+            save_user_file("user_%ss" % cls.type_name(), save_dict_of_owner, page_owner)
 
-    def clone(self: _Self) -> _Self:
-        page_dict = self._.copy()
-        page_dict["owner"] = str(user.id) if user.id else ""
-        new_page = self.__class__(page_dict)
+    def clone(self) -> Self:
+        page_config = replace(self.config)
+        page_config.owner = user.id if user.id else UserId("")
+        new_page = self.__class__(page_config)
         return new_page
 
     @classmethod
-    def declare_permission(cls, page: _Self) -> None:
+    def declare_permission(cls, page: Self) -> None:
         permname = f"{cls.type_name()}.{page.name()}"
         if page.is_public() and permname not in permission_registry:
             permission_registry.register(
                 Permission(
                     section=permission_section_registry[cls.type_name()],
                     name=page.name(),
-                    title=page.title(),
+                    title=f"{page.title()} ({page.name()})",
                     description=page.description(),
                     defaults=default_authorized_builtin_role_ids,
                 )
             )
 
     @classmethod
-    def custom_list_buttons(cls, instance: _Self) -> None:
+    def custom_list_buttons(cls, instance: Self) -> None:
         pass
 
     # Override this in order to display additional columns of an instance
@@ -914,18 +943,18 @@ class Overridable(Base[_T_OverridableSpec], Generic[_T_OverridableSpec, _Self]):
 
     @classmethod
     def reserved_unique_ids(cls) -> list[str]:
-        """Used to exclude names from choosing as unique ID, e.g. builtin names
-        in sidebar snapins"""
+        """Used to exclude names from choosing as unique ID, e.g. built-in names
+        in sidebar snap-ins"""
         return []
 
 
-class ListPage(Page, Generic[_Self]):
-    def __init__(self, pagetype: type[_Self]) -> None:
+class ListPage(Page, Generic[_T]):
+    def __init__(self, pagetype: type[_T]) -> None:
         self._type = pagetype
 
     def page(self) -> None:
         instances = self._type.load()
-        self._type.need_overriding_permission()
+        self._type.need_overriding_permission("edit")
 
         title_plural = self._type.phrase("title_plural")
         breadcrumb = make_breadcrumb(title_plural, "list", self._type.list_url())
@@ -946,6 +975,7 @@ class ListPage(Page, Generic[_Self]):
                         ),
                         PageMenuEntry(
                             title=_("Delete selected"),
+                            name="delete",
                             icon_name="delete",
                             item=make_confirmed_form_submit_link(
                                 form_name="bulk_delete",
@@ -993,12 +1023,10 @@ class ListPage(Page, Generic[_Self]):
             try:
                 instances.remove_instance((owner, delname))
                 self._type.save_user_instances(instances, owner)
+                flash(_("Your %s has been deleted.") % pagetype_title)
                 html.reload_whole_page()
             except MKUserError as e:
                 html.user_error(e)
-
-            flash(_("Your %s has been deleted.") % pagetype_title)
-            html.reload_whole_page(self._type.list_url())
 
         elif request.var("_bulk_delete") and transactions.check_transaction():
             self._bulk_delete_after_confirm(instances)
@@ -1007,18 +1035,28 @@ class ListPage(Page, Generic[_Self]):
         for what, title, scope_instances in [
             ("my", _("Customized"), my_instances),
             ("foreign", _("Owned by other users"), foreign_instances),
-            ("builtin", _("Builtin"), builtin_instances),
+            ("builtin", _("Built-in"), builtin_instances),
         ]:
             if scope_instances:
-                self._show_table(instances, what, title, scope_instances)
+                html.h3(title, class_="table")
 
+                if what != "builtin":
+                    with html.form_context("bulk_delete", method="POST"):
+                        self._show_table(instances, scope_instances, deletable=True)
+                        html.hidden_field("selection_id", SelectionId.from_request(request))
+                        html.hidden_fields()
+                        init_rowselect(self._type.type_name())
+                else:
+                    self._show_table(instances, scope_instances)
+
+        html.javascript("cmk.page_menu.check_menu_entry_by_checkboxes('delete')")
         html.footer()
 
     @classmethod
     def _partition_instances(
         cls,
-        instances: OverridableInstances[_Self],
-    ) -> tuple[list[_Self], list[_Self], list[_Self]]:
+        instances: OverridableInstances[_T],
+    ) -> tuple[list[_T], list[_T], list[_T]]:
         my_instances, foreign_instances, builtin_instances = [], [], []
 
         for instance in instances.instances_sorted():
@@ -1032,7 +1070,7 @@ class ListPage(Page, Generic[_Self]):
 
         return my_instances, foreign_instances, builtin_instances
 
-    def _bulk_delete_after_confirm(self, instances: OverridableInstances[_Self]) -> None:
+    def _bulk_delete_after_confirm(self, instances: OverridableInstances[_T]) -> None:
         to_delete: list[tuple[UserId, str]] = []
         for varname, _value in request.itervars(prefix="_c_"):
             if html.get_checkbox(varname):
@@ -1048,52 +1086,48 @@ class ListPage(Page, Generic[_Self]):
         for owner in {e[0] for e in to_delete}:
             self._type.save_user_instances(instances, owner)
 
-        flash(_("The selected %s have been deleted.") % self._type.phrase("title_plural"))
-        html.reload_whole_page(self._type.list_url())
+        if len(to_delete) > 1:
+            flash(_("Selected %s have been deleted.") % self._type.phrase("title_plural").lower())
+        elif len(to_delete) == 1:
+            flash(_("%s has been deleted.") % self._type.phrase("title"))
+
+        html.reload_whole_page()
 
     def _show_table(
         self,
-        instances: OverridableInstances[_Self],
-        what: str,
-        title: str,
-        scope_instances: Sequence[Overridable],
+        instances: OverridableInstances[_T],
+        scope_instances: Sequence[_T],
+        deletable: bool = False,
     ) -> None:
-        html.h3(title, class_="table")
-
-        if what != "builtin":
-            html.begin_form("bulk_delete", method="POST")
-
         with table_element(limit=None) as table:
             for instance in scope_instances:
                 table.row()
 
-                if what != "builtin" and instance.may_delete():
+                if deletable and instance.may_delete():
                     table.cell(
                         html.render_input(
                             "_toggle_group",
                             type_="button",
                             class_="checkgroup",
-                            onclick="cmk.selection.toggle_all_rows(this.form);",
+                            onclick="cmk.selection.toggle_all_rows(this.form);"
+                            "cmk.page_menu.check_menu_entry_by_checkboxes('delete')",
                             value="X",
                         ),
                         sortable=False,
                         css=["checkbox"],
                     )
-                    html.checkbox(f"_c_{instance.owner()}+{instance.name()}")
+                    html.checkbox(
+                        f"_c_{instance.owner()}+{instance.name()}",
+                        onclick="cmk.page_menu.check_menu_entry_by_checkboxes('delete')",
+                        class_="page_checkbox",
+                    )
 
                 # Actions
                 table.cell(_("Actions"), css=["buttons visuals"])
 
                 # View
                 if isinstance(instance, PageRenderer):
-                    html.icon_button(instance.page_url(), _("View"), self._type.type_name())
-
-                # Clone / Customize
-                html.icon_button(instance.clone_url(), _("Create a private copy of this"), "clone")
-
-                # Delete
-                if instance.may_delete():
-                    html.icon_button(instance.delete_url(), _("Delete!"), "delete")
+                    html.icon_button(instance.view_url(), _("View"), self._type.type_name())
 
                 # Edit
                 if instance.may_edit():
@@ -1101,12 +1135,19 @@ class ListPage(Page, Generic[_Self]):
 
                 self._type.custom_list_buttons(instance)
 
+                # Clone / Customize
+                html.icon_button(instance.clone_url(), _("Create a private copy of this"), "clone")
+
+                # Delete
+                if instance.may_delete():
+                    html.icon_button(instance.delete_url(), _("Delete"), "delete")
+
                 # Internal ID of instance (we call that 'name')
                 table.cell(_("ID"), instance.name(), css=["narrow"])
 
                 # Title
                 table.cell(_("Title"))
-                html.write_text(instance.render_title(instances))
+                html.write_text_permissive(instance.render_title(instances))
                 html.help(_u(instance.description()))
 
                 # Custom columns specific to that page type
@@ -1115,30 +1156,26 @@ class ListPage(Page, Generic[_Self]):
                 # Owner
                 table.cell(
                     _("Owner"),
-                    HTMLWriter.render_i(_("builtin"))
-                    if instance.is_builtin()
-                    else instance.owner(),
+                    (
+                        HTMLWriter.render_i(_("built-in"))
+                        if instance.is_builtin()
+                        else instance.owner()
+                    ),
                 )
                 table.cell(_("Public"), _("yes") if instance.is_public() else _("no"))
                 table.cell(_("Hidden"), _("yes") if instance.is_hidden() else _("no"))
 
-        if what != "builtin":
-            html.hidden_field("selection_id", weblib.selection_id())
-            html.hidden_fields()
-            html.end_form()
-            init_rowselect(self._type.type_name())
 
-
-class EditPage(Page, Generic[_T_OverridableSpec, _Self]):
-    def __init__(self, pagetype: type[_Self]) -> None:
+class EditPage(Page, Generic[_T_OverridableConfig, _T]):
+    def __init__(self, pagetype: type[_T]) -> None:
         self._type = pagetype
 
-    def page(self) -> None:  # pylint: disable=too-many-branches
+    def page(self) -> None:
         """Page for editing an existing page, or creating a new one"""
         back_url = request.get_url_input("back", self._type.list_url())
 
         instances = self._type.load()
-        self._type.need_overriding_permission()
+        self._type.need_overriding_permission("edit")
 
         raw_mode = request.get_ascii_input_mandatory("mode", "edit")
         mode: PageMode
@@ -1155,7 +1192,7 @@ class EditPage(Page, Generic[_T_OverridableSpec, _Self]):
         title = self._type.phrase(mode)
         if mode == "create":
             page_name = ""
-            page_dict = {
+            page_dict: dict[str, object] = {
                 "name": self._type.default_name(instances),
                 "topic": self._type.default_topic(),
             }
@@ -1168,7 +1205,7 @@ class EditPage(Page, Generic[_T_OverridableSpec, _Self]):
                     None, _("The requested %s does not exist") % self._type.phrase("title")
                 )
 
-            page_dict = page.internal_representation()
+            page_dict = page.serialize()
             if mode == "edit":
                 if not page.may_edit():
                     raise MKAuthException(
@@ -1177,12 +1214,11 @@ class EditPage(Page, Generic[_T_OverridableSpec, _Self]):
                     )
             else:  # clone
                 page_dict = copy.deepcopy(page_dict)
-                page_dict["name"] += "_clone"
+                page_dict["name"] = f"{page_dict['name']}_clone"
                 assert user.id is not None
                 page_dict["owner"] = str(user.id)
                 owner_id = user.id
-
-        breadcrumb = make_breadcrumb(title, mode, self._type.list_url())
+        breadcrumb = make_breadcrumb(title, mode, self._type.list_url(), self._type.phrase("title"))
         page_menu = make_edit_form_page_menu(
             breadcrumb,
             dropdown_name=self._type.type_name(),
@@ -1200,7 +1236,7 @@ class EditPage(Page, Generic[_T_OverridableSpec, _Self]):
         parameters, keys_by_topic = self._collect_parameters(mode)
 
         vs = Dictionary(
-            title=_("General Properties"),
+            title=_("General properties"),
             render="form",
             optional_keys=False,
             elements=parameters,
@@ -1219,6 +1255,7 @@ class EditPage(Page, Generic[_T_OverridableSpec, _Self]):
                 vs.validate_value(new_page_dict, varprefix)
             except MKUserError as e:
                 user_errors.add(e)
+                new_page_dict = {}
 
             # Take over keys from previous value that are specific to the page type
             # and not edited here.
@@ -1228,46 +1265,40 @@ class EditPage(Page, Generic[_T_OverridableSpec, _Self]):
                 page_dict = new_page_dict
                 page_dict["owner"] = str(user.id)  # because is not in vs elements
 
-            # Since we have no way to parse the raw dictionary and Dictionary is also not typable,
-            # we need to hope here that page_dict fits with _T_OverridableSpec. On the mission to at
-            # least add some typing to `self._`, we take this shortcut for now. There are way bigger
-            # problems in this class hierarchy than the edit dialog we should solve first.
-            # TODO: Find a way to clean it up.
-            new_page = self._type(cast(_T_OverridableSpec, page_dict))
-
             if not user_errors:
+                new_page = self._type.deserialize(page_dict)
+
                 instances.add_page(new_page)
                 self._type.save_user_instances(instances, owner_id)
-                if mode == "create":
-                    redirect_url = new_page.after_create_url() or back_url
+                if request.var("save_and_view"):
+                    redirect_url = new_page.after_create_url() or makeuri_contextless(
+                        request,
+                        [("name", new_page.name())],
+                        filename="%s.py" % self._type.type_name(),
+                    )
                 else:
                     redirect_url = back_url
-
-                flash(_("Your changes haven been saved."))
+                    flash(_("Your changes have been saved."))
 
                 # Reload sidebar.TODO: This code logically belongs to PageRenderer. How
                 # can we simply move it there?
                 # TODO: This is not true for all cases. e.g. the BookmarkList is not
-                # of type PageRenderer but has a dedicated sidebar snapin. Maybe
+                # of type PageRenderer but has a dedicated sidebar snap-in. Maybe
                 # the best option would be to make a dedicated method to decide whether
                 # or not to reload the sidebar.
-                if not page_dict.get("hidden") or new_page_dict.get("hidden") != page_dict.get(
-                    "hidden"
-                ):
-                    html.reload_whole_page(redirect_url)
+                html.reload_whole_page(redirect_url)
 
         else:
             html.show_localization_hint()
 
         html.show_user_errors()
 
-        html.begin_form("edit", method="POST")
-        html.help(vs.help())
-        vs.render_input(varprefix, page_dict)
-        # Should be ignored by hidden_fields, but I do not dare to change it there
-        request.del_var("filled_in")
-        html.hidden_fields()
-        html.end_form()
+        with html.form_context("edit", method="POST"):
+            html.help(vs.help())
+            vs.render_input(varprefix, page_dict)
+            # Should be ignored by hidden_fields, but I do not dare to change it there
+            request.del_var("filled_in")
+            html.hidden_fields()
         html.footer()
 
     def _collect_parameters(
@@ -1296,10 +1327,12 @@ class EditPage(Page, Generic[_T_OverridableSpec, _Self]):
         return parameters, keys_by_topic
 
 
-def make_breadcrumb(title: str, page_name: str, list_url: str) -> Breadcrumb:
+def make_breadcrumb(
+    title: str, page_name: str, list_url: str, parent_title: str | None = None
+) -> Breadcrumb:
     breadcrumb = make_main_menu_breadcrumb(mega_menu_registry.menu_customize())
 
-    breadcrumb.append(BreadcrumbItem(title=title, url=list_url))
+    breadcrumb.append(BreadcrumbItem(title=parent_title or title, url=list_url))
 
     if page_name == "list":  # The list is the parent of all others
         return breadcrumb
@@ -1357,14 +1390,14 @@ def _page_menu_entries_related(current_type_name: str) -> Iterator[PageMenuEntry
     for other_type_name, other_pagetype in page_types.items():
         if current_type_name != other_type_name:
             yield PageMenuEntry(
-                title=other_pagetype.phrase("title_plural").title(),
+                title=other_pagetype.phrase("title_plural"),
                 icon_name=other_type_name,
                 item=make_simple_link("%ss.py" % other_type_name),
             )
 
 
 def _has_reporting() -> bool:
-    return not cmk_version.is_raw_edition()
+    return edition(cmk.utils.paths.omd_root) is not Edition.CRE
 
 
 def vs_no_permission_to_publish(type_title: str, title: str) -> FixedValue:
@@ -1380,12 +1413,12 @@ def PublishTo(
     publish_all: bool,
     publish_groups: bool,
     publish_sites: bool,
+    type_title: str,
     title: str | None = None,
-    type_title: str | None = None,
     with_foreign_groups: bool = True,
 ) -> CascadingDropdown:
     if title is None:
-        title = _("Make this %s available for other users") % type_title
+        title = _("Make this %s available for other users") % type_title.lower()
 
     choices: list[CascadingDropdownChoice] = []
     if publish_all:
@@ -1438,10 +1471,10 @@ def make_edit_form_page_menu(
         dropdowns=[
             PageMenuDropdown(
                 name=dropdown_name,
-                title=type_title.title(),
+                title=type_title.capitalize(),
                 topics=[
                     PageMenuTopic(
-                        title=_("Save this %s and go to") % type_title,
+                        title=_("Actions"),
                         entries=list(
                             _page_menu_entries_save(
                                 breadcrumb,
@@ -1479,10 +1512,6 @@ _save_pagetype_icons: dict[str, Icon] = {
         "emblem": "time",
     },
     "graph_collection": "save_graph",
-    "graph_tuning": {
-        "icon": "save_graph",
-        "emblem": "settings",
-    },
     "view": "save_view",
 }
 
@@ -1497,13 +1526,13 @@ def _page_menu_entries_save(
 ) -> Iterator[PageMenuEntry]:
     """Provide the different "save" buttons"""
     yield PageMenuEntry(
-        title=_("List of %s") % type_title_plural,
+        title=_("Save & view list"),
         icon_name="save",
         item=make_form_submit_link(form_name, "_save"),
         is_list_entry=True,
         is_shortcut=True,
         is_suggested=True,
-        shortcut_title=_("Save & go to list"),
+        shortcut_title=_("Save & view list"),
         css_classes=["submit"],
     )
 
@@ -1524,7 +1553,7 @@ def _page_menu_entries_save(
         title=_("Cancel"),
         icon_name="cancel",
         item=make_simple_link(parent_item.url),
-        is_list_entry=False,
+        is_list_entry=True,
         is_shortcut=True,
         is_suggested=True,
     )
@@ -1590,14 +1619,15 @@ def ContactGroupChoice(with_foreign_groups: bool) -> DualListChoice:
 #   |  graphs.                                                             |
 #   '----------------------------------------------------------------------'
 
-_T_OverridableContainerSpec = TypeVar("_T_OverridableContainerSpec", bound=OverridableContainerSpec)
+_T_OverridableContainerConfig = TypeVar(
+    "_T_OverridableContainerConfig", bound=OverridableContainerConfig
+)
 
 
-class OverridableContainer(Overridable[_T_OverridableContainerSpec, _Self]):
+class OverridableContainer(Overridable[_T_OverridableContainerConfig]):
     @classmethod
     @abc.abstractmethod
-    def may_contain(cls, element_type_name: str) -> bool:
-        ...
+    def may_contain(cls, element_type_name: str) -> bool: ...
 
     @classmethod
     def page_menu_add_to_topics(cls, added_type: str) -> list[PageMenuTopic]:
@@ -1616,14 +1646,13 @@ class OverridableContainer(Overridable[_T_OverridableContainerSpec, _Self]):
         ]
 
     @classmethod
-    def _page_menu_add_to_entries(cls, pages: list[_Self]) -> Iterator[PageMenuEntry]:
+    def _page_menu_add_to_entries(cls, pages: list[Self]) -> Iterator[PageMenuEntry]:
         for page in pages:
             yield PageMenuEntry(
                 title=page.title(),
                 icon_name=cls.type_name(),
                 item=make_javascript_link(
-                    "cmk.popup_menu.pagetype_add_to_container(%s, %s);"
-                    % (json.dumps(cls.type_name()), json.dumps(page.name()))
+                    f"cmk.popup_menu.pagetype_add_to_container({json.dumps(cls.type_name())}, {json.dumps(page.name())});"
                 ),
             )
 
@@ -1659,15 +1688,16 @@ class OverridableContainer(Overridable[_T_OverridableContainerSpec, _Self]):
         if target_page:
             if not isinstance(target_page, str):
                 target_page = target_page.page_url()
-            html.write_text(target_page)
-        html.write_text("\n%s" % ("true" if need_sidebar_reload else "false"))
+
+        response.set_content_type("text/plain")
+        response.set_data(f"{target_page or ''}\n{'true' if need_sidebar_reload else 'false'}")
 
     # Default implementation for generic containers - used e.g. by GraphCollection
     @classmethod
     def add_element_via_popup(
-        cls: type[_Self], page_name: str, element_type: str, create_info: ElementSpec
+        cls, page_name: str, element_type: str, create_info: ElementSpec
     ) -> tuple[str | None, bool]:
-        cls.need_overriding_permission()
+        cls.need_overriding_permission("edit")
 
         need_sidebar_reload = False
         instances = cls.load()
@@ -1688,24 +1718,19 @@ class OverridableContainer(Overridable[_T_OverridableContainerSpec, _Self]):
         # With a redirect directly to the page afterwards do it like this:
         # return page, need_sidebar_reload
 
-    def __init__(self, d: _T_OverridableContainerSpec) -> None:
-        if "elements" not in d:
-            d["elements"] = []
-        super().__init__(d)
-
     def elements(self) -> Sequence[ElementSpec]:
-        return self._["elements"]
+        return self.config.elements
 
     def remove_element(self, nr: int) -> None:
-        del self._["elements"][nr]
+        del self.config.elements[nr]
 
     def add_element(self, element: ElementSpec) -> None:
-        self._["elements"].append(element)
+        self.config.elements.append(element)
 
     def move_element(self, nr: int, whither: int) -> None:
-        el = self._["elements"][nr]
-        del self._["elements"][nr]
-        self._["elements"][whither:whither] = [el]
+        el = self.config.elements[nr]
+        del self.config.elements[nr]
+        self.config.elements[whither:whither] = [el]
 
     def is_empty(self) -> bool:
         return not self.elements()
@@ -1720,15 +1745,14 @@ class OverridableContainer(Overridable[_T_OverridableContainerSpec, _Self]):
 #   |              |___/                                                   |
 #   +----------------------------------------------------------------------+
 #   |  Base class for all things that have an URL and can be rendered as   |
-#   |  an HTML page. And that can be added to the sidebar snapin of all    |
-#   |  pages.
+#   |  an HTML page. And that can be added to the sidebar snap-in of all   |
+#   |  pages.                                                              |
 #   '----------------------------------------------------------------------'
 
-_T_PageRendererSpec = TypeVar("_T_PageRendererSpec", bound=PageRendererSpec)
-_SelfPageRenderer = TypeVar("_SelfPageRenderer", bound="PageRenderer")
+_T_PageRendererConfig = TypeVar("_T_PageRendererConfig", bound=PageRendererConfig)
 
 
-class PageRenderer(OverridableContainer[_T_PageRendererSpec, _SelfPageRenderer]):
+class PageRenderer(OverridableContainer[_T_PageRendererConfig]):
     # Stuff to be overridden by the implementation of actual page types
 
     # Attribute for identifying that page when building an URL to
@@ -1766,6 +1790,8 @@ class PageRenderer(OverridableContainer[_T_PageRendererSpec, _SelfPageRenderer])
                         Integer(
                             title=_("Sort index"),
                             default_value=99,
+                            minvalue=1,
+                            maxvalue=65535,
                             help=_(
                                 "You can customize the order of the %s by changing "
                                 "this number. Lower numbers will be sorted first. "
@@ -1795,7 +1821,9 @@ class PageRenderer(OverridableContainer[_T_PageRendererSpec, _SelfPageRenderer])
                         "hidden",
                         Checkbox(
                             title=_("Sidebar integration"),
-                            label=_("Do not add a link to this page in sidebar"),
+                            label=_(
+                                "Do not add a link to this page in sidebar and in monitor menu."
+                            ),
                         ),
                     ),
                 ],
@@ -1803,16 +1831,6 @@ class PageRenderer(OverridableContainer[_T_PageRendererSpec, _SelfPageRenderer])
         ]
 
         return parameters
-
-    @classmethod
-    def _transform_old_spec(cls, spec: dict) -> dict:
-        spec.setdefault("sort_index", 99)
-        spec.setdefault("is_show_more", False)
-
-        spec.setdefault("context", {})
-        spec.setdefault("add_context_to_title", False)
-
-        return spec
 
     @classmethod
     def page_handlers(cls) -> dict[str, cmk.gui.pages.PageHandlerFunc]:
@@ -1826,14 +1844,22 @@ class PageRenderer(OverridableContainer[_T_PageRendererSpec, _SelfPageRenderer])
 
     @classmethod
     @abc.abstractmethod
-    def page_show(cls) -> None:
-        ...
+    def page_show(cls) -> None: ...
 
     @classmethod
-    def requested_page(
-        cls, instances: OverridableInstances[_SelfPageRenderer]
-    ) -> _SelfPageRenderer:
-        name = request.get_ascii_input_mandatory(cls.ident_attr(), "")
+    def requested_page(cls, instances: OverridableInstances[Self]) -> Self:
+        return cls.requested_page_by_name(
+            instances,
+            request.get_ascii_input_mandatory(cls.ident_attr(), ""),
+        )
+
+    @classmethod
+    def requested_page_by_name(cls, instances: OverridableInstances[Self], name: str) -> Self:
+        if owner := request.get_validated_type_input(UserId, "owner"):
+            cls.need_overriding_permission("see_user")
+            if foreign := instances.find_foreign_page(owner, name):
+                return foreign
+
         page = instances.find_page(name)
         if not page:
             raise MKGeneralException(
@@ -1842,22 +1868,13 @@ class PageRenderer(OverridableContainer[_T_PageRendererSpec, _SelfPageRenderer])
         return page
 
     def topic(self) -> str:
-        try:
-            return self._["topic"]
-        except KeyError:
-            return "other"
+        return self.config.topic
 
     def sort_index(self) -> int:
-        try:
-            return self._["sort_index"]
-        except KeyError:
-            return 99
+        return self.config.sort_index
 
     def is_show_more(self) -> bool:
-        try:
-            return self._["is_show_more"]
-        except KeyError:
-            return False
+        return self.config.is_show_more
 
     # Helper functions for page handlers and render function
     def page_header(self) -> str:
@@ -1870,10 +1887,37 @@ class PageRenderer(OverridableContainer[_T_PageRendererSpec, _SelfPageRenderer])
             filename="%s.py" % self.type_name(),
         )
 
-    def render_title(self, instances: OverridableInstances[_SelfPageRenderer]) -> str | HTML:
+    def view_url(self) -> str:
+        http_vars: HTTPVariables = [(self.ident_attr(), self.name())]
+        if not self.is_mine():
+            http_vars.append(("owner", self.owner()))
+        return makeuri_contextless(request, http_vars, filename="%s.py" % self.type_name())
+
+    def render_title(self, instances: OverridableInstances[Self]) -> str | HTML:
         if self._can_be_linked(instances):
             return HTMLWriter.render_a(self.title(), href=self.page_url())
         return super().render_title(instances)
+
+    def to_visual(self) -> Visual:
+        return {
+            "owner": self.config.owner,
+            "name": self.config.name,
+            "context": {},
+            "single_infos": [],
+            "add_context_to_title": False,
+            "title": self.config.title,
+            "description": self.config.description,
+            "topic": self.config.topic,
+            "sort_index": self.config.sort_index,
+            "is_show_more": self.config.is_show_more,
+            "icon": None,
+            "hidden": self.config.hidden,
+            "hidebutton": False,
+            "public": False if self.config.public is None else self.config.public,
+            "packaged": False,
+            "link_from": {},
+            "megamenu_search_terms": [],
+        }
 
 
 # .
@@ -1936,7 +1980,39 @@ def page_menu_add_to_topics(added_type: str) -> list[PageMenuTopic]:
 #   '----------------------------------------------------------------------'
 
 
-class PagetypeTopics(Overridable[PagetypeTopicSpec, "PagetypeTopics"]):
+class PagetypeTopics(Overridable[PagetypeTopicConfig]):
+    @classmethod
+    def deserialize(cls, page_dict: Mapping[str, object]) -> Self:
+        deserialized = PagetypeTopicModel.model_validate(page_dict)
+        return cls(
+            PagetypeTopicConfig(
+                name=deserialized.name,
+                title=deserialized.title,
+                description=deserialized.description,
+                owner=deserialized.owner,
+                public=deserialized.public,
+                hidden=deserialized.hidden,
+                icon_name=deserialized.icon_name,
+                sort_index=deserialized.sort_index,
+                max_entries=deserialized.max_entries,
+                hide=deserialized.hide,
+            )
+        )
+
+    def serialize(self) -> dict[str, object]:
+        return PagetypeTopicModel(
+            name=self.config.name,
+            title=self.config.title,
+            description=self.config.description,
+            owner=self.config.owner,
+            public=self.config.public,
+            hidden=self.config.hidden,
+            icon_name=self.config.icon_name,
+            sort_index=self.config.sort_index,
+            max_entries=self.config.max_entries,
+            hide=self.config.hide,
+        ).model_dump()
+
     @classmethod
     def type_name(cls) -> str:
         return "pagetype_topic"
@@ -2008,146 +2084,157 @@ class PagetypeTopics(Overridable[PagetypeTopicSpec, "PagetypeTopics"]):
 
     def render_extra_columns(self, table: Table) -> None:
         """Show some specific useful columns in the list view"""
-        table.cell(_("Icon"), html.render_icon(self._["icon_name"]))
+        table.cell(_("Icon"), html.render_icon(self.config.icon_name))
         table.cell(_("Nr. of items"), str(self.max_entries()))
-        table.cell(_("Sort index"), str(self._["sort_index"]))
+        table.cell(_("Sort index"), str(self.config.sort_index))
 
     @classmethod
-    def builtin_pages(cls) -> Mapping[str, PagetypeTopicSpec]:
-        return {
-            "overview": {
-                "name": "overview",
-                "title": _("Overview"),
-                "icon_name": "topic_overview",
-                "description": "",
-                "public": True,
-                "sort_index": 20,
-                "owner": UserId.builtin(),
-            },
-            "monitoring": {
-                "name": "monitoring",
-                "title": _("Monitoring"),
-                "icon_name": "topic_monitoring",
-                "description": "",
-                "public": True,
-                "sort_index": 30,
-                "owner": UserId.builtin(),
-            },
-            "problems": {
-                "name": "problems",
-                "title": _("Problems"),
-                "icon_name": "topic_problems",
-                "description": "",
-                "public": True,
-                "sort_index": 40,
-                "owner": UserId.builtin(),
-            },
-            "history": {
-                "name": "history",
-                "title": _("History"),
-                "icon_name": "topic_history",
-                "description": "",
-                "public": True,
-                "sort_index": 50,
-                "owner": UserId.builtin(),
-            },
-            "analyze": {
-                "name": "analyze",
-                "title": _("System"),
-                "icon_name": "topic_checkmk",
-                "description": "",
-                "public": True,
-                "sort_index": 60,
-                "owner": UserId.builtin(),
-            },
-            "events": {
-                "name": "events",
-                "title": _("Event Console"),
-                "icon_name": "topic_events",
-                "description": "",
-                "public": True,
-                "sort_index": 70,
-                "owner": UserId.builtin(),
-            },
-            "cloud": {
-                "name": "cloud",
-                "title": _("Cloud"),
-                "icon_name": "plugins_cloud",
-                "description": "",
-                "public": True,
-                "sort_index": 75,
-                "owner": UserId.builtin(),
-            },
-            "bi": {
-                "name": "bi",
-                "title": _("Business Intelligence"),
-                "icon_name": "topic_bi",
-                "description": "",
-                "sort_index": 80,
-                "public": True,
-                "hide": _no_bi_aggregate_active(),
-                "owner": UserId.builtin(),
-            },
-            "applications": {
-                "name": "applications",
-                "title": _("Applications"),
-                "icon_name": "topic_applications",
-                "description": "",
-                "public": True,
-                "sort_index": 85,
-                "owner": UserId.builtin(),
-            },
-            "inventory": {
-                "name": "inventory",
-                "title": _("Inventory"),
-                "icon_name": "topic_inventory",
-                "description": "",
-                "public": True,
-                "sort_index": 90,
-                "owner": UserId.builtin(),
-            },
-            "network_statistics": {
-                "name": "network_statistics",
-                "title": _("Network statistics"),
-                "icon_name": "topic_network_statistics",
-                "description": "",
-                "sort_index": 95,
-                "public": True,
-                "hide": not is_ntop_configured(),
-                "owner": UserId.builtin(),
-            },
-            "my_workplace": {
-                "name": "my_workplace",
-                "title": _("Workplace"),
-                "icon_name": "topic_my_workplace",
-                "description": "",
-                "public": True,
-                "sort_index": 100,
-                "owner": UserId.builtin(),
-            },
+    def builtin_pages(cls) -> Mapping[str, PagetypeTopicConfig]:
+        topics: dict[str, PagetypeTopicConfig] = {
+            "overview": PagetypeTopicConfig(
+                name="overview",
+                title=_("Overview"),
+                icon_name="topic_overview",
+                public=True,
+                sort_index=20,
+                owner=UserId.builtin(),
+            ),
+            "monitoring": PagetypeTopicConfig(
+                name="monitoring",
+                title=_("Monitoring"),
+                icon_name="topic_monitoring",
+                public=True,
+                sort_index=30,
+                owner=UserId.builtin(),
+            ),
+            "problems": PagetypeTopicConfig(
+                name="problems",
+                title=_("Problems"),
+                icon_name="topic_problems",
+                public=True,
+                sort_index=40,
+                owner=UserId.builtin(),
+            ),
+            "history": PagetypeTopicConfig(
+                name="history",
+                title=_("History"),
+                icon_name="topic_history",
+                public=True,
+                sort_index=50,
+                owner=UserId.builtin(),
+            ),
+            "analyze": PagetypeTopicConfig(
+                name="analyze",
+                title=_("System"),
+                icon_name="topic_checkmk",
+                public=True,
+                sort_index=60,
+                owner=UserId.builtin(),
+            ),
+            "cloud": PagetypeTopicConfig(
+                name="cloud",
+                title=_("Cloud"),
+                icon_name="plugins_cloud",
+                public=True,
+                sort_index=75,
+                owner=UserId.builtin(),
+            ),
+            "bi": PagetypeTopicConfig(
+                name="bi",
+                title=_("Business Intelligence"),
+                icon_name="topic_bi",
+                sort_index=80,
+                public=True,
+                hide=_no_bi_aggregate_active(),
+                owner=UserId.builtin(),
+            ),
+            "applications": PagetypeTopicConfig(
+                name="applications",
+                title=_("Applications"),
+                icon_name="topic_applications",
+                public=True,
+                sort_index=85,
+                owner=UserId.builtin(),
+            ),
+            "inventory": PagetypeTopicConfig(
+                name="inventory",
+                title=_("HW/SW Inventory"),
+                icon_name="topic_inventory",
+                public=True,
+                sort_index=90,
+                owner=UserId.builtin(),
+            ),
+            "network_statistics": PagetypeTopicConfig(
+                name="network_statistics",
+                title=_("Network statistics"),
+                icon_name="topic_network_statistics",
+                sort_index=95,
+                public=True,
+                hide=not is_ntop_configured(),
+                owner=UserId.builtin(),
+            ),
+            "it_efficiency": PagetypeTopicConfig(
+                name="it_efficiency",
+                title=_("IT infrastructure efficiency"),
+                icon_name="topic_analyze",
+                description=_("Analyze the utilization of your IT infrastructure data center."),
+                public=True,
+                sort_index=100,
+                owner=UserId.builtin(),
+            ),
+            "synthetic_monitoring": PagetypeTopicConfig(
+                name="synthetic_monitoring",
+                title=_("Synthetic Monitoring"),
+                icon_name="synthetic_monitoring_topic",
+                public=True,
+                sort_index=105,
+                owner=UserId.builtin(),
+            ),
+            "my_workplace": PagetypeTopicConfig(
+                name="my_workplace",
+                title=_("Workplace"),
+                icon_name="topic_my_workplace",
+                public=True,
+                sort_index=110,
+                owner=UserId.builtin(),
+            ),
             # Only fallback for items without topic
-            "other": {
-                "name": "other",
-                "title": _("Other"),
-                "icon_name": "topic_other",
-                "description": "",
-                "public": True,
-                "sort_index": 105,
-                "owner": UserId.builtin(),
-            },
+            "other": PagetypeTopicConfig(
+                name="other",
+                title=_("Other"),
+                icon_name="topic_other",
+                public=True,
+                sort_index=115,
+                owner=UserId.builtin(),
+            ),
         }
+        if edition(cmk.utils.paths.omd_root) is not Edition.CSE:  # disabled in CSE
+            topics.update(
+                {
+                    "events": PagetypeTopicConfig(
+                        name="events",
+                        title=_("Event Console"),
+                        icon_name="topic_events",
+                        public=True,
+                        sort_index=70,
+                        owner=UserId.builtin(),
+                    )
+                }
+            )
+
+        return topics
 
     def max_entries(self) -> int:
-        return self._.get("max_entries", 10)
+        return self.config.max_entries
 
     def sort_index(self) -> int:
-        return self._["sort_index"]
+        return self.config.sort_index
 
     def icon_name(self) -> str:
-        return self._["icon_name"]
+        return self.config.icon_name
 
     def hide(self) -> bool:
-        return self._.get("hide", False)
+        return self.config.hide
 
     @classmethod
     def choices(cls) -> list[tuple[str, str]]:
@@ -2155,6 +2242,7 @@ class PagetypeTopics(Overridable[PagetypeTopicSpec, "PagetypeTopics"]):
         return [
             (p.name(), p.title())
             for p in sorted(instances.instances(), key=lambda p: p.sort_index())
+            if p.is_permitted()
         ]
 
     @classmethod
@@ -2162,7 +2250,11 @@ class PagetypeTopics(Overridable[PagetypeTopicSpec, "PagetypeTopics"]):
         """Returns either the requested topic or fallback to "other"."""
         instances = PagetypeTopics.load()
         other_page = instances.find_page("other")
-        assert other_page is not None
+        if not other_page:
+            raise MKUserError(
+                None,
+                _("No permission for fallback topic 'Other'. Please contact your administrator."),
+            )
         return instances.find_page(topic_id) or other_page
 
 
@@ -2191,43 +2283,56 @@ def _no_bi_aggregate_active() -> bool:
 
 def _customize_menu_topics() -> list[TopicMenuTopic]:
     general_items = []
-    monitoring_items = [
-        TopicMenuItem(
-            name="views",
-            title=_("Views"),
-            url="edit_views.py",
-            sort_index=10,
-            is_show_more=False,
-            icon="view",
-        ),
-        TopicMenuItem(
-            name="dashboards",
-            title=_("Dashboards"),
-            url="edit_dashboards.py",
-            sort_index=20,
-            is_show_more=False,
-            icon="dashboard",
-        ),
-    ]
+    monitoring_items = []
     graph_items = []
-    business_reporting_items = [
-        TopicMenuItem(
-            name="reports",
-            title=_("Reports"),
-            url="edit_reports.py",
-            sort_index=10,
-            is_show_more=True,
-            icon="report",
+    business_reporting_items = []
+
+    if user.may("general.edit_views"):
+        monitoring_items.append(
+            TopicMenuItem(
+                name="views",
+                title=_("Views"),
+                url="edit_views.py",
+                sort_index=10,
+                is_show_more=False,
+                icon="view",
+            ),
         )
-    ]
+
+    if user.may("general.edit_dashboards"):
+        monitoring_items.append(
+            TopicMenuItem(
+                name="dashboards",
+                title=_("Dashboards"),
+                url="edit_dashboards.py",
+                sort_index=20,
+                is_show_more=False,
+                icon="dashboard",
+            ),
+        )
+
+    if user.may("general.edit_reports"):
+        business_reporting_items.append(
+            TopicMenuItem(
+                name="reports",
+                title=_("Reports"),
+                url="edit_reports.py",
+                sort_index=10,
+                is_show_more=False,
+                icon="report",
+            )
+        )
 
     for index, page_type_ in enumerate(all_page_types().values()):
+        if not user.may(f"general.edit_{page_type_.type_name()}"):
+            continue
+
         item = TopicMenuItem(
             name=page_type_.type_name(),
             title=page_type_.phrase("title_plural"),
             url="%ss.py" % page_type_.type_name(),
             sort_index=40 + (index * 10),
-            is_show_more=page_type_.type_is_show_more(),
+            is_show_more=False,
             icon=page_type_.type_icon(),
         )
 
@@ -2274,15 +2379,23 @@ def _customize_menu_topics() -> list[TopicMenuTopic]:
     return topics
 
 
-mega_menu_registry.register(
-    MegaMenu(
-        name="customize",
-        title=_l("Customize"),
-        icon="main_customize",
-        sort_index=10,
-        topics=_customize_menu_topics,
-    )
-)
+def hide_customize_menu() -> bool:
+    permissions = [
+        "general.edit_pagetype_topic",
+        "general.edit_bookmark_list",
+        "general.edit_custom_snapin",
+        "general.edit_graph_collection",
+        "general.edit_graph_tuning",
+        "general.edit_custom_graph",
+        "general.edit_forecast_graph",
+        "general.edit_sla_configuration",
+        "general.edit_views",
+        "general.edit_dashboards",
+        "general.edit_reports",
+    ]
+
+    return not any(user.may(perm) for perm in permissions)
+
 
 #   .--Permissions---------------------------------------------------------.
 #   |        ____                     _         _                          |

@@ -6,7 +6,8 @@
 import typing
 from collections.abc import Iterable
 
-from cmk.base.check_api import check_levels, get_bytes_human_readable
+from cmk.agent_based.legacy.v0_unstable import check_levels
+from cmk.agent_based.v2 import render
 
 NULLMAILER_MAILQ_DEFAULT_LEVELS = {
     "deferred": (10, 20),
@@ -43,7 +44,7 @@ def check_single_queue(queue: Queue, levels_length: tuple[int, int]) -> Iterable
         queue.size,
         "size" if make_metric else None,
         None,
-        human_readable_func=get_bytes_human_readable,
+        human_readable_func=render.bytes,
         infoname="Size",
     )
 

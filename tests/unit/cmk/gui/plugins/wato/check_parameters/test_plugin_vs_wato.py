@@ -4,29 +4,34 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 import abc
+import logging
 import typing as t
+from pprint import pformat
 
-from cmk.base.api.agent_based.checking_classes import CheckPlugin
-from cmk.base.api.agent_based.inventory_classes import InventoryPlugin
-from cmk.base.api.agent_based.type_defs import ParametersTypeAlias
+from cmk.utils.check_utils import ParametersTypeAlias
+from cmk.utils.rulesets.definition import RuleGroup
 
-from cmk.gui.plugins.wato.inventory import RulespecGroupInventory
+from cmk.checkengine.inventory import InventoryPlugin
+
+from cmk.base.api.agent_based.plugin_classes import AgentBasedPlugins, CheckPlugin
+
+from cmk.gui.inventory import RulespecGroupInventory
 from cmk.gui.plugins.wato.utils import RulespecGroupCheckParametersDiscovery
+from cmk.gui.utils.rule_specs.legacy_converter import GENERATED_GROUP_PREFIX
+from cmk.gui.wato import RulespecGroupDiscoveryCheckParameters
 from cmk.gui.watolib.rulespecs import (
     CheckParameterRulespecWithItem,
     CheckParameterRulespecWithoutItem,
     Rulespec,
     rulespec_registry,
+    RulespecSubGroup,
 )
+
+logger = logging.getLogger(__name__)
 
 T = t.TypeVar("T")
 TF = t.TypeVar("TF", bound=Rulespec)
 TC = t.TypeVar("TC", bound=t.Union[CheckPlugin, InventoryPlugin])
-
-
-class FixRegister:  # TODO: make the original class importable?!
-    check_plugins: t.Dict[str, CheckPlugin]
-    inventory_plugins: t.Dict[str, InventoryPlugin]
 
 
 class MergeKey(t.NamedTuple):
@@ -82,32 +87,25 @@ class Base(t.Generic[T], abc.ABC):
 class BaseProtocol(t.Protocol):
     type: str
 
-    def get_name(self) -> str:
-        ...
+    def get_name(self) -> str: ...
 
-    def get_merge_name(self) -> str:
-        ...
+    def get_merge_name(self) -> str: ...
 
-    def get_description(self) -> str:
-        ...
+    def get_description(self) -> str: ...
 
-    def __eq__(self, other: object) -> bool:
-        ...
+    def __eq__(self, other: object) -> bool: ...
 
-    def __gt__(self, other: object) -> bool:
-        ...
+    def __gt__(self, other: object) -> bool: ...
 
 
 class WatoProtocol(BaseProtocol, t.Protocol):
     def validate_parameter(
         self, parameters: t.Optional[ParametersTypeAlias]
-    ) -> t.Optional[Exception]:
-        ...
+    ) -> t.Optional[Exception]: ...
 
 
 class PluginProtocol(BaseProtocol, t.Protocol):
-    def get_default_parameters(self) -> t.Optional[ParametersTypeAlias]:
-        ...
+    def get_default_parameters(self) -> t.Optional[ParametersTypeAlias]: ...
 
 
 class Plugin(Base[TC], abc.ABC):
@@ -118,8 +116,7 @@ class Plugin(Base[TC], abc.ABC):
         return str(self._element.name)
 
     @abc.abstractmethod
-    def get_default_parameters(self) -> t.Optional[ParametersTypeAlias]:
-        ...
+    def get_default_parameters(self) -> t.Optional[ParametersTypeAlias]: ...
 
 
 class PluginDiscovery(Plugin[CheckPlugin]):
@@ -137,11 +134,11 @@ class PluginInventory(Plugin[InventoryPlugin]):
     type = "inventory"
 
     def get_merge_name(self) -> str:
-        assert self._element.inventory_ruleset_name
-        return str(self._element.inventory_ruleset_name)
+        assert self._element.ruleset_name
+        return str(self._element.ruleset_name)
 
     def get_default_parameters(self) -> t.Optional[ParametersTypeAlias]:
-        return self._element.inventory_default_parameters
+        return self._element.defaults
 
 
 class PluginCheck(Plugin[CheckPlugin]):
@@ -200,21 +197,25 @@ class WatoCheck(Wato[t.Union[CheckParameterRulespecWithoutItem, CheckParameterRu
         return isinstance(self._element, CheckParameterRulespecWithItem)
 
 
-def load_plugin(fix_register: FixRegister) -> t.Iterator[PluginProtocol]:
-    for check_element in fix_register.check_plugins.values():
+def load_plugin(agent_based_plugins: AgentBasedPlugins) -> t.Iterator[PluginProtocol]:
+    for check_element in agent_based_plugins.check_plugins.values():
         if check_element.check_ruleset_name is not None:
             yield PluginCheck(check_element)
-    for discovery_element in fix_register.check_plugins.values():
+    for discovery_element in agent_based_plugins.check_plugins.values():
         if discovery_element.discovery_ruleset_name is not None:
             yield PluginDiscovery(discovery_element)
-    for inventory_element in fix_register.inventory_plugins.values():
-        if inventory_element.inventory_ruleset_name is not None:
+    for inventory_element in agent_based_plugins.inventory_plugins.values():
+        if inventory_element.ruleset_name is not None:
             yield PluginInventory(inventory_element)
 
 
 def load_wato() -> t.Iterator[WatoProtocol]:
     for element in rulespec_registry.values():
-        if element.group == RulespecGroupCheckParametersDiscovery:
+        if isinstance(group := element.group(), RulespecGroupCheckParametersDiscovery) or (
+            isinstance(group, RulespecSubGroup)
+            and GENERATED_GROUP_PREFIX in group.__class__.__name__
+            and issubclass(group.main_group, RulespecGroupDiscoveryCheckParameters)
+        ):
             yield WatoDiscovery(element)
         elif element.group == RulespecGroupInventory:
             yield WatoInventory(element)
@@ -228,9 +229,9 @@ def load_wato() -> t.Iterator[WatoProtocol]:
             yield WatoCheck(element)
 
 
-def test_plugin_vs_wato(fix_register: FixRegister) -> None:
+def test_plugin_vs_wato(agent_based_plugins: AgentBasedPlugins) -> None:
     error_reporter = ErrorReporter()
-    for plugin, wato in merge(sorted(load_plugin(fix_register)), sorted(load_wato())):
+    for plugin, wato in merge(sorted(load_plugin(agent_based_plugins)), sorted(load_wato())):
         if plugin is None and wato is not None:
             error_reporter.report_wato_unused(wato)
         elif wato is None and plugin is not None:
@@ -247,87 +248,47 @@ def test_plugin_vs_wato(fix_register: FixRegister) -> None:
 class ErrorReporter:
     KNOWN_WATO_UNUSED = {
         # type # name
-        ("check", "checkgroup_parameters:checkmk_agent_plugins"),
-        ("check", "checkgroup_parameters:ceph_status"),
-        ("check", "checkgroup_parameters:disk_temperature"),
-        ("check", "checkgroup_parameters:entersekt_soaprrors"),
-        ("check", "checkgroup_parameters:hw_single_temperature"),
-        ("check", "checkgroup_parameters:hw_temperature"),
-        ("check", "checkgroup_parameters:mailqueue_length"),
-        ("check", "checkgroup_parameters:mssql_blocked_sessions"),
-        ("check", "checkgroup_parameters:postgres_sessions"),
-        ("check", "checkgroup_parameters:room_temperature"),
-        ("check", "checkgroup_parameters:ruckus_mac"),
-        ("check", "checkgroup_parameters:statgrab_mem"),
-        ("check", "checkgroup_parameters:systemd_services"),
-        ("check", "checkgroup_parameters:temperature_trends"),
-        ("check", "checkgroup_parameters:prism_container"),
+        ("check", RuleGroup.CheckgroupParameters("checkmk_agent_plugins")),
+        ("check", RuleGroup.CheckgroupParameters("ceph_status")),
+        ("check", RuleGroup.CheckgroupParameters("mailqueue_length")),
+        ("check", RuleGroup.CheckgroupParameters("mssql_blocked_sessions")),
+        ("check", RuleGroup.CheckgroupParameters("postgres_sessions")),
+        ("check", RuleGroup.CheckgroupParameters("ruckus_mac")),
+        ("check", RuleGroup.CheckgroupParameters("systemd_services")),
+        ("check", RuleGroup.CheckgroupParameters("temperature_trends")),
+        ("check", RuleGroup.CheckgroupParameters("prism_container")),
+        ("check", RuleGroup.CheckgroupParameters("azure_databases")),  # deprecated
         ("discovery", "discovery_systemd_units_services_rules"),
-        ("inventory", "active_checks:cmk_inv"),
-        ("inventory", "inv_parameters:inv_if"),
-        ("inventory", "inv_parameters:lnx_sysctl"),
+        ("inventory", RuleGroup.ActiveChecks("cmk_inv")),
+        ("inventory", RuleGroup.InvParameters("inv_if")),
+        ("inventory", RuleGroup.InvParameters("lnx_sysctl")),
         ("inventory", "inv_retention_intervals"),
-        ("inventory", "inv_exports:software_csv"),  # deprecated since 2.2
-    }
-    KNOWN_ITEM_REQUIREMENTS = {
-        # type # plugin # wato
-        ("check", "azure_ad_sync", "checkgroup_parameters:azure_ad"),
-        ("check", "azure_agent_info", "checkgroup_parameters:azure_agent_info"),
-        ("check", "checkpoint_memory", "checkgroup_parameters:memory_simple"),
-        ("check", "cisco_cpu_memory", "checkgroup_parameters:cisco_cpu_memory"),
-        ("check", "datapower_mem", "checkgroup_parameters:memory_simple"),
-        ("check", "f5_bigip_mem", "checkgroup_parameters:memory_simple"),
-        ("check", "f5_bigip_mem_tmm", "checkgroup_parameters:memory_simple"),
-        ("check", "haproxy_frontend", "checkgroup_parameters:haproxy_frontend"),
-        ("check", "haproxy_server", "checkgroup_parameters:haproxy_server"),
-        ("check", "hp_procurve_mem", "checkgroup_parameters:memory_simple"),
-        ("check", "mongodb_replica_set", "checkgroup_parameters:mongodb_replica_set"),
-        ("check", "mongodb_replica_set_election", "checkgroup_parameters:mongodb_replica_set"),
-        ("check", "netapp_fcpio", "checkgroup_parameters:netapp_fcportio"),
         (
-            "check",
-            "systemd_units_services_summary",
-            "checkgroup_parameters:systemd_services_summary",
-        ),
-        ("check", "ucd_mem", "checkgroup_parameters:memory_simple"),
+            "inventory",
+            RuleGroup.InvExports("software_csv"),
+        ),  # deprecated since 2.2
     }
-    KNOWN_WATO_MISSING = {
+
+    ENFORCING_ONLY_RULESETS = {
+        # These plugins only have rules to be enforced (and configured),
+        # but no rules to configure discovered services.
+        # This may or may not be intentional and/or reasonable.
+        # If the plugins are discovered by default, it is likely to be unintentional.
         # type # instance # wato
-        ("check", "3ware_units", "raid"),
-        ("check", "brocade_tm", "brocade_tm"),
-        ("check", "checkpoint_vsx_status", "checkpoint_vsx_traffic_status"),
-        ("check", "domino_tasks", "domino_tasks"),
-        ("check", "drbd_disk", "drbd.disk"),
-        ("check", "drbd_net", "drbd.net"),
-        ("check", "drbd_stats", "drbd.stats"),
-        ("check", "entersekt_soaperrors", "entersekt_soaperrors"),
-        ("check", "innovaphone_channels", "hw_single_channelserature"),
-        ("check", "ironport_misc", "obsolete"),
-        ("check", "j4p_performance_app_sess", "j4p_performance.app_sess"),
-        ("check", "j4p_performance_app_state", "j4p_performance.app_state"),
-        ("check", "j4p_performance_mem", "j4p_performance.mem"),
-        ("check", "j4p_performance_serv_req", "j4p_performance.serv_req"),
-        ("check", "j4p_performance_threads", "j4p_performance.threads"),
-        ("check", "j4p_performance_uptime", "j4p_performance.uptime"),
-        ("check", "lsi_array", "raid"),
-        ("check", "md", "raid"),
-        ("check", "mongodb_replication_info", "mongodb_replication_info"),
-        ("check", "moxa_iologik_register", "iologik_register"),
-        ("check", "netstat", "tcp_connections"),
+        ("check", "3ware_units", "raid"),  # has no params, but can be enforced.
+        ("check", "lsi_array", "raid"),  # has no params, but can be enforced.
+        ("check", "md", "raid"),  # has no params, but can be enforced.
+        ("check", "netstat", "tcp_connections"),  # can only be enforced, never discovered.
         ("check", "nvidia_errors", "hw_errors"),
-        ("check", "qlogic_fcport", "qlogic_fcport"),
-        ("check", "sap_hana_proc", "sap_hana_proc"),
-        ("check", "stormshield_cluster_node", "stormshield_quality"),
-        ("check", "stormshield_policy", "stormshield"),
-        ("check", "stormshield_updates", "stormshield_updates"),
-        ("check", "tsm_stagingpools", "tsm_stagingspools"),
         ("check", "vbox_guest", "vm_state"),
         ("check", "win_netstat", "tcp_connections"),
         ("check", "wmic_process", "wmic_process"),
-        ("check", "zerto_vpg_rpo", "zerto_vpg_rpo"),
         ("check", "zertificon_mail_queues", "zertificon_mail_queues"),
         ("check", "zpool_status", "zpool_status"),
-        ("check", "zypper", "zypper"),
+    }
+
+    KNOWN_WATO_MISSING = {
+        # type # instance # wato
         ("discovery", "fileinfo", "fileinfo_groups"),
         ("discovery", "fileinfo_groups", "fileinfo_groups"),
         ("discovery", "sap_hana_fileinfo", "fileinfo_groups"),
@@ -337,190 +298,12 @@ class ErrorReporter:
         ("inventory", "inv_if", "inv_if"),
         ("inventory", "lnx_sysctl", "lnx_sysctl"),
     }
-    KNOWN_ERROR_LOADING_DEFAULTS = {
-        # type # plugin # wato
-        ("check", "ad_replication", "checkgroup_parameters:ad_replication"),
-        ("check", "apc_ats_output", "checkgroup_parameters:apc_ats_output"),
-        ("check", "apc_humidity", "checkgroup_parameters:humidity"),
-        ("check", "apc_symmetra", "checkgroup_parameters:apc_symentra"),
-        ("check", "apc_symmetra_temp", "checkgroup_parameters:temperature"),
-        ("check", "appdynamics_sessions", "checkgroup_parameters:jvm_sessions"),
-        ("check", "appdynamics_web_container", "checkgroup_parameters:jvm_threads"),
-        (
-            "check",
-            "aws_dynamodb_table_read_capacity",
-            "checkgroup_parameters:aws_dynamodb_capacity",
-        ),
-        (
-            "check",
-            "aws_dynamodb_table_write_capacity",
-            "checkgroup_parameters:aws_dynamodb_capacity",
-        ),
-        ("check", "barracuda_mail_latency", "checkgroup_parameters:mail_latency"),
-        ("check", "blade_bx_powerfan", "checkgroup_parameters:hw_fans_perc"),
-        ("check", "brocade_fan", "checkgroup_parameters:hw_fans"),
-        ("check", "brocade_mlx_module_mem", "checkgroup_parameters:memory_multiitem"),
-        ("check", "brocade_optical", "checkgroup_parameters:brocade_optical"),
-        ("check", "brocade_sys_mem", "checkgroup_parameters:memory_relative"),
-        ("check", "bvip_fans", "checkgroup_parameters:hw_fans"),
-        ("check", "bvip_poe", "checkgroup_parameters:epower_single"),
-        ("check", "casa_cpu_mem", "checkgroup_parameters:memory_multiitem"),
-        ("check", "ceph_status_mgrs", "checkgroup_parameters:ceph_mgrs"),
-        ("check", "ceph_status_osds", "checkgroup_parameters:ceph_osds"),
-        (
-            "check",
-            "cisco_prime_wifi_access_points",
-            "checkgroup_parameters:cisco_prime_wifi_access_points",
-        ),
-        (
-            "check",
-            "cisco_prime_wifi_connections",
-            "checkgroup_parameters:cisco_prime_wifi_connections",
-        ),
-        ("check", "cisco_sys_mem", "checkgroup_parameters:cisco_supervisor_mem"),
-        ("check", "citrix_licenses", "checkgroup_parameters:citrix_licenses"),
-        ("check", "citrix_serverload", "checkgroup_parameters:citrix_load"),
-        ("check", "couchbase_buckets_mem", "checkgroup_parameters:memory_multiitem"),
-        ("check", "db2_backup", "checkgroup_parameters:db2_backup"),
-        ("check", "db2_mem", "checkgroup_parameters:db2_mem"),
-        ("check", "ddn_s2a_faultsbasic_disks", "checkgroup_parameters:disk_failures"),
-        ("check", "ddn_s2a_faultsbasic_fans", "checkgroup_parameters:fan_failures"),
-        ("check", "ddn_s2a_stats_io", "checkgroup_parameters:storage_iops"),
-        ("check", "ddn_s2a_stats_readhits", "checkgroup_parameters:read_hits"),
-        ("check", "dell_idrac_fans", "checkgroup_parameters:hw_fans"),
-        ("check", "dell_om_fans", "checkgroup_parameters:hw_fans"),
-        ("check", "docsis_channels_upstream", "checkgroup_parameters:docsis_channels_upstream"),
-        ("check", "domino_transactions", "checkgroup_parameters:domino_transactions"),
-        ("check", "domino_users", "checkgroup_parameters:domino_users"),
-        ("check", "eltek_fans", "checkgroup_parameters:hw_fans_perc"),
-        ("check", "emc_isilon_power", "checkgroup_parameters:evolt"),
-        ("check", "emcvnx_sp_util", "checkgroup_parameters:sp_util"),
-        ("check", "enterasys_lsnat", "checkgroup_parameters:lsnat"),
-        ("check", "epson_beamer_lamp", "checkgroup_parameters:lamp_operation_time"),
-        ("check", "esx_vsphere_licenses", "checkgroup_parameters:esx_licenses"),
-        ("check", "esx_vsphere_objects_count", "checkgroup_parameters:esx_vsphere_objects_count"),
-        ("check", "esx_vsphere_sensors", "checkgroup_parameters:hostsystem_sensors"),
-        ("check", "esx_vsphere_vm_guest_tools", "checkgroup_parameters:vm_guest_tools"),
-        ("check", "esx_vsphere_vm_heartbeat", "checkgroup_parameters:vm_heartbeat"),
-        ("check", "f5_bigip_fans", "checkgroup_parameters:hw_fans"),
-        ("check", "f5_bigip_pool", "checkgroup_parameters:f5_pools"),
-        ("check", "fortigate_antivirus", "checkgroup_parameters:fortigate_antivirus"),
-        ("check", "fortigate_ips", "checkgroup_parameters:fortigate_ips"),
-        ("check", "fortigate_ipsecvpn", "checkgroup_parameters:ipsecvpn"),
-        ("check", "fortigate_memory", "checkgroup_parameters:memory"),
-        ("check", "fortigate_node_sessions", "checkgroup_parameters:fortigate_node_sessions"),
-        ("check", "fortigate_sessions_base", "checkgroup_parameters:fortigate_sessions"),
-        ("check", "fortigate_sessions", "checkgroup_parameters:fortigate_sessions"),
-        ("check", "fortimail_cpu_load", "checkgroup_parameters:fortimail_cpu_load"),
-        ("check", "fortimail_disk_usage", "checkgroup_parameters:fortimail_disk_usage"),
-        ("check", "genua_pfstate", "checkgroup_parameters:pf_used_states"),
-        ("check", "hitachi_hnas_bossock", "checkgroup_parameters:bossock_fibers"),
-        ("check", "hivemanager_devices", "checkgroup_parameters:hivemanager_devices"),
-        ("check", "hpux_multipath", "checkgroup_parameters:hpux_multipath"),
-        ("check", "huawei_osn_laser", "checkgroup_parameters:huawei_osn_laser"),
-        ("check", "ibm_imm_fan", "checkgroup_parameters:hw_fans_perc"),
-        ("check", "ibm_svc_license", "checkgroup_parameters:ibmsvc_licenses"),
-        ("check", "icom_repeater_ps_volt", "checkgroup_parameters:ps_voltage"),
-        ("check", "innovaphone_mem", "checkgroup_parameters:innovaphone_mem"),
-        ("check", "inotify", "checkgroup_parameters:inotify"),
-        ("check", "ipr400_in_voltage", "checkgroup_parameters:evolt"),
-        ("check", "janitza_umg_freq", "checkgroup_parameters:efreq"),
-        ("check", "jolokia_metrics_app_sess", "checkgroup_parameters:jvm_sessions"),
-        ("check", "jolokia_metrics_bea_queue", "checkgroup_parameters:jvm_queue"),
-        ("check", "jolokia_metrics_bea_requests", "checkgroup_parameters:jvm_requests"),
-        ("check", "jolokia_metrics_bea_sess", "checkgroup_parameters:jvm_sessions"),
-        ("check", "jolokia_metrics_bea_threads", "checkgroup_parameters:jvm_threads"),
-        ("check", "jolokia_metrics_requests", "checkgroup_parameters:jvm_requests"),
-        ("check", "jolokia_metrics_serv_req", "checkgroup_parameters:jvm_requests"),
-        ("check", "juniper_mem", "checkgroup_parameters:juniper_mem_modules"),
-        ("check", "juniper_screenos_mem", "checkgroup_parameters:juniper_mem"),
-        ("check", "juniper_trpz_flash", "checkgroup_parameters:general_flash_usage"),
-        ("check", "juniper_trpz_mem", "checkgroup_parameters:juniper_mem"),
-        ("check", "keepalived", "checkgroup_parameters:keepalived"),
-        ("check", "kernel", "checkgroup_parameters:vm_counter"),
-        ("check", "knuerr_rms_humidity", "checkgroup_parameters:single_humidity"),
-        ("check", "liebert_cooling", "checkgroup_parameters:liebert_cooling"),
-        ("check", "liebert_cooling_position", "checkgroup_parameters:liebert_cooling_position"),
-        ("check", "liebert_fans", "checkgroup_parameters:hw_fans_perc"),
-        ("check", "liebert_fans_condenser", "checkgroup_parameters:hw_fans_perc"),
-        ("check", "liebert_humidity_air", "checkgroup_parameters:humidity"),
-        ("check", "logins", "checkgroup_parameters:logins"),
-        ("check", "lvm_vgs", "checkgroup_parameters:volume_groups"),
-        ("check", "mikrotik_signal", "checkgroup_parameters:signal_quality"),
-        ("check", "mongodb_collections", "checkgroup_parameters:mongodb_collections"),
-        ("check", "mounts", "checkgroup_parameters:fs_mount_options"),
-        ("check", "mq_queues", "checkgroup_parameters:mq_queues"),
-        ("check", "msexch_dag_copyqueue", "checkgroup_parameters:msexch_copyqueue"),
-        ("check", "msexch_isclienttype", "checkgroup_parameters:msx_info_store"),
-        ("check", "msexch_isstore", "checkgroup_parameters:msx_info_store"),
-        ("check", "mssql_connections", "checkgroup_parameters:mssql_connections"),
-        ("check", "mysql_slave", "checkgroup_parameters:mysql_slave"),
-        ("check", "netapp_api_connection", "checkgroup_parameters:netapp_instance"),
-        ("check", "netapp_api_environment_fan_faults", "checkgroup_parameters:hw_fans"),
-        ("check", "netapp_api_environment_fans", "checkgroup_parameters:hw_fans"),
-        ("check", "netscaler_health_fan", "checkgroup_parameters:hw_fans"),
-        ("check", "netscaler_mem", "checkgroup_parameters:netscaler_mem"),
-        ("check", "openhardwaremonitor_fan", "checkgroup_parameters:hw_fans"),
-        ("check", "openhardwaremonitor_smart", "checkgroup_parameters:openhardwaremonitor_smart"),
-        ("check", "openhardwaremonitor_temperature", "checkgroup_parameters:temperature"),
-        ("check", "oracle_diva_csm_tapes", "checkgroup_parameters:blank_tapes"),
-        ("check", "plesk_backups", "checkgroup_parameters:plesk_backups"),
-        ("check", "prometheus_custom", "checkgroup_parameters:prometheus_custom"),
-        ("check", "ps", "checkgroup_parameters:ps"),
-        ("check", "pulse_secure_mem_util", "checkgroup_parameters:pulse_secure_mem_util"),
-        ("check", "pulse_secure_users", "checkgroup_parameters:pulse_secure_users"),
-        ("check", "qnap_fans", "checkgroup_parameters:hw_fans"),
-        ("check", "quanta_fan", "checkgroup_parameters:hw_fans"),
-        ("check", "ra32e_switch", "checkgroup_parameters:switch_contact"),
-        ("check", "rabbitmq_nodes_mem", "checkgroup_parameters:memory_multiitem"),
-        ("check", "raritan_pdu_ocprot", "checkgroup_parameters:ocprot_current"),
-        ("check", "raritan_pdu_outletcount", "checkgroup_parameters:plug_count"),
-        ("check", "rds_licenses", "checkgroup_parameters:rds_licenses"),
-        ("check", "redis_info_persistence", "checkgroup_parameters:redis_info_persistence"),
-        ("check", "safenet_ntls_clients", "checkgroup_parameters:safenet_ntls_clients"),
-        ("check", "safenet_ntls_links", "checkgroup_parameters:safenet_ntls_links"),
-        ("check", "sansymphony_alerts", "checkgroup_parameters:sansymphony_alerts"),
-        ("check", "siemens_plc_flag", "checkgroup_parameters:siemens_plc_flag"),
-        ("check", "skype_conferencing", "checkgroup_parameters:skype_conferencing"),
-        ("check", "skype_sip_stack", "checkgroup_parameters:skype_sip"),
-        ("check", "symantec_av_updates", "checkgroup_parameters:antivir_update_age"),
-        ("check", "tinkerforge_ambient", "checkgroup_parameters:brightness"),
-        ("check", "tplink_mem", "checkgroup_parameters:memory_percentage_used"),
-        ("check", "tplink_poe_summary", "checkgroup_parameters:epower_single"),
-        ("check", "ucs_c_rack_server_util_cpu", "checkgroup_parameters:cpu_utilization_multiitem"),
-        ("check", "ups_in_freq", "checkgroup_parameters:efreq"),
-        ("check", "ups_in_voltage", "checkgroup_parameters:evolt"),
-        ("check", "ups_out_voltage", "checkgroup_parameters:evolt"),
-        ("check", "ups_socomec_in_voltage", "checkgroup_parameters:evolt"),
-        ("check", "ups_socomec_out_voltage", "checkgroup_parameters:evolt"),
-        ("check", "veeam_tapejobs", "checkgroup_parameters:veeam_tapejobs"),
-        ("check", "vms_system_procs", "checkgroup_parameters:vms_procs"),
-        (
-            "check",
-            "wagner_titanus_topsense_airflow_deviation",
-            "checkgroup_parameters:airflow_deviation",
-        ),
-        ("check", "watchdog_sensors_humidity", "checkgroup_parameters:humidity"),
-        ("check", "websphere_mq_channels", "checkgroup_parameters:websphere_mq_channels"),
-        ("check", "windows_multipath", "checkgroup_parameters:windows_multipath"),
-        ("check", "wmi_cpuload", "checkgroup_parameters:cpu_load"),
-        ("discovery", "domino_tasks", "inv_domino_tasks_rules"),
-        ("discovery", "mssql_counters_cache_hits", "inventory_mssql_counters_rules"),
-        ("discovery", "mssql_datafiles", "mssql_transactionlogs_discovery"),
-        ("discovery", "mssql_transactionlogs", "mssql_transactionlogs_discovery"),
-        ("discovery", "ps", "inventory_processes_rules"),
-        ("discovery", "vnx_quotas", "discovery_rules_vnx_quotas"),
-        ("discovery", "hitachi_hnas_volume", "filesystem_groups"),
-        ("discovery", "hitachi_hnas_volume_virtual", "filesystem_groups"),
-    }
 
     def __init__(self) -> None:
         self._last_exception: t.Optional[DefaultLoadingFailed] = None
         self._failed = False
         self._known_wato_unused = self.KNOWN_WATO_UNUSED.copy()
-        self._known_item_requirements = self.KNOWN_ITEM_REQUIREMENTS.copy()
-        self._known_wato_missing = self.KNOWN_WATO_MISSING.copy()
-        self._known_error_loading_defaults = self.KNOWN_ERROR_LOADING_DEFAULTS.copy()
+        self._known_wato_missing = self.KNOWN_WATO_MISSING | self.ENFORCING_ONLY_RULESETS
 
     def failed(self) -> bool:
         return self._failed
@@ -530,7 +313,7 @@ class ErrorReporter:
         if element in self._known_wato_unused:
             self._known_wato_unused.remove(element)
             return
-        print(f"{wato.get_description()} is not used by any plugin")
+        logger.info(f"{wato.get_description()} is not used by any plugin")
         self._failed |= True
 
     def report_wato_missing(self, plugin: PluginProtocol) -> None:
@@ -538,19 +321,19 @@ class ErrorReporter:
         if element in self._known_wato_missing:
             self._known_wato_missing.remove(element)
             return
-        print(
+        logger.info(
             f"{plugin.get_description()} wants to use "
             f"wato ruleset '{plugin.get_merge_name()}' but this can not be found"
         )
         self._failed |= True
 
     def run_tests(self, plugin: PluginProtocol, wato: WatoProtocol) -> None:
-        # try to load the plugin defaults into wato ruleset
+        # try to load the plug-in defaults into wato ruleset
         exception = wato.validate_parameter(plugin.get_default_parameters())
         if exception:
             self._report_error_loading_defaults(plugin, wato, exception)
 
-        # see if both plugin and wato have the same idea about items
+        # see if both plug-in and wato have the same idea about items
         if isinstance(plugin, PluginCheck) and isinstance(wato, WatoCheck):
             if wato.has_item() != plugin.has_item():
                 self._report_check_item_requirements(plugin, wato)
@@ -560,15 +343,11 @@ class ErrorReporter:
         plugin: PluginCheck,
         wato: WatoCheck,
     ) -> None:
-        element = (plugin.type, plugin.get_name(), wato.get_name())
-        if element in self._known_item_requirements:
-            self._known_item_requirements.remove(element)
-            return
-        print(
+        logger.info(
             f"{plugin.get_description()} and {wato.get_description()} have different item requirements:"
         )
-        print("    wato   handles item:", wato.has_item())
-        print("    plugin handles items:", plugin.has_item())
+        logger.info("    wato   handles item: %r", wato.has_item())
+        logger.info("    plug-in handles items: %r", plugin.has_item())
         self._failed |= True
 
     def _report_error_loading_defaults(
@@ -577,11 +356,7 @@ class ErrorReporter:
         wato: WatoProtocol,
         exception: Exception,
     ) -> None:
-        element = (plugin.type, plugin.get_name(), wato.get_name())
-        if element in self._known_error_loading_defaults:
-            self._known_error_loading_defaults.remove(element)
-            return
-        print(
+        logger.info(
             f"Loading the default value of {plugin.get_description()} "
             f"into {wato.get_description()} failed:\n    {exception.__class__.__name__}: {exception}"
         )
@@ -595,7 +370,7 @@ class ErrorReporter:
 
     def test_for_vanished_known_problems(self) -> None:
         """
-        Generally test_plugin_vs_wato makes sure that the plugin default values
+        Generally test_plugin_vs_wato makes sure that the plug-in default values
         matches the structure of the wato ruleset.
 
         This particular test makes sure that the known defects defined in the
@@ -607,12 +382,8 @@ class ErrorReporter:
         `_known_*` set.
         """
         # ci does not report the variables, so we print them...
-        print(self._known_error_loading_defaults)
-        print(self._known_item_requirements)
-        print(self._known_wato_missing)
-        print(self._known_wato_unused)
-        assert len(self._known_error_loading_defaults) == 0
-        assert len(self._known_item_requirements) == 0
+        logger.info(pformat(self._known_wato_missing))
+        logger.info(pformat(self._known_wato_unused))
         assert len(self._known_wato_missing) == 0
         assert len(self._known_wato_unused) == 0
 
@@ -630,8 +401,7 @@ T_contra = t.TypeVar("T_contra", contravariant=True)
 
 
 class SupportsGreaterThan(t.Protocol, t.Generic[T_contra]):
-    def __gt__(self, other: T_contra) -> bool:
-        ...
+    def __gt__(self, other: T_contra) -> bool: ...
 
 
 A = t.TypeVar("A", bound=SupportsGreaterThan)

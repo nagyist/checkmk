@@ -3,16 +3,21 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-import copy
 import json
 import logging
-from collections.abc import Mapping, Sequence
-from typing import Any, Final
+import time
+from collections.abc import Sequence
+from typing import Final
 
-from cmk.utils.piggyback import get_piggyback_raw_data, PiggybackRawDataInfo, PiggybackTimeSettings
-from cmk.utils.type_defs import AgentRawData, HostAddress, HostName
+from cmk.utils.agentdatatype import AgentRawData
+from cmk.utils.hostaddress import HostAddress, HostName
+from cmk.utils.log import VERBOSE
+from cmk.utils.paths import omd_root
 
-from cmk.fetchers import Fetcher, Mode
+from cmk.piggyback.backend import Config as PiggybackConfig
+from cmk.piggyback.backend import get_messages_for, PiggybackMessage
+
+from ._abstract import Fetcher, Mode
 
 
 class PiggybackFetcher(Fetcher[AgentRawData]):
@@ -23,11 +28,13 @@ class PiggybackFetcher(Fetcher[AgentRawData]):
         address: HostAddress | None,
         time_settings: Sequence[tuple[str | None, str, int]],
     ) -> None:
-        super().__init__(logger=logging.getLogger("cmk.helper.piggyback"))
+        super().__init__()
         self.hostname: Final = hostname
         self.address: Final = address
+        self.config: Final = PiggybackConfig(hostname, time_settings)
         self.time_settings: Final = time_settings
-        self._sources: list[PiggybackRawDataInfo] = []
+        self._logger: Final = logging.getLogger("cmk.helper.piggyback")
+        self._sources: list[PiggybackMessage] = []
 
     def __repr__(self) -> str:
         return (
@@ -42,31 +49,40 @@ class PiggybackFetcher(Fetcher[AgentRawData]):
             + ")"
         )
 
-    @classmethod
-    def _from_json(cls, serialized: Mapping[str, Any]) -> "PiggybackFetcher":
-        return cls(**copy.deepcopy(dict(serialized)))
-
-    def to_json(self) -> Mapping[str, Any]:
-        return {
-            "hostname": self.hostname,
-            "address": self.address,
-            "time_settings": self.time_settings,
-        }
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, PiggybackFetcher):
+            return False
+        return (
+            self.hostname == other.hostname
+            and self.address == other.address
+            and self.time_settings == other.time_settings
+        )
 
     def open(self) -> None:
-        for origin in (self.hostname, self.address):
-            self._sources.extend(PiggybackFetcher._raw_data(origin, self.time_settings))
+        self._sources.extend(
+            line
+            for origin in (self.hostname, self.address)
+            if origin
+            for line in PiggybackFetcher._raw_data(origin)
+        )
 
     def close(self) -> None:
         self._sources.clear()
 
     def _fetch_from_io(self, mode: Mode) -> AgentRawData:
-        return AgentRawData(b"" + self._get_main_section() + self._get_source_labels_section())
+        self._logger.log(VERBOSE, "Get piggybacked data")
+        return AgentRawData(
+            bytes(
+                self._get_main_section()
+                + self._get_source_summary_section()
+                + self._get_source_labels_section()
+            )
+        )
 
-    def _get_main_section(self) -> AgentRawData:
-        raw_data = AgentRawData(b"")
+    def _get_main_section(self) -> bytearray | bytes:
+        raw_data = bytearray()
         for src in self._sources:
-            if src.info.successfully_processed:
+            if (time.time() - src.meta.last_update) <= self.config.max_cache_age(src.meta.source):
                 # !! Important for Check_MK and Check_MK Discovery service !!
                 #   - sources contains ALL file infos and is not filtered
                 #     in cmk/base/piggyback.py as in previous versions
@@ -74,23 +90,29 @@ class PiggybackFetcher(Fetcher[AgentRawData]):
                 #     it's service details
                 #   - Check_MK Discovery: Only shows vanished/new/... if raw data is not
                 #     added; ie. if file_info is not successfully processed
-                raw_data = AgentRawData(raw_data + src.raw_data)
+                raw_data += src.raw_data
         return raw_data
 
-    def _get_source_labels_section(self) -> AgentRawData:
+    def _get_source_summary_section(self) -> bytes:
+        """Add some meta information about the piggyback sources to the agent output.
+
+        The fetcher messages currently lack the capability to add additional meta information
+        to the sources (other than one single exception).
+        Since we're adding payload anyway, we add this section as well, to be consumed by the summarizer.
+        """
+        if not self._sources:
+            return b""
+        return f"<<<piggyback_source_summary:sep(0)>>>\n{'\n'.join(s.meta.serialize() for s in self._sources)}\n".encode()
+
+    def _get_source_labels_section(self) -> bytearray | bytes:
         """Return a <<<labels>>> agent section which adds the piggyback sources
         to the labels of the current host"""
         if not self._sources:
-            return AgentRawData(b"")
+            return b""
 
-        labels = {
-            "cmk/piggyback_source_%s" % src.info.source_hostname: "yes" for src in self._sources
-        }
-        return AgentRawData(b"<<<labels:sep(0)>>>\n%s\n" % json.dumps(labels).encode("utf-8"))
+        labels = {"cmk/piggyback_source_%s" % src.meta.source: "yes" for src in self._sources}
+        return ("<<<labels:sep(0)>>>\n%s\n" % json.dumps(labels)).encode("utf-8")
 
     @staticmethod
-    def _raw_data(
-        hostname: HostName | HostAddress | None,
-        time_settings: PiggybackTimeSettings,
-    ) -> Sequence[PiggybackRawDataInfo]:
-        return get_piggyback_raw_data(hostname if hostname else HostName(""), time_settings)
+    def _raw_data(hostname: HostAddress) -> Sequence[PiggybackMessage]:
+        return get_messages_for(hostname, omd_root)

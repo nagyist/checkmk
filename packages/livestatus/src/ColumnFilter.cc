@@ -6,8 +6,10 @@
 #include "livestatus/ColumnFilter.h"
 
 #include <functional>
+#include <memory>
 
 #include "livestatus/AndingFilter.h"
+#include "livestatus/opids.h"
 
 std::unique_ptr<Filter> ColumnFilter::partialFilter(
     columnNamePredicate predicate) const {

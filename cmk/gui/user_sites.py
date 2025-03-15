@@ -7,10 +7,11 @@ from __future__ import annotations
 
 from livestatus import SiteConfigurations, SiteId
 
-from cmk.utils.site import omd_site
+from cmk.ccc.site import omd_site
 
+from cmk.gui.config import active_config
 from cmk.gui.logged_in import user as global_user
-from cmk.gui.site_config import configured_sites, site_is_local
+from cmk.gui.site_config import configured_sites, is_replication_enabled, site_is_local
 
 
 def sorted_sites() -> list[tuple[SiteId, str]]:
@@ -53,7 +54,7 @@ def get_event_console_site_choices() -> list[tuple[SiteId, str]]:
                 for site_id, site in global_user.authorized_sites(
                     unfiltered_sites=configured_sites()
                 ).items()
-                if site_is_local(site_id) or site.get("replicate_ec", False)
+                if site_is_local(active_config, site_id) or site.get("replicate_ec", False)
             }
         )
     )
@@ -74,6 +75,6 @@ def activation_sites() -> SiteConfigurations:
             for site_id, site in global_user.authorized_sites(
                 unfiltered_sites=configured_sites()
             ).items()
-            if site_is_local(site_id) or site.get("replication")
+            if site_is_local(active_config, site_id) or is_replication_enabled(site)
         }
     )

@@ -3,8 +3,9 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -12,22 +13,24 @@ import pytest
 import responses
 from pytest_mock import MockerFixture
 
-from tests.testlib.utils import is_enterprise_repo, is_managed_repo
+from tests.testlib.common.repo import is_cloud_repo, is_enterprise_repo, is_managed_repo
 
-from livestatus import NetworkSocketDetails, SiteConfiguration, SiteId
+from livestatus import NetworkSocketDetails, SiteConfiguration, SiteId, TLSParams
 
-import cmk.utils.packaging
+import cmk.ccc.version as cmk_version
+
 import cmk.utils.paths
-import cmk.utils.version as cmk_version
-from cmk.utils.type_defs import UserId
+from cmk.utils.user import UserId
 
-import cmk.gui.watolib.activate_changes as activate_changes
-import cmk.gui.watolib.config_sync as config_sync
-import cmk.gui.watolib.mkeventd
+import cmk.gui.mkeventd.wato
 from cmk.gui.config import active_config
-from cmk.gui.nodevis_lib import topology_dir
+from cmk.gui.nodevis.utils import topology_dir
+from cmk.gui.watolib import activate_changes, config_sync
 
+from cmk import trace
 from cmk.bi.type_defs import frozen_aggregations_dir
+from cmk.messaging import rabbitmq
+from cmk.piggyback.hub import PiggybackHubConfig, PiggybackHubConfigType
 
 
 @pytest.fixture(name="mocked_responses")
@@ -62,7 +65,7 @@ def fixture_disable_ec_rule_stats_loading(monkeypatch: pytest.MonkeyPatch) -> No
     # During CME config computation the EC rule packs are loaded which currently also load the
     # rule usage information from the running EC. Since we do not have a EC running this fails
     # and causes timeouts. Disable this for these tests.
-    monkeypatch.setattr(cmk.gui.watolib.mkeventd, "get_rule_stats_from_ec", lambda: {})
+    monkeypatch.setattr(cmk.gui.mkeventd.wato, "_get_rule_stats_from_ec", lambda: {})
 
 
 @pytest.fixture(autouse=True)
@@ -82,7 +85,7 @@ def _create_sync_snapshot(
     tmp_path: Path,
     remote_site: SiteId,
     edition: cmk_version.Edition,
-) -> Iterator[activate_changes.SnapshotSettings]:
+) -> Iterator[config_sync.SnapshotSettings]:
     with _create_test_sync_config(monkeypatch):
         yield _generate_sync_snapshot(
             activation_manager,
@@ -115,7 +118,7 @@ def _create_test_sync_config(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         f.write("DUMMY_PWD_ENTRY \n")
 
     with monkeypatch.context() as m:
-        if cmk_version.is_managed_edition():
+        if cmk_version.edition(cmk.utils.paths.omd_root) is cmk_version.Edition.CME:
             m.setattr(
                 active_config,
                 "customers",
@@ -153,7 +156,7 @@ def _get_site_configuration(remote_site: SiteId) -> SiteConfiguration:
                 "tcp",
                 NetworkSocketDetails(
                     address=("127.0.0.1", 6790),
-                    tls=("encrypted", {"verify": True}),
+                    tls=("encrypted", TLSParams(verify=True)),
                 ),
             ),
             "replication": "slave",
@@ -169,6 +172,7 @@ def _get_site_configuration(remote_site: SiteId) -> SiteConfiguration:
             "persist": False,
             "replicate_ec": True,
             "multisiteurl": "http://localhost/unit_remote_1/check_mk/",
+            "message_broker_port": 5672,
         }
     if remote_site == SiteId("unit_remote_2"):
         return {
@@ -180,7 +184,7 @@ def _get_site_configuration(remote_site: SiteId) -> SiteConfiguration:
                 "tcp",
                 NetworkSocketDetails(
                     address=("127.0.0.1", 6790),
-                    tls=("encrypted", {"verify": True}),
+                    tls=("encrypted", TLSParams(verify=True)),
                 ),
             ),
             "replication": "slave",
@@ -196,6 +200,7 @@ def _get_site_configuration(remote_site: SiteId) -> SiteConfiguration:
             "persist": False,
             "replicate_ec": True,
             "multisiteurl": "http://localhost/unit_remote_1/check_mk/",
+            "message_broker_port": 5672,
         }
     raise ValueError(remote_site)
 
@@ -215,6 +220,7 @@ def _get_activation_manager(
                     "disabled": False,
                     "insecure": False,
                     "multisiteurl": "",
+                    "message_broker_port": 5672,
                     "persist": False,
                     "replicate_ec": False,
                     "replication": "",
@@ -239,15 +245,19 @@ def _generate_sync_snapshot(
     remote_site: SiteId,
     *,
     edition: cmk_version.Edition,
-) -> activate_changes.SnapshotSettings:
+) -> config_sync.SnapshotSettings:
     snapshot_data_collector_class = (
         "CMESnapshotDataCollector"
         if edition is cmk_version.Edition.CME
         else "CRESnapshotDataCollector"
     )
+
     assert activation_manager._activation_id is not None
     site_snapshot_settings = activation_manager._get_site_snapshot_settings(
-        activation_manager._activation_id, activation_manager._sites
+        activation_manager._activation_id,
+        activation_manager._sites,
+        {remote_site: rabbitmq.Definitions()},
+        {remote_site: PiggybackHubConfig(type=PiggybackHubConfigType.PERSISTED, locations={})},
     )
     snapshot_settings = site_snapshot_settings[remote_site]
 
@@ -256,9 +266,9 @@ def _generate_sync_snapshot(
 
     # Now create the snapshot
     work_dir = tmp_path / "activation"
-    snapshot_manager = activate_changes.SnapshotManager.factory(
-        str(work_dir), site_snapshot_settings, edition
-    )
+    snapshot_manager = activate_changes.activation_features_registry[
+        str(edition)
+    ].snapshot_manager_factory(str(work_dir), site_snapshot_settings)
     assert snapshot_manager._data_collector.__class__.__name__ == snapshot_data_collector_class
 
     snapshot_manager.generate_snapshots()
@@ -290,6 +300,7 @@ def _get_expected_paths(
         "etc/auth.serials",
         "etc/check_mk/multisite.d/wato/users.mk",
         "var/check_mk/web/%s" % user_id,
+        "var/check_mk/web/%s/automation_user.mk" % user_id,
         "var/check_mk/web/%s/cached_profile.mk" % user_id,
         "var/check_mk/web/%s/enforce_pw_change.mk" % user_id,
         "var/check_mk/web/%s/last_pw_change.mk" % user_id,
@@ -306,14 +317,22 @@ def _get_expected_paths(
         "etc/check_mk/apache.d/wato/sitespecific.mk",
         "etc/check_mk/conf.d/distributed_wato.mk",
         "etc/check_mk/conf.d/wato/sitespecific.mk",
+        "etc/check_mk/diskspace.d",
+        "etc/check_mk/diskspace.d/wato",
+        "etc/check_mk/diskspace.d/wato/sitespecific.mk",
         "etc/check_mk/mkeventd.d/wato/sitespecific.mk",
         "etc/check_mk/multisite.d/wato/ca-certificates_sitespecific.mk",
         "etc/check_mk/multisite.d/wato/sitespecific.mk",
         "etc/check_mk/rrdcached.d",
         "etc/check_mk/rrdcached.d/wato",
         "etc/check_mk/rrdcached.d/wato/sitespecific.mk",
+        "etc/check_mk/piggyback_hub.conf",
         "etc/omd",
+        "etc/omd/distributed.mk",
         "etc/omd/sitespecific.mk",
+        "etc/rabbitmq",
+        "etc/rabbitmq/definitions.d",
+        "etc/rabbitmq/definitions.d/definitions.next.json",
     ]
 
     if edition is not cmk_version.Edition.CRE:
@@ -321,6 +340,7 @@ def _get_expected_paths(
             "etc/check_mk/dcd.d/wato/distributed.mk",
             "etc/check_mk/dcd.d",
             "etc/check_mk/dcd.d/wato",
+            "etc/check_mk/dcd.d/wato/connections.mk",
             "etc/check_mk/dcd.d/wato/sitespecific.mk",
             "etc/check_mk/mknotifyd.d",
             "etc/check_mk/mknotifyd.d/wato",
@@ -354,6 +374,7 @@ def _get_expected_paths(
             "etc/check_mk/multisite.d/wato/customers.mk",
             "etc/check_mk/multisite.d/wato/groups.mk",
             "etc/check_mk/multisite.d/wato/user_connections.mk",
+            "etc/password_store.secret",
         ]
 
         if with_local:
@@ -380,7 +401,7 @@ def _get_expected_paths(
     # precondition is a more cleanly separated structure.
 
     if is_enterprise_repo() and edition is cmk_version.Edition.CRE:
-        # CEE paths are added when the CEE plugins for WATO are available, i.e.
+        # CEE paths are added when the CEE plug-ins for WATO are available, i.e.
         # when the "enterprise/" path is present.
         expected_paths += [
             "etc/check_mk/dcd.d",
@@ -395,7 +416,7 @@ def _get_expected_paths(
         ]
 
     if is_managed_repo() and edition is not cmk_version.Edition.CME:
-        # CME paths are added when the CME plugins for WATO are available, i.e.
+        # CME paths are added when the CME plug-ins for WATO are available, i.e.
         # when the "managed/" path is present.
         expected_paths += [
             "local/share",
@@ -409,18 +430,34 @@ def _get_expected_paths(
             "local/share/check_mk/web/htdocs/themes/modern-dark/images",
         ]
 
+    if (is_cloud_repo() and edition is cmk_version.Edition.CCE) or (
+        is_managed_repo() and edition is cmk_version.Edition.CME
+    ):
+        expected_paths += [
+            "etc/check_mk/otel_collector.d",
+            "etc/check_mk/otel_collector.d/wato",
+            "etc/check_mk/otel_collector.d/wato/otel_collector.mk",
+            "etc/check_mk/otel_collector.d/wato/sitespecific.mk",
+        ]
+
     return expected_paths
 
 
 @pytest.mark.usefixtures("request_context")
 @pytest.mark.parametrize("remote_site", [SiteId("unit_remote_1"), SiteId("unit_remote_2")])
 def test_generate_snapshot(
-    edition: cmk_version.Edition,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     with_user_login: UserId,
     remote_site: SiteId,
 ) -> None:
+    # Unfortunately we can not use the edition fixture anymore, which parameterizes the test with
+    # all editions. The reason for this is that cmk.gui.main_modules now executes the registrations
+    # for the edition it detects. In the future we want be able to create edition specific
+    # application objects, which would make testing them independently possible. Until then we have
+    # to accept the smaller test scope.
+    edition = cmk_version.edition(cmk.utils.paths.omd_root)
+
     with _get_activation_manager(monkeypatch, remote_site) as activation_manager:
         with _create_sync_snapshot(
             activation_manager,
@@ -440,81 +477,21 @@ def test_generate_snapshot(
             assert sorted(paths) == sorted(expected_paths)
 
 
-@pytest.mark.parametrize(
-    "master, slave, result",
-    [
-        pytest.param(
-            {"first": {"customer": "tribe"}},
-            {"first": {"customer": "tribe"}, "second": {"customer": "tribe"}},
-            {"first": {"customer": "tribe"}},
-            id="Delete user from master",
-        ),
-        pytest.param(
-            {
-                "cmkadmin": {
-                    "customer": None,
-                    "notification_rules": [{"description": "adminevery"}],
-                },
-                "first": {"customer": "tribe", "notification_rules": []},
-            },
-            {},
-            {
-                "cmkadmin": {
-                    "customer": None,
-                    "notification_rules": [{"description": "adminevery"}],
-                },
-                "first": {"customer": "tribe", "notification_rules": []},
-            },
-            id="New users",
-        ),
-        pytest.param(
-            {
-                "cmkadmin": {
-                    "customer": None,
-                    "notification_rules": [{"description": "all admins"}],
-                },
-                "first": {"customer": "tribe", "notification_rules": []},
-            },
-            {
-                "cmkadmin": {
-                    "customer": None,
-                    "notification_rules": [{"description": "adminevery"}],
-                },
-                "first": {
-                    "customer": "tribe",
-                    "notification_rules": [{"description": "Host on fire"}],
-                },
-            },
-            {
-                "cmkadmin": {
-                    "customer": None,
-                    "notification_rules": [{"description": "all admins"}],
-                },
-                "first": {
-                    "customer": "tribe",
-                    "notification_rules": [{"description": "Host on fire"}],
-                },
-            },
-            id="Update Global user notifications. Retain Customer user notifications",
-        ),
-    ],
-)
-def test_update_contacts_dict(master: dict, slave: dict, result: dict) -> None:
-    assert config_sync._update_contacts_dict(master, slave) == result
-
-
 # This test does not perform the full synchronization. It executes the central site parts and mocks
 # the remote site HTTP calls
 @pytest.mark.usefixtures("request_context")
 def test_synchronize_site(
     mocked_responses: responses.RequestsMock,
     monkeypatch: pytest.MonkeyPatch,
-    edition: cmk_version.Edition,
     tmp_path: Path,
     mocker: MockerFixture,
 ) -> None:
-    if edition is cmk_version.Edition.CME:
-        pytest.skip("Seems faked site environment is not 100% correct")
+    # Unfortunately we can not use the edition fixture anymore, which parameterizes the test with
+    # all editions. The reason for this is that cmk.gui.main_modules now executes the registrations
+    # for the edition it detects. In the future we want be able to create edition specific
+    # application objects, which would make testing them independently possible. Until then we have
+    # to accept the smaller test scope.
+    edition = cmk_version.edition(cmk.utils.paths.omd_root)
 
     mocked_responses.add(
         method=responses.POST,
@@ -552,11 +529,10 @@ def test_synchronize_site(
         body="True",
     )
 
-    monkeypatch.setattr(cmk_version, "is_raw_edition", lambda: edition is cmk_version.Edition.CRE)
-    monkeypatch.setattr(
-        cmk_version, "is_managed_edition", lambda: edition is cmk_version.Edition.CME
-    )
+    monkeypatch.setattr(cmk_version, "edition", lambda *args, **kw: edition)
 
+    file_filter_func = None
+    site_id = SiteId("unit_remote_1")
     with _get_activation_manager(monkeypatch, SiteId("unit_remote_1")) as activation_manager:
         assert activation_manager._activation_id is not None
         with _create_sync_snapshot(
@@ -566,12 +542,47 @@ def test_synchronize_site(
             remote_site=SiteId("unit_remote_1"),
             edition=edition,
         ) as snapshot_settings:
-            site_activation = activate_changes.ActivateChangesSite(
-                SiteId("unit_remote_1"),
-                snapshot_settings,
-                activation_manager._activation_id,
-                prevent_activate=True,
-            )
+            _synchronize_site(activation_manager, site_id, snapshot_settings, file_filter_func)
 
-            site_activation._time_started = time.time()
-            site_activation._synchronize_site()
+
+def _synchronize_site(
+    activation_manager: activate_changes.ActivateChangesManager,
+    site_id: SiteId,
+    snapshot_settings: config_sync.SnapshotSettings,
+    file_filter_func: Callable[[str], bool] | None,
+) -> None:
+    assert activation_manager._activation_id is not None
+    site_activation_state = activate_changes._initialize_site_activation_state(
+        site_id, activation_manager._activation_id, activation_manager, time.time(), "GUI"
+    )
+
+    current_span = trace.get_current_span()
+    fetch_state_result = activate_changes.fetch_sync_state(
+        snapshot_settings.snapshot_components,
+        site_activation_state,
+        {},
+        current_span,
+    )
+
+    assert fetch_state_result is not None
+    sync_state, site_activation_state, sync_start = fetch_state_result
+
+    calc_delta_result = activate_changes.calc_sync_delta(
+        sync_state,
+        file_filter_func,
+        site_activation_state,
+        sync_start,
+        current_span,
+    )
+    assert calc_delta_result is not None
+    sync_delta, site_activation_state, sync_start = calc_delta_result
+
+    sync_result = activate_changes.synchronize_files(
+        sync_delta,
+        sync_state.remote_config_generation,
+        Path(snapshot_settings.work_dir),
+        site_activation_state,
+        sync_start,
+        current_span,
+    )
+    assert sync_result is not None

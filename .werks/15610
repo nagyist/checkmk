@@ -1,0 +1,16 @@
+Title: Fix Error in LIVESTATUS_TCP_ONLY_FROM during omd config
+Class: fix
+Compatible: compat
+Component: omd
+Date: 1683186871
+Edition: cre
+Knowledge: doc
+Level: 2
+Version: 2.3.0b1
+
+If a user ran the command <tt>omd config</tt> and selected <tt>Distributed Monitoring >
+LIVESTATUS_TCP_ONLY_FROM</tt>, then the following error was shown
+C+:
+Error in LIVESTATUS_TCP_ONLY_FROM
+C-:
+With this Werk, the error no longer occurs.

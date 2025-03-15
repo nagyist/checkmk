@@ -3,22 +3,20 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-import subprocess
 import time
 from collections.abc import MutableSequence
 from datetime import datetime
-from typing import Any
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import Any, Literal, NotRequired, TypedDict
 
-from six import ensure_str
+from cmk.ccc import store
 
 import cmk.utils.paths
-import cmk.utils.store as store
-from cmk.utils.notify import ensure_utf8
-from cmk.utils.type_defs import UserId
+from cmk.utils.mail import default_from_address, MailString, send_mail_sendmail, set_mail_headers
+from cmk.utils.user import UserId
 
-import cmk.gui.pages
-import cmk.gui.userdb as userdb
-import cmk.gui.utils as utils
+from cmk.gui import userdb, utils
 from cmk.gui.breadcrumb import Breadcrumb, make_simple_page_breadcrumb
 from cmk.gui.config import active_config
 from cmk.gui.default_permissions import PermissionSectionGeneral
@@ -37,8 +35,8 @@ from cmk.gui.page_menu import (
     PageMenuEntry,
     PageMenuTopic,
 )
+from cmk.gui.pages import PageRegistry
 from cmk.gui.permissions import Permission, permission_registry
-from cmk.gui.utils.escaping import escape_to_html
 from cmk.gui.utils.html import HTML
 from cmk.gui.utils.transaction_manager import transactions
 from cmk.gui.valuespec import (
@@ -53,7 +51,29 @@ from cmk.gui.valuespec import (
     TextAreaUnicode,
 )
 
-Message = DictionaryModel
+MessageMethod = Literal["gui_hint", "gui_popup", "mail", "dashlet"]
+
+
+class MessageMandatory(TypedDict):
+    """From dictionary valuespec"""
+
+    text: str
+    dest: tuple[str, list[UserId]]
+    methods: list[MessageMethod]
+
+
+class Message(MessageMandatory):
+    """Later added by _process_message"""
+
+    valid_till: NotRequired[int]
+    id: NotRequired[str]
+    time: NotRequired[int]
+    security: NotRequired[bool]
+    acknowledged: NotRequired[bool]
+
+
+def register(page_registry: PageRegistry) -> None:
+    page_registry.register_page_handler("message", page_message)
 
 
 def get_gui_messages(user_id: UserId | None = None) -> MutableSequence[Message]:
@@ -62,14 +82,24 @@ def get_gui_messages(user_id: UserId | None = None) -> MutableSequence[Message]:
     path = cmk.utils.paths.profile_dir / user_id / "messages.mk"
     messages = store.load_object_from_file(path, default=[])
 
-    # Delete too old messages
+    # Delete too old messages and update security message durations
     updated = False
     for index, message in enumerate(messages):
         now = time.time()
         valid_till = message.get("valid_till")
-        if valid_till is not None and valid_till < now:
-            messages.pop(index)
-            updated = True
+        valid_from = message.get("time")
+        if valid_till is not None:
+            if message.get("security") and active_config.user_security_notification_duration.get(
+                "update_existing_duration"
+            ):
+                message["valid_till"] = (
+                    valid_from
+                    + active_config.user_security_notification_duration.get("max_duration")
+                )
+                updated = True
+            if valid_till < now:
+                messages.pop(index)
+                updated = True
 
     if updated:
         save_gui_messages(messages)
@@ -80,8 +110,23 @@ def get_gui_messages(user_id: UserId | None = None) -> MutableSequence[Message]:
 def delete_gui_message(msg_id: str) -> None:
     messages = get_gui_messages()
     for index, msg in enumerate(messages):
-        if msg["id"] == msg_id:
+        if msg["id"] == msg_id and not msg.get("security"):
             messages.pop(index)
+    save_gui_messages(messages)
+
+
+def acknowledge_gui_message(msg_id: str) -> None:
+    messages = get_gui_messages()
+    for index, msg in enumerate(messages):
+        if msg["id"] == msg_id:
+            messages[index]["acknowledged"] = True
+    save_gui_messages(messages)
+
+
+def acknowledge_all_messages() -> None:
+    messages = get_gui_messages()
+    for index, _msg in enumerate(messages):
+        messages[index]["acknowledged"] = True
     save_gui_messages(messages)
 
 
@@ -93,7 +138,7 @@ def save_gui_messages(messages: MutableSequence[Message], user_id: UserId | None
     store.save_object_to_file(path, messages)
 
 
-def _messaging_methods() -> dict[str, dict[str, Any]]:
+def _messaging_methods() -> dict[MessageMethod, dict[str, Any]]:
     return {
         "gui_popup": {
             "title": _("Show popup message"),
@@ -132,7 +177,6 @@ permission_registry.register(
 )
 
 
-@cmk.gui.pages.register("message")
 def page_message() -> None:
     if not user.may("general.message"):
         raise MKAuthException(_("You are not allowed to use the message module."))
@@ -148,15 +192,19 @@ def page_message() -> None:
         try:
             msg = vs_message.from_html_vars("_message")
             vs_message.validate_value(msg, "_message")
-            _process_message_message(msg)
+            message = Message(
+                text=msg["text"],
+                dest=msg["dest"],
+                methods=msg["methods"],
+            )
+            _process_message(message)
         except MKUserError as e:
             html.user_error(e)
 
-    html.begin_form("message", method="POST")
-    vs_message.render_input_as_form("_message", {})
+    with html.form_context("message", method="POST"):
+        vs_message.render_input_as_form("_message", {})
 
-    html.hidden_fields()
-    html.end_form()
+        html.hidden_fields()
     html.footer()
 
 
@@ -269,7 +317,7 @@ def _vs_message() -> Dictionary:
     )
 
 
-def _validate_msg(msg: Message, _varprefix: str) -> None:
+def _validate_msg(msg: DictionaryModel, _varprefix: str) -> None:
     if not msg.get("methods"):
         raise MKUserError("methods", _("Please select at least one messaging method."))
 
@@ -286,9 +334,10 @@ def _validate_msg(msg: Message, _varprefix: str) -> None:
                 raise MKUserError("dest", _('A user with the id "%s" does not exist.') % user_id)
 
 
-def _process_message_message(msg: Message) -> None:  # pylint: disable=too-many-branches
+def _process_message(msg: Message) -> None:  # pylint: disable=R0912
     msg["id"] = utils.gen_id()
-    msg["time"] = time.time()
+    msg["time"] = int(time.time())
+    msg["acknowledged"] = False
 
     if isinstance(msg["dest"], str):
         dest_what = msg["dest"]
@@ -311,7 +360,7 @@ def _process_message_message(msg: Message) -> None:  # pylint: disable=too-many-
         num_success[method] = 0
 
     # Now loop all messaging methods to send the messages
-    errors: dict[str, list[tuple]] = {}
+    errors: dict[MessageMethod, list[tuple]] = {}
     for user_id in recipients:
         for method in msg["methods"]:
             try:
@@ -321,7 +370,7 @@ def _process_message_message(msg: Message) -> None:  # pylint: disable=too-many-
             except MKInternalError as e:
                 errors.setdefault(method, []).append((user_id, e))
 
-    message = escape_to_html(_("The message has successfully been sent..."))
+    message = HTML.with_escaping(_("The message has successfully been sent..."))
     message += HTMLWriter.render_br()
 
     parts = []
@@ -337,15 +386,15 @@ def _process_message_message(msg: Message) -> None:  # pylint: disable=too-many-
             )
         )
 
-    message += HTMLWriter.render_ul(HTML().join(parts))
+    message += HTMLWriter.render_ul(HTML.empty().join(parts))
     message += HTMLWriter.render_p(_("Recipients: %s") % ", ".join(recipients))
     html.show_message(message)
 
     if errors:
-        error_message = HTML()
+        error_message = HTML.empty()
         for method, method_errors in errors.items():
             error_message += _("Failed to send %s messages to the following users:") % method
-            table_rows = HTML()
+            table_rows = HTML.empty()
             for user_id, exception in method_errors:
                 table_rows += HTMLWriter.render_tr(
                     HTMLWriter.render_td(HTMLWriter.render_tt(user_id))
@@ -373,7 +422,7 @@ def message_mail(user_id: UserId, msg: Message) -> bool:
     if not user_spec:
         raise MKInternalError(_("This user does not exist."))
 
-    if not user_spec.get("email"):
+    if not (user_email := user_spec.get("email")):
         raise MKInternalError(_("This user has no mail address configured."))
 
     recipient_name = user_spec.get("alias")
@@ -386,61 +435,34 @@ def message_mail(user_id: UserId, msg: Message) -> bool:
     if not sender_name:
         sender_name = user_id
 
-    # Code mostly taken from message_via_email() from message.py module
-    subject = _("Checkmk: Message")
-    body = (
-        _(
-            """Greetings %s,
-
-%s sent you a message:
-
----
-%s
----
-
-"""
-        )
-        % (recipient_name, sender_name, msg["text"])
+    body = _("""Greetings %s,\n\n%s sent you a message: \n\n---\n%s\n---""") % (
+        recipient_name,
+        sender_name,
+        msg["text"],
     )
 
-    if msg["valid_till"]:
+    if valid_till := msg.get("valid_till"):
         body += _("This message has been created at %s and is valid till %s.") % (
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(msg["time"])),
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(msg["valid_till"])),
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(valid_till)),
         )
 
-    # FIXME: Maybe use the configured mail command for Check_MK-Message one day
-    # TODO: mail does not accept umlauts: "contains invalid character '\303'" in mail
-    #       addresses. handle this correctly.
-    # ? type of user_spec seems to be Dict[str,Any]
-    command = [
-        "mail",
-        "-s",
-        subject,
-        ensure_str(user_spec["email"]),  # pylint: disable= six-ensure-str-bin-call
-    ]
-
-    ensure_utf8()
-
+    mail = MIMEMultipart(_charset="utf-8")
+    mail.attach(MIMEText(body.replace("\n", "\r\n"), "plain", _charset="utf-8"))
+    reply_to = ""
     try:
-        completed_process = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            close_fds=True,
-            encoding="utf-8",
-            check=False,
-            input=body,
+        send_mail_sendmail(
+            set_mail_headers(
+                MailString(user_email),
+                MailString("Checkmk: Message"),
+                MailString(default_from_address()),
+                MailString(reply_to),
+                mail,
+            ),
+            target=MailString(user_email),
+            from_address=MailString(default_from_address()),
         )
-    except OSError as e:
-        raise MKInternalError(
-            _('Mail could not be delivered. Failed to execute command "%s": %s')
-            % (" ".join(command), e)
-        )
+    except Exception as exc:
+        raise MKInternalError(_("Mail could not be delivered: '%s'") % exc) from exc
 
-    if completed_process.returncode:
-        raise MKInternalError(
-            _("Mail could not be delivered. Exit code of command is %r. Output is: %s")
-            % (completed_process.returncode, completed_process.stdout)
-        )
     return True

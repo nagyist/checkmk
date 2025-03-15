@@ -82,16 +82,19 @@ class BICallARuleAction(ABCBIAction, ABCWithSchema):
         bi_rule = bi_rule_id_registry[self.rule_id]
         rule_arguments = replace_macros(self.params.arguments, search_result)
         mapped_rule_arguments = dict(
-            zip(["$%s$" % x for x in bi_rule.params.arguments], rule_arguments)
+            zip([f"${x}$" for x in bi_rule.params.arguments], rule_arguments)
         )
         return replace_macros(bi_rule.properties.title, mapped_rule_arguments)
 
 
 class BICallARuleActionSchema(Schema):
-    type = ReqConstant(BICallARuleAction.kind())
-    rule_id = ReqString(dump_default="", example="test_rule_1")
+    type = ReqConstant(BICallARuleAction.kind(), description="Call a BI rule to create nodes.")
+    rule_id = ReqString(dump_default="", example="test_rule_1", description="ID of the rule.")
     params = ReqNested(
-        BIParamsSchema, dump_default=BIParamsSchema().dump({}), example=BIParamsSchema().dump({})
+        BIParamsSchema,
+        dump_default=BIParamsSchema().dump({}),
+        example=BIParamsSchema().dump({}),
+        description="Parameters for the rule.",
     )
 
 
@@ -140,8 +143,10 @@ class BIStateOfHostAction(ABCBIAction, ABCWithSchema):
 
 
 class BIStateOfHostActionSchema(Schema):
-    type = ReqConstant(BIStateOfHostAction.kind())
-    host_regex = ReqString(dump_default="", example="testhost")
+    type = ReqConstant(
+        BIStateOfHostAction.kind(), description="Create nodes representing the state of hosts."
+    )
+    host_regex = ReqString(dump_default="", example="testhost", description="Host name regex.")
 
 
 #   .--StateOfSvc----------------------------------------------------------.
@@ -209,9 +214,14 @@ class BIStateOfServiceAction(ABCBIAction, ABCWithSchema):
 
 
 class BIStateOfServiceActionSchema(Schema):
-    type = ReqConstant(BIStateOfServiceAction.kind())
-    host_regex = ReqString(dump_default="", example="testhost")
-    service_regex = ReqString(dump_default="", example="testservice")
+    type = ReqConstant(
+        BIStateOfServiceAction.kind(),
+        description="Create nodes representing the state of services.",
+    )
+    host_regex = ReqString(dump_default="", example="testhost", description="Host name regex.")
+    service_regex = ReqString(
+        dump_default="", example="testservice", description="Service name regex."
+    )
 
 
 #   .--StateOfRmn----------------------------------------------------------.
@@ -259,8 +269,11 @@ class BIStateOfRemainingServicesAction(ABCBIAction, ABCWithSchema):
 
 
 class BIStateOfRemainingServicesActionSchema(Schema):
-    type = ReqConstant(BIStateOfRemainingServicesAction.kind())
-    host_regex = ReqString(dump_default="", example="testhost")
+    type = ReqConstant(
+        BIStateOfRemainingServicesAction.kind(),
+        description="Create nodes for each service that is not contained in any other node of this aggregation.",
+    )
+    host_regex = ReqString(dump_default="", example="testhost", description="Host name regex.")
 
 
 #   .--Schemas-------------------------------------------------------------.
@@ -286,6 +299,4 @@ class BIActionSchema(OneOfSchema):
     # }
 
     def get_obj_type(self, obj: ABCBIAction | dict) -> str:
-        if isinstance(obj, dict):
-            return obj["type"]
-        return obj.kind()
+        return obj["type"] if isinstance(obj, dict) else obj.kind()

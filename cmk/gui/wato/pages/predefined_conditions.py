@@ -6,42 +6,40 @@
 
 from collections.abc import Collection
 
-import cmk.gui.userdb as userdb
+from cmk.gui import userdb
 from cmk.gui.exceptions import MKUserError
-from cmk.gui.groups import load_contact_group_information
 from cmk.gui.htmllib.html import html
 from cmk.gui.http import request
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
-from cmk.gui.plugins.wato.utils import (
-    mode_registry,
-    SimpleEditMode,
-    SimpleListMode,
-    SimpleModeType,
-    WatoMode,
-)
 from cmk.gui.table import Table
 from cmk.gui.type_defs import PermissionName
 from cmk.gui.utils.urls import makeuri_contextless
 from cmk.gui.valuespec import (
     Alternative,
+    DictionaryEntry,
     DropdownChoice,
     DualListChoice,
     FixedValue,
     Transform,
     ValueSpec,
 )
-from cmk.gui.wato.pages.rulesets import RuleConditions, VSExplicitConditions
+from cmk.gui.wato.pages.rulesets import VSExplicitConditions
+from cmk.gui.watolib.config_domain_name import ABCConfigDomain
 from cmk.gui.watolib.config_domains import ConfigDomainCore
-from cmk.gui.watolib.hosts_and_folders import Folder
-from cmk.gui.watolib.predefined_conditions import PredefinedConditionStore
-from cmk.gui.watolib.rulesets import (
-    AllRulesets,
-    FilteredRulesetCollection,
-    FolderRulesets,
-    UseHostFolder,
-)
+from cmk.gui.watolib.groups_io import load_contact_group_information
+from cmk.gui.watolib.hosts_and_folders import folder_tree
+from cmk.gui.watolib.mode import ModeRegistry, WatoMode
+from cmk.gui.watolib.predefined_conditions import PredefinedConditionSpec, PredefinedConditionStore
+from cmk.gui.watolib.rulesets import AllRulesets, FolderRulesets, RuleConditions, UseHostFolder
 from cmk.gui.watolib.rulespecs import RulespecGroup, ServiceRulespec
+
+from ._simple_modes import SimpleEditMode, SimpleListMode, SimpleModeType
+
+
+def register(mode_registry: ModeRegistry) -> None:
+    mode_registry.register(ModePredefinedConditions)
+    mode_registry.register(ModeEditPredefinedCondition)
 
 
 class DummyRulespecGroup(RulespecGroup):
@@ -75,25 +73,24 @@ def vs_conditions() -> Transform:
     )
 
 
-class PredefinedConditionModeType(SimpleModeType):
-    def type_name(self):
+class PredefinedConditionModeType(SimpleModeType[PredefinedConditionSpec]):
+    def type_name(self) -> str:
         return "predefined_condition"
 
-    def name_singular(self):
+    def name_singular(self) -> str:
         return _("predefined condition")
 
     def is_site_specific(self) -> bool:
         return False
 
-    def can_be_disabled(self):
+    def can_be_disabled(self) -> bool:
         return False
 
-    def affected_config_domains(self):
-        return [ConfigDomainCore]
+    def affected_config_domains(self) -> list[ABCConfigDomain]:
+        return [ConfigDomainCore()]
 
 
-@mode_registry.register
-class ModePredefinedConditions(SimpleListMode):
+class ModePredefinedConditions(SimpleListMode[PredefinedConditionSpec]):
     @classmethod
     def name(cls) -> str:
         return "predefined_conditions"
@@ -112,18 +109,15 @@ class ModePredefinedConditions(SimpleListMode):
     def title(self) -> str:
         return _("Predefined conditions")
 
-    def _table_title(self):
+    def _table_title(self) -> str:
         return _("Predefined conditions")
 
-    def _validate_deletion(self, ident, entry):
-        matched_rulesets = FilteredRulesetCollection.filter(
-            AllRulesets.load_all_rulesets().get_rulesets(),
-            key=lambda ruleset: ruleset.matches_search_with_rules(
-                {"rule_predefined_condition": ident}
-            ),
-        ).get_rulesets()
-
-        if matched_rulesets:
+    def _validate_deletion(self, ident: str, entry: PredefinedConditionSpec) -> None:
+        if {
+            name: ruleset
+            for name, ruleset in AllRulesets.load_all_rulesets().get_rulesets().items()
+            if ruleset.matches_search_with_rules({"rule_predefined_condition": ident})
+        }:
             raise MKUserError(
                 "_delete",
                 _('You can not delete this %s because it is <a href="%s">in use</a>.')
@@ -141,12 +135,12 @@ class ModePredefinedConditions(SimpleListMode):
         )
         super().page()
 
-    def _show_action_cell(  # type: ignore[no-untyped-def]
+    def _show_action_cell(
         self,
         nr: int,
         table: Table,
         ident: str,
-        entry,
+        entry: PredefinedConditionSpec,
     ) -> None:
         super()._show_action_cell(nr, table, ident, entry)
 
@@ -156,7 +150,7 @@ class ModePredefinedConditions(SimpleListMode):
             "search",
         )
 
-    def _search_url(self, ident):
+    def _search_url(self, ident: str) -> str:
         return makeuri_contextless(
             request,
             [
@@ -167,44 +161,45 @@ class ModePredefinedConditions(SimpleListMode):
             ],
         )
 
-    def _show_entry_cells(self, table, ident, entry):
+    def _show_entry_cells(self, table: Table, ident: str, entry: PredefinedConditionSpec) -> None:
         table.cell(_("Title"), entry["title"])
 
         table.cell(_("Conditions"))
         html.open_ul(class_="conditions")
         html.open_li()
-        html.write_text(
+        html.write_text_permissive(
             "{}: {}".format(
-                _("Folder"), Folder.folder(entry["conditions"]["host_folder"]).alias_path()
+                _("Folder"), folder_tree().folder(entry["conditions"]["host_folder"]).alias_path()
             )
         )
         html.close_li()
         html.close_ul()
-        html.write_text(vs_conditions().value_to_html(entry["conditions"]))
+        html.write_text_permissive(vs_conditions().value_to_html(entry["conditions"]))
 
         table.cell(_("Editable by"))
         if entry["owned_by"] is None:
-            html.write_text(
+            html.write_text_permissive(
                 _(
                     "Administrators (having the permission "
                     '"Write access to all predefined conditions")'
                 )
             )
         else:
-            html.write_text(self._contact_group_alias(entry["owned_by"]))
+            html.write_text_permissive(self._contact_group_alias(entry["owned_by"]))
 
         table.cell(_("Shared with"))
         if not entry["shared_with"]:
-            html.write_text(_("Not shared"))
+            html.write_text_permissive(_("Not shared"))
         else:
-            html.write_text(", ".join([self._contact_group_alias(g) for g in entry["shared_with"]]))
+            html.write_text_permissive(
+                ", ".join([self._contact_group_alias(g) for g in entry["shared_with"]])
+            )
 
-    def _contact_group_alias(self, name):
+    def _contact_group_alias(self, name: str) -> str:
         return self._contact_groups.get(name, {"alias": name})["alias"]
 
 
-@mode_registry.register
-class ModeEditPredefinedCondition(SimpleEditMode):
+class ModeEditPredefinedCondition(SimpleEditMode[PredefinedConditionSpec]):
     @classmethod
     def name(cls) -> str:
         return "edit_predefined_condition"
@@ -223,7 +218,7 @@ class ModeEditPredefinedCondition(SimpleEditMode):
             store=PredefinedConditionStore(),
         )
 
-    def _vs_individual_elements(self):
+    def _vs_individual_elements(self) -> list[DictionaryEntry]:
         if user.may("wato.edit_all_predefined_conditions"):
             admin_element: list[ValueSpec] = [
                 FixedValue(
@@ -283,7 +278,7 @@ class ModeEditPredefinedCondition(SimpleEditMode):
             ),
         ]
 
-    def _save(self, entries):
+    def _save(self, entries: dict[str, PredefinedConditionSpec]) -> None:
         # In case it already existed before, remember the previous path
         old_entries = self._store.load_for_reading()
         old_path = None
@@ -292,6 +287,7 @@ class ModeEditPredefinedCondition(SimpleEditMode):
 
         super()._save(entries)
 
+        assert self._ident is not None
         conditions = RuleConditions.from_config("", entries[self._ident]["conditions"])
 
         # Update rules of source folder in case the folder was changed
@@ -300,13 +296,13 @@ class ModeEditPredefinedCondition(SimpleEditMode):
 
         self._rewrite_rules_for(conditions)
 
-    def _move_rules_for_conditions(self, conditions, old_path):
-        # type (RuleConditions, str) -> None
+    def _move_rules_for_conditions(self, conditions: RuleConditions, old_path: str) -> None:
         """Apply changed folder of predefined condition to rules"""
-        old_folder = Folder.folder(old_path)
+        tree = folder_tree()
+        old_folder = tree.folder(old_path)
         old_rulesets = FolderRulesets.load_folder_rulesets(old_folder)
 
-        new_folder = Folder.folder(conditions.host_folder)
+        new_folder = tree.folder(conditions.host_folder)
         new_rulesets = FolderRulesets.load_folder_rulesets(new_folder)
 
         for old_ruleset in old_rulesets.get_rulesets().values():
@@ -317,8 +313,8 @@ class ModeEditPredefinedCondition(SimpleEditMode):
                     new_ruleset = new_rulesets.get(old_ruleset.name)
                     new_ruleset.append_rule(new_folder, rule)
 
-        new_rulesets.save()
-        old_rulesets.save()
+        new_rulesets.save_folder()
+        old_rulesets.save_folder()
 
     def _rewrite_rules_for(self, conditions: RuleConditions) -> None:
         """Apply changed predefined condition to rules
@@ -328,7 +324,7 @@ class ModeEditPredefinedCondition(SimpleEditMode):
         the changed predefined condition. Since the conditions are only applied to the
         rules while saving them this step is needed.
         """
-        folder = Folder.folder(conditions.host_folder)
+        folder = folder_tree().folder(conditions.host_folder)
         rulesets = FolderRulesets.load_folder_rulesets(folder)
 
         for ruleset in rulesets.get_rulesets().values():
@@ -336,9 +332,9 @@ class ModeEditPredefinedCondition(SimpleEditMode):
                 if rule.predefined_condition_id() == self._ident:
                     rule.update_conditions(conditions)
 
-        rulesets.save()
+        rulesets.save_folder()
 
-    def _contact_group_choices(self, only_own=False):
+    def _contact_group_choices(self, only_own: bool = False) -> list[tuple[str, str]]:
         contact_groups = load_contact_group_information()
 
         if only_own:

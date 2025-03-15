@@ -5,15 +5,15 @@
 
 #include <filesystem>
 
-#include "cap.h"
-#include "cfg.h"
-#include "cma_core.h"
 #include "common/yaml.h"
 #include "lwa/types.h"
-#include "read_file.h"
-#include "test_tools.h"
 #include "tools/_misc.h"
 #include "tools/_process.h"
+#include "watest/test_tools.h"
+#include "wnx/cap.h"
+#include "wnx/cfg.h"
+#include "wnx/cma_core.h"
+#include "wnx/read_file.h"
 
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -40,7 +40,7 @@ TEST(CapTest, InstallFileAsCopyNoThrow) {
     EXPECT_FALSE(res);
 }
 
-/// \brief Keeps temporary folder and pair of file names and dirs
+/// Keeps temporary folder and pair of file names and dirs
 class CapTestFixture : public ::testing::Test {
 public:
     static constexpr std::string_view name() { return "a.txt"; }
@@ -53,8 +53,7 @@ public:
     [[nodiscard]] fs::path target_dir() const { return temp.out(); }
 
 private:
-    tst::TempDirPair temp{
-        ::testing::UnitTest::GetInstance()->current_test_info()->name()};
+    tst::TempDirPair temp{tst::GetUnitTestName()};
 };
 
 TEST_F(CapTestFixture, CheckAreFilesSame) {
@@ -124,7 +123,7 @@ static bool ValidateInstallYml(const std::filesystem::path &file) {
     }
 }
 
-/// \brief Keeps temporary folder and pair of file names and dirs
+/// Keeps temporary folder and pair of file names and dirs
 class CapTestYamlFixture : public ::testing::Test {
 public:
     static constexpr std::string_view name() { return files::kInstallYmlFileA; }
@@ -328,8 +327,8 @@ TEST(CapTest, GetProcessToKill) {
 TEST(CapTest, StoreFileAgressive) {
     ASSERT_TRUE(IsStoreFileAgressive()) << "should be set normally";
 
-    auto work = tst::MakeTempFolderInTempPath(wtools::ConvertToUtf16(
-        ::testing::UnitTest::GetInstance()->current_test_info()->name()));
+    auto work = tst::MakeTempFolderInTempPath(
+        wtools::ConvertToUtf16(tst::GetUnitTestName()));
     fs::create_directories(work);
 
     fs::path ping(R"(c:\windows\system32\ping.exe)");
@@ -342,7 +341,8 @@ TEST(CapTest, StoreFileAgressive) {
     ASSERT_TRUE(fs::copy_file(ping, cmk_test_ping,
                               fs::copy_options::overwrite_existing));
     ASSERT_TRUE(tools::RunDetachedCommand(
-        wtools::ToUtf8(cmk_test_ping.wstring()) + " -t 8.8.8.8"));
+                    wtools::ToUtf8(cmk_test_ping.wstring()) + " -t 8.8.8.8")
+                    .has_value());
     cma::tools::sleep(200ms);
     std::vector buf = {'_', '_'};
     ASSERT_FALSE(StoreFile(cmk_test_ping, buf));
@@ -350,7 +350,8 @@ TEST(CapTest, StoreFileAgressive) {
     ASSERT_TRUE(fs::copy_file(ping, cmk_test_ping,
                               fs::copy_options::overwrite_existing));
     ASSERT_TRUE(tools::RunDetachedCommand(
-        wtools::ToUtf8(cmk_test_ping.wstring()) + " -t 8.8.8.8"));
+                    wtools::ToUtf8(cmk_test_ping.wstring()) + " -t 8.8.8.8")
+                    .has_value());
     cma::tools::sleep(200ms);
 
     std::error_code ec;

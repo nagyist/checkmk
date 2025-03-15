@@ -10,29 +10,44 @@ from contextlib import contextmanager
 from typing import cast, Literal, NamedTuple, NewType, TypedDict
 
 from livestatus import (
+    ConnectedSite,
     LivestatusOutputFormat,
     lqencode,
     MKLivestatusQueryError,
     MultiSiteConnection,
     NetworkSocketDetails,
     NetworkSocketInfo,
+    sanitize_site_configuration,
     SiteConfiguration,
     SiteConfigurations,
     SiteId,
     UnixSocketInfo,
 )
 
+from cmk.ccc.site import omd_site
+from cmk.ccc.version import __version__, Edition, edition, Version, VersionsIncompatible
+
+from cmk.utils import paths
+from cmk.utils.licensing.handler import LicenseState
+from cmk.utils.licensing.registry import get_license_state
 from cmk.utils.paths import livestatus_unix_socket
-from cmk.utils.type_defs import UserId
-from cmk.utils.version import is_managed_edition
+from cmk.utils.user import UserId
 
 from cmk.gui.config import active_config
 from cmk.gui.ctx_stack import g
+from cmk.gui.flask_app import current_app
 from cmk.gui.http import request
 from cmk.gui.i18n import _
 from cmk.gui.log import logger
 from cmk.gui.logged_in import LoggedInUser
 from cmk.gui.logged_in import user as global_user
+from cmk.gui.site_config import get_site_config
+from cmk.gui.utils.compatibility import (
+    is_distributed_monitoring_compatible_for_licensing,
+    LicensingCompatibility,
+    LicensingCompatible,
+    make_incompatible_info,
+)
 
 #   .--API-----------------------------------------------------------------.
 #   |                             _    ____ ___                            |
@@ -66,6 +81,7 @@ class SiteStatus(TypedDict, total=False):
     livestatus_version: str
     program_start: int
     program_version: str
+    max_long_output_size: int
     state: Literal["online", "disabled", "down", "unreach", "dead", "waiting", "missing", "unknown"]
 
 
@@ -95,9 +111,10 @@ def cleanup_connections() -> Iterator[None]:
 # sockets and connection classes. This should really be cleaned up (context managers, ...)
 def disconnect() -> None:
     """Actively closes all Livestatus connections."""
-    if not g:
+    # NOTE: g.__bool__() *can* return False due to the LocalProxy Kung Fu!
+    if not g:  # type: ignore[truthy-bool]
         return
-    logger.debug("Disconnecing site connections")
+    logger.debug("Disconnecting site connections")
     if "live" in g:
         g.live.disconnect()
     g.pop("live", None)
@@ -121,9 +138,7 @@ def all_groups(what: str) -> list[tuple[str, str]]:
 
 # TODO: this too does not really belong here...
 def get_alias_of_host(site_id: SiteId | None, host_name: str) -> SiteId:
-    query = (
-        "GET hosts\n" "Cache: reload\n" "Columns: alias\n" "Filter: name = %s" % lqencode(host_name)
-    )
+    query = "GET hosts\nCache: reload\nColumns: alias\nFilter: name = %s" % lqencode(host_name)
 
     with only_sites(site_id):
         try:
@@ -172,8 +187,10 @@ def _ensure_connected(user: LoggedInUser | None, force_authuser: UserId | None) 
         user = global_user
 
     if force_authuser is None:
-        request_force_authuser = request.get_str_input("force_authuser")
-        force_authuser = UserId(request_force_authuser) if request_force_authuser else None
+        # This makes also sure force_authuser is not the builtin user aka UserId("")
+        force_authuser = (
+            u if (u := request.get_validated_type_input(UserId, "force_authuser")) else None
+        )
 
     logger.debug(
         "Initializing livestatus connections as user %s (forced auth user: %s)",
@@ -185,24 +202,100 @@ def _ensure_connected(user: LoggedInUser | None, force_authuser: UserId | None) 
     _connect_multiple_sites(user)
     _set_livestatus_auth(user, force_authuser)
 
-    site_states_to_log = g.site_status.copy()
-    site_states_to_log.update({"secret": "REDACTED"})
-    logger.debug("Site states: %r", site_states_to_log)
+    logger.debug(
+        "Site states: %r",
+        _redacted_site_states_for_logging(),
+    )
+
+
+def _redacted_site_states_for_logging() -> dict[SiteId, dict[str, object]]:
+    return {
+        site_id: {
+            k: sanitize_site_configuration(v) if k == "site" else v for k, v in site_status.items()
+        }
+        for site_id, site_status in g.site_status.items()
+    }
+
+
+def _edition_from_livestatus(livestatus_edition: str | None) -> Edition | None:
+    for ed in Edition:
+        if ed.long == livestatus_edition:
+            return ed
+    return None
+
+
+def _get_distributed_monitoring_compatibility(
+    site_id: str,
+    central_version: str,
+    central_edition: Edition,
+    central_license_state: LicenseState,
+    remote_edition: Edition | None,
+) -> LicensingCompatibility | VersionsIncompatible:
+    if site_id == omd_site():
+        return LicensingCompatible()
+
+    if remote_edition is None:
+        if Version.from_str(central_version) < Version.from_str("2.2.0"):
+            return LicensingCompatible()
+        return VersionsIncompatible(
+            _(
+                "Central site is version >= 2.2 while remote site is an older version, please "
+                "update remote sites first"
+            )
+        )
+
+    return is_distributed_monitoring_compatible_for_licensing(
+        central_edition=central_edition,
+        central_license_state=central_license_state,
+        remote_edition=remote_edition,
+    )
+
+
+def _get_distributed_monitoring_connection_from_site_id(site_id: str) -> ConnectedSite | None:
+    for connected_site in g.live.connections:
+        if connected_site.id == site_id:
+            return connected_site
+    return None
+
+
+def _inhibit_incompatible_site_connection(
+    site_id: str,
+    central_version: str,
+    central_edition: Edition,
+    central_license_state: LicenseState,
+    remote_version: str,
+    remote_edition: Edition | None,
+    compatibility: LicensingCompatibility | VersionsIncompatible,
+) -> None:
+    if not (
+        incompatible_connection := _get_distributed_monitoring_connection_from_site_id(site_id)
+    ):
+        return
+
+    g.live.connections.remove(incompatible_connection)
+    g.live.deadsites[site_id] = {
+        "exception": make_incompatible_info(
+            central_version=central_version,
+            central_edition_short=central_edition.short,
+            central_license_state=central_license_state,
+            remote_version=remote_version.removeprefix("Check_MK "),
+            remote_edition_short=remote_edition.short if remote_edition else None,
+            remote_license_state=None,
+            compatibility=compatibility,
+        ),
+        "site": incompatible_connection.config,
+    }
 
 
 def _connect_multiple_sites(user: LoggedInUser) -> None:
     enabled_sites, disabled_sites = _get_enabled_and_disabled_sites(user)
     _set_initial_site_states(enabled_sites, disabled_sites)
 
-    if is_managed_edition():
-        # Astroid 2.x bug prevents us from using NewType https://github.com/PyCQA/pylint/issues/2296
-        from cmk.gui.cme.livestatus import (  # pylint: disable=no-name-in-module
-            CMEMultiSiteConnection,
-        )
-
-        g.live = CMEMultiSiteConnection(enabled_sites, disabled_sites)
-    else:
-        g.live = MultiSiteConnection(enabled_sites, disabled_sites)
+    g.live = MultiSiteConnection(
+        sites=enabled_sites,
+        disabled_sites=disabled_sites,
+        only_sites_postprocess=current_app().features.livestatus_only_sites_postprocess,
+    )
 
     # Fetch status of sites by querying the version of Nagios and livestatus
     # This may be cached by a proxy for up to the next configuration reload.
@@ -210,11 +303,21 @@ def _connect_multiple_sites(user: LoggedInUser) -> None:
     for response in g.live.query(
         "GET status\n"
         "Cache: reload\n"
-        "Columns: livestatus_version program_version program_start num_hosts num_services "
-        "core_pid"
+        "Columns: livestatus_version program_version program_start num_hosts num_services max_long_output_size "
+        "core_pid edition"
     ):
         try:
-            site_id, v1, v2, ps, num_hosts, num_services, pid = response
+            (
+                site_id,
+                v1,
+                v2,
+                ps,
+                num_hosts,
+                num_services,
+                max_long_output_size,
+                pid,
+                remote_edition,
+            ) = response
         except ValueError:
             e = MKLivestatusQueryError("Invalid response to status query: %s" % response)
 
@@ -228,18 +331,39 @@ def _connect_multiple_sites(user: LoggedInUser) -> None:
             )
             continue
 
-        g.site_status[site_id].update(
-            {
-                "state": "online",
-                "livestatus_version": v1,
-                "program_version": v2,
-                "program_start": ps,
-                "num_hosts": num_hosts,
-                "num_services": num_services,
-                "core": v2.startswith("Check_MK") and "cmc" or "nagios",
-                "core_pid": pid,
-            }
+        central_edition = edition(paths.omd_root)
+        central_version = __version__
+        remote_edition = _edition_from_livestatus(remote_edition)
+        central_license_state = get_license_state()
+
+        compatibility = _get_distributed_monitoring_compatibility(
+            site_id, central_version, central_edition, central_license_state, remote_edition
         )
+
+        if not isinstance(compatibility, LicensingCompatible):
+            _inhibit_incompatible_site_connection(
+                site_id,
+                central_version,
+                central_edition,
+                central_license_state,
+                v2,
+                remote_edition,
+                compatibility,
+            )
+        else:
+            g.site_status[site_id].update(
+                {
+                    "state": "online",
+                    "livestatus_version": v1,
+                    "program_version": v2,
+                    "program_start": ps,
+                    "num_hosts": num_hosts,
+                    "num_services": num_services,
+                    "max_long_output_size": max_long_output_size,
+                    "core": v2.startswith("Check_MK") and "cmc" or "nagios",
+                    "core_pid": pid,
+                }
+            )
     g.live.set_prepend_site(False)
 
     # TODO(lm): Find a better way to make the Livestatus object trigger the update
@@ -256,7 +380,7 @@ def _get_enabled_and_disabled_sites(
     for site_id, site_spec in user.authorized_sites().items():
         site_spec = _site_config_for_livestatus(site_id, site_spec)
         # Astroid 2.x bug prevents us from using NewType https://github.com/PyCQA/pylint/issues/2296
-        # pylint: disable=unsupported-assignment-operation
+
         if user.is_site_disabled(site_id):
             disabled_sites[site_id] = site_spec
         else:
@@ -278,9 +402,8 @@ def _site_config_for_livestatus(site_id: SiteId, site_spec: SiteConfiguration) -
     if site_spec.get("proxy") is not None:
         assert site_spec["proxy"] is not None
         copied_site["cache"] = site_spec["proxy"].get("cache", True)
-    else:
-        if isinstance(site_spec["socket"], tuple) and site_spec["socket"][0] in ["tcp", "tcp6"]:
-            copied_site["tls"] = cast(NetworkSocketDetails, site_spec["socket"][1])["tls"]
+    elif isinstance(site_spec["socket"], tuple) and site_spec["socket"][0] in ["tcp", "tcp6"]:
+        copied_site["tls"] = cast(NetworkSocketDetails, site_spec["socket"][1])["tls"]
     copied_site["socket"] = encode_socket_for_livestatus(site_id, site_spec)
 
     return copied_site
@@ -335,7 +458,10 @@ _STATUS_NAMES = {
 }
 
 
-def site_state_titles() -> dict[str, str]:
+def site_state_titles() -> dict[
+    Literal["online", "disabled", "down", "unreach", "dead", "waiting", "missing", "unknown"],
+    str,
+]:
     return {
         "online": _("This site is online."),
         "disabled": _("The connection to this site has been disabled."),
@@ -344,6 +470,7 @@ def site_state_titles() -> dict[str, str]:
         "dead": _("This site is not responding."),
         "waiting": _("The status of this site has not yet been determined."),
         "missing": _("This site does not exist."),
+        "unknown": _("The status of this site could not be determined."),
     }
 
 
@@ -482,3 +609,14 @@ def filter_available_site_choices(choices: list[tuple[SiteId, str]]) -> list[tup
             continue
         sites_enabled.append(entry)
     return sites_enabled
+
+
+def site_choices() -> list[tuple[str, str]]:
+    return sorted(
+        [
+            (sitename, get_site_config(active_config, sitename)["alias"])
+            for sitename, state in states().items()
+            if state["state"] == "online"
+        ],
+        key=lambda a: a[1].lower(),
+    )

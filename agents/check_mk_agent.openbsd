@@ -1,9 +1,7 @@
-#!/bin/sh
+#!/bin/ksh
 # Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
-
-# shellcheck shell=ksh
 
 # Author: Lars Michelsen <lm@mathias-kettner.de>
 #         Florian Heigl <florian.heigl@gmail.com>
@@ -124,7 +122,7 @@ section_openbsd_mem() {
 
 section_misc_sections() {
     echo "<<<check_mk>>>"
-    echo "Version: 2.3.0b1"
+    echo "Version: 2.5.0b1"
     echo "AgentOS: openbsd"
     echo "Hostname: $(hostname)"
     echo "AgentDirectory: $MK_CONFDIR"
@@ -132,12 +130,18 @@ section_misc_sections() {
     echo "SpoolDirectory: $SPOOLDIR"
     echo "PluginsDirectory: $PLUGINSDIR"
     echo "LocalDirectory: $LOCALDIR"
+    echo "OSType: unix"
+    echo "OSName: $(uname -s)"
+    echo "OSVersion: $(uname -r)"
 
     echo '<<<df>>>'
     df -kPt ffs | sed -e 's/^\([^ ][^ ]*\) \(.*\)$/\1 ffs \2/' | sed 1d
 
     # processes including username, without kernel processes
     echo '<<<ps>>>'
+    echo "[time]"
+    get_epoch
+    echo "[processes]"
     ps ax -ww -o user,vsz,rss,pcpu,command | sed -e 1d -e 's/ *\([^ ]*\) *\([^ ]*\) *\([^ ]*\) *\([^ ]*\) */(\1,\2,\3,\4) /'
 
     echo '<<<cpu>>>'
@@ -177,8 +181,8 @@ section_misc_sections() {
 
     # adjust internal field separator to get lines from netstat and backup it before
     OFS=$IFS
-    IFS='
-'
+    IFS=''
+
     # collect netstat values and interface number
     for NS in $NETSTAT_OUTPUT; do
         NI=$((NI + 1))
@@ -215,6 +219,9 @@ section_misc_sections() {
             # Speed
             SP=$(echo "$IO" | grep -E "media:.*base" | cut -d\( -f2 | cut -db -f1)
             if [ "$SP" ]; then
+                case "$SP" in
+                    *G*) SP=$((${SP%G} * 1000)) ;;
+                esac
                 printf "\tSpeed: %sMb/s\n" "${SP}"
             fi
             # Detect duplexity - in reality only available for physical devices but
@@ -244,7 +251,7 @@ section_misc_sections() {
     IFS=$OFS
 
     # IPMI-Data (Fans, CPU, temperature, etc)
-    # needs the sysutils/ipmitool and kldload ipmi.ko
+    # needs the sysutils/ipmitool or freeipmi and kldload ipmi.ko
     if inpath ipmitool; then
         echo '<<<ipmi>>>'
         ipmitool sensor list |
@@ -252,11 +259,28 @@ section_misc_sections() {
             sed -e 's/ *| */|/g' -e "s/ /_/g" -e 's/_*$//' -e 's/|/ /g' |
             grep -v -E '^[^ ]+ na ' |
             grep -v ' discrete '
+    elif inpath ipmi-sensors; then
+        echo '<<<ipmi_sensors>>>'
+        if ipmi-sensors --help | grep -q legacy-output; then
+            IPMI_FORMAT="--legacy-output"
+        else
+            IPMI_FORMAT=""
+        fi
+        if ipmi-sensors --help | grep -q " \-\-groups"; then
+            IPMI_GROUP_OPT="-g"
+        else
+            IPMI_GROUP_OPT="-t"
+        fi
+        for class in Temperature Power_Unit Fan; do
+            ipmi-sensors ${IPMI_FORMAT} --sdr-cache-directory /var/cache ${IPMI_GROUP_OPT} "${class}" | sed -e 's/ /_/g' -e 's/:_/ /g' -e 's@ \([^(]*\)_(\([^)]*\))@ \2_\1@'
+            # In case of a timeout immediately leave loop.
+            if [ $? = 255 ]; then break; fi
+        done
     fi
 
     if inpath mailq && getent passwd postfix >/dev/null 2>&1; then
         echo '<<<postfix_mailq>>>'
-        mailq | tail -n 6
+        sudo_as_root mailq | tail -n 6
     fi
 }
 

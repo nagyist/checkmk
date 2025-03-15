@@ -3,12 +3,18 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+from cmk.gui.valuespec import AutocompleterRegistry
+
 from ..registry import DashletRegistry
 from .custom_url import URLDashlet
 from .failed_notifications import FailedNotificationsDashlet
-from .graph import TemplateGraphDashlet
+from .graph import (
+    default_dashlet_graph_render_options,
+    GRAPH_TEMPLATE_CHOICE_AUTOCOMPLETER_ID,
+    graph_templates_autocompleter,
+    TemplateGraphDashlet,
+)
 from .logo import MKLogoDashlet
-from .snapin import SnapinDashlet
 from .static_text import StaticTextDashlet, StaticTextDashletConfig
 from .stats import EventStatsDashlet, HostStatsDashlet, ServiceStatsDashlet, StatsDashletConfig
 from .user_messages import MessageUsersDashlet
@@ -28,19 +34,26 @@ __all__ = [
     "StatsDashletConfig",
     "LinkedViewDashletConfig",
     "copy_view_into_dashlet",
+    "default_dashlet_graph_render_options",
 ]
 
 
-def register_dashlets(dashlet_registry: DashletRegistry) -> None:
+def register_dashlets(
+    dashlet_registry: DashletRegistry,
+    autocompleter_registry: AutocompleterRegistry,
+) -> None:
     dashlet_registry.register(StaticTextDashlet)
     dashlet_registry.register(URLDashlet)
     dashlet_registry.register(FailedNotificationsDashlet)
     dashlet_registry.register(TemplateGraphDashlet)
     dashlet_registry.register(MKLogoDashlet)
-    dashlet_registry.register(SnapinDashlet)
     dashlet_registry.register(HostStatsDashlet)
     dashlet_registry.register(ServiceStatsDashlet)
     dashlet_registry.register(EventStatsDashlet)
     dashlet_registry.register(MessageUsersDashlet)
     dashlet_registry.register(ViewDashlet)
     dashlet_registry.register(LinkedViewDashlet)
+    autocompleter_registry.register_autocompleter(
+        GRAPH_TEMPLATE_CHOICE_AUTOCOMPLETER_ID,
+        graph_templates_autocompleter,
+    )

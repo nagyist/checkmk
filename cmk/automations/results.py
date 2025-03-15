@@ -5,33 +5,32 @@
 
 from __future__ import annotations
 
+import json
+import socket
 from abc import ABC, abstractmethod
 from ast import literal_eval
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, astuple, dataclass
-from typing import Any, TypedDict, TypeVar
+from dataclasses import asdict, astuple, dataclass, field
+from typing import Any, Literal, TypedDict, TypeVar
 
-from cmk.utils import version as cmk_version
+from cmk.ccc import version as cmk_version
+from cmk.ccc.plugin_registry import Registry
+
+from cmk.utils.agentdatatype import AgentRawData
+from cmk.utils.check_utils import ParametersTypeAlias
 from cmk.utils.config_warnings import ConfigurationWarnings
-from cmk.utils.labels import HostLabelValueDict, Labels
-from cmk.utils.parameters import TimespecificParameters
-from cmk.utils.plugin_registry import Registry
-from cmk.utils.rulesets.ruleset_matcher import LabelSources, RulesetName
-from cmk.utils.type_defs import AgentRawData, CheckPluginNameStr
-from cmk.utils.type_defs import DiscoveryResult as SingleHostDiscoveryResult
-from cmk.utils.type_defs import (
-    Gateways,
-    HostName,
-    Item,
-    LegacyCheckParameters,
-    MetricTuple,
-    NotifyAnalysisInfo,
-    NotifyBulks,
-    ParametersTypeAlias,
-    ServiceDetails,
-    ServiceName,
-    ServiceState,
-)
+from cmk.utils.hostaddress import HostAddress, HostName
+from cmk.utils.ip_lookup import IPStackConfig
+from cmk.utils.labels import HostLabel, HostLabelValueDict, Labels, LabelSources
+from cmk.utils.notify_types import NotifyAnalysisInfo, NotifyBulks
+from cmk.utils.rulesets.ruleset_matcher import RulesetName
+from cmk.utils.servicename import Item, ServiceName
+
+from cmk.checkengine.discovery import AutocheckEntry, CheckPreviewEntry
+from cmk.checkengine.discovery import DiscoveryResult as SingleHostDiscoveryResult
+from cmk.checkengine.legacy import LegacyCheckParameters
+from cmk.checkengine.parameters import TimespecificParameters
+from cmk.checkengine.submitters import ServiceDetails, ServiceState
 
 DiscoveredHostLabelsDict = dict[str, HostLabelValueDict]
 
@@ -44,8 +43,7 @@ class ResultTypeRegistry(Registry[type["ABCAutomationResult"]]):
 result_type_registry = ResultTypeRegistry()
 
 
-class SerializedResult(str):
-    ...
+class SerializedResult(str): ...
 
 
 _DeserializedType = TypeVar("_DeserializedType", bound="ABCAutomationResult")
@@ -68,8 +66,7 @@ class ABCAutomationResult(ABC):
 
     @staticmethod
     @abstractmethod
-    def automation_call() -> str:
-        ...
+    def automation_call() -> str: ...
 
     def _default_serialize(self) -> SerializedResult:
         return SerializedResult(repr(astuple(self)))
@@ -84,7 +81,7 @@ class ServiceDiscoveryResult(ABCAutomationResult):
 
     @staticmethod
     def _from_dict(
-        serialized: Mapping[HostName, Mapping[str, Any]]
+        serialized: Mapping[HostName, Mapping[str, Any]],
     ) -> Mapping[HostName, SingleHostDiscoveryResult]:
         return {k: SingleHostDiscoveryResult(**v) for k, v in serialized.items()}
 
@@ -113,41 +110,72 @@ class DiscoveryPre22NameResult(ServiceDiscoveryResult):
 result_type_registry.register(DiscoveryPre22NameResult)
 
 
-@dataclass(frozen=True)
-class CheckPreviewEntry:
-    check_source: str
-    check_plugin_name: str
-    ruleset_name: RulesetName | None
-    item: Item
-    discovered_parameters: LegacyCheckParameters
-    effective_parameters: LegacyCheckParameters
-    description: str
-    state: int | None
-    output: str
-    metrics: list[MetricTuple]
-    labels: dict[str, str]
-    found_on_nodes: list[HostName]
-
-
 @dataclass
 class ServiceDiscoveryPreviewResult(ABCAutomationResult):
     output: str
     check_table: Sequence[CheckPreviewEntry]
+    nodes_check_table: Mapping[HostName, Sequence[CheckPreviewEntry]]
     host_labels: DiscoveredHostLabelsDict
     new_labels: DiscoveredHostLabelsDict
     vanished_labels: DiscoveredHostLabelsDict
     changed_labels: DiscoveredHostLabelsDict
+    labels_by_host: Mapping[HostName, Sequence[HostLabel]]
     source_results: Mapping[str, tuple[int, str]]
 
     def serialize(self, for_cmk_version: cmk_version.Version) -> SerializedResult:
-        if for_cmk_version <= cmk_version.Version.from_str("2.2.0b2"):
-            return SerializedResult(repr(astuple(self)[:6]))
-        return SerializedResult(repr(astuple(self)))
+        if for_cmk_version < cmk_version.Version.from_str("2.4.0b1"):
+            raw = asdict(self)
+            raw.pop("nodes_check_table")
+            return SerializedResult(
+                repr(
+                    {
+                        **raw,
+                        "labels_by_host": {
+                            str(host_name): [label.serialize() for label in labels]
+                            for host_name, labels in self.labels_by_host.items()
+                        },
+                    }
+                )
+            )
+
+        return self._serialize_as_dict()
+
+    def _serialize_as_dict(self) -> SerializedResult:
+        raw = asdict(self)
+        return SerializedResult(
+            repr(
+                {
+                    **raw,
+                    "labels_by_host": {
+                        str(host_name): [label.serialize() for label in labels]
+                        for host_name, labels in self.labels_by_host.items()
+                    },
+                }
+            )
+        )
 
     @classmethod
     def deserialize(cls, serialized_result: SerializedResult) -> ServiceDiscoveryPreviewResult:
-        raw_output, raw_check_table, *raw_rest = literal_eval(serialized_result)
-        return cls(raw_output, [CheckPreviewEntry(*cpe) for cpe in raw_check_table], *raw_rest)
+        raw = literal_eval(serialized_result)
+        return cls(
+            output=raw["output"],
+            check_table=[CheckPreviewEntry(**cpe) for cpe in raw["check_table"]],
+            nodes_check_table={
+                HostName(h): [CheckPreviewEntry(**cpe) for cpe in entries]
+                for h, entries in raw["nodes_check_table"].items()
+            },
+            host_labels=raw["host_labels"],
+            new_labels=raw["new_labels"],
+            vanished_labels=raw["vanished_labels"],
+            changed_labels=raw["changed_labels"],
+            labels_by_host={
+                HostName(raw_host_name): [
+                    HostLabel.deserialize(raw_label) for raw_label in raw_host_labels
+                ]
+                for raw_host_name, raw_host_labels in raw["labels_by_host"].items()
+            },
+            source_results=raw["source_results"],
+        )
 
     @staticmethod
     def automation_call() -> str:
@@ -157,30 +185,93 @@ class ServiceDiscoveryPreviewResult(ABCAutomationResult):
 result_type_registry.register(ServiceDiscoveryPreviewResult)
 
 
-# Should be droped in 2.3
-class DiscoveryPreviewPre22NameResult(ServiceDiscoveryPreviewResult):
+class SpecialAgentDiscoveryPreviewResult(ServiceDiscoveryPreviewResult):
     @staticmethod
     def automation_call() -> str:
-        return "try-inventory"
+        return "special-agent-discovery-preview"
 
 
-result_type_registry.register(DiscoveryPreviewPre22NameResult)
+result_type_registry.register(SpecialAgentDiscoveryPreviewResult)
 
 
 @dataclass
-class SetAutochecksResult(ABCAutomationResult):
+class AutodiscoveryResult(ABCAutomationResult):
+    hosts: Mapping[HostName, SingleHostDiscoveryResult]
+    changes_activated: bool
+
+    def _hosts_to_dict(self) -> Mapping[HostName, Mapping[str, Any]]:
+        return {k: asdict(v) for k, v in self.hosts.items()}
+
+    @staticmethod
+    def _hosts_from_dict(
+        serialized: Mapping[HostName, Mapping[str, Any]],
+    ) -> Mapping[HostName, SingleHostDiscoveryResult]:
+        return {k: SingleHostDiscoveryResult(**v) for k, v in serialized.items()}
+
+    def serialize(self, for_cmk_version: cmk_version.Version) -> SerializedResult:
+        return SerializedResult(repr((self._hosts_to_dict(), self.changes_activated)))
+
+    @classmethod
+    def deserialize(cls, serialized_result: SerializedResult) -> AutodiscoveryResult:
+        hosts, changes_activated = literal_eval(serialized_result)
+        return cls(cls._hosts_from_dict(hosts), changes_activated)
+
     @staticmethod
     def automation_call() -> str:
-        return "set-autochecks"
+        return "autodiscovery"
 
 
-result_type_registry.register(SetAutochecksResult)
+result_type_registry.register(AutodiscoveryResult)
 
 
-SetAutochecksTable = dict[
-    tuple[str, Item], tuple[ServiceName, LegacyCheckParameters, Labels, list[HostName]]
-]
-SetAutochecksTablePre20 = dict[tuple[str, Item], tuple[dict[str, Any], Labels]]
+@dataclass
+class SetAutochecksV2Result(ABCAutomationResult):
+    @staticmethod
+    def automation_call() -> str:
+        return "set-autochecks-v2"
+
+
+result_type_registry.register(SetAutochecksV2Result)
+
+
+@dataclass
+class SetAutochecksInput:
+    discovered_host: HostName  # effective host, the one that is being discovered.
+    target_services: Mapping[
+        ServiceName, AutocheckEntry
+    ]  # the table of services we want to see on the discovered host
+    nodes_services: Mapping[
+        HostName, Mapping[ServiceName, AutocheckEntry]
+    ]  # the discovered services on all the nodes
+
+    @classmethod
+    def deserialize(cls, serialized_input: str) -> SetAutochecksInput:
+        raw = json.loads(serialized_input)
+        return cls(
+            discovered_host=HostName(raw["discovered_host"]),
+            target_services={
+                ServiceName(n): AutocheckEntry.load(literal_eval(s))
+                for n, s in raw["target_services"].items()
+            },
+            nodes_services={
+                HostName(k): {
+                    ServiceName(n): AutocheckEntry.load(literal_eval(s)) for n, s in v.items()
+                }
+                for k, v in raw["nodes_services"].items()
+            },
+        )
+
+    def serialize(self) -> str:
+        return json.dumps(
+            {
+                "discovered_host": str(self.discovered_host),
+                "target_services": {n: repr(s.dump()) for n, s in self.target_services.items()},
+                "nodes_services": {
+                    str(k): {n: repr(s.dump()) for n, s in v.items()}
+                    for k, v in self.nodes_services.items()
+                },
+            }
+        )
 
 
 @dataclass
@@ -253,6 +344,18 @@ result_type_registry.register(GetServicesLabelsResult)
 
 
 @dataclass
+class GetServiceNameResult(ABCAutomationResult):
+    service_name: str
+
+    @staticmethod
+    def automation_call() -> str:
+        return "get-service-name"
+
+
+result_type_registry.register(GetServiceNameResult)
+
+
+@dataclass
 class AnalyseHostResult(ABCAutomationResult):
     labels: Labels
     label_sources: LabelSources
@@ -263,6 +366,30 @@ class AnalyseHostResult(ABCAutomationResult):
 
 
 result_type_registry.register(AnalyseHostResult)
+
+
+@dataclass
+class AnalyzeHostRuleMatchesResult(ABCAutomationResult):
+    results: dict[str, list[object]]
+
+    @staticmethod
+    def automation_call() -> str:
+        return "analyze-host-rule-matches"
+
+
+result_type_registry.register(AnalyzeHostRuleMatchesResult)
+
+
+@dataclass
+class AnalyzeServiceRuleMatchesResult(ABCAutomationResult):
+    results: dict[str, list[object]]
+
+    @staticmethod
+    def automation_call() -> str:
+        return "analyze-service-rule-matches"
+
+
+result_type_registry.register(AnalyzeServiceRuleMatchesResult)
 
 
 @dataclass
@@ -321,7 +448,7 @@ result_type_registry.register(GetConfigurationResult)
 
 @dataclass
 class GetCheckInformationResult(ABCAutomationResult):
-    plugin_infos: Mapping[CheckPluginNameStr, Mapping[str, Any]]
+    plugin_infos: Mapping[str, Mapping[str, Any]]
 
     @staticmethod
     def automation_call() -> str:
@@ -343,16 +470,199 @@ class GetSectionInformationResult(ABCAutomationResult):
 result_type_registry.register(GetSectionInformationResult)
 
 
+@dataclass(frozen=True)
+class Gateway:
+    existing_gw_host_name: HostName | None
+    ip: HostAddress
+    dns_name: HostName | None
+
+
+@dataclass(frozen=True)
+class GatewayResult:
+    gateway: Gateway | None
+    state: str
+    ping_fails: int
+    message: str
+
+
 @dataclass
 class ScanParentsResult(ABCAutomationResult):
-    gateways: Gateways
+    results: Sequence[GatewayResult]
 
     @staticmethod
     def automation_call() -> str:
         return "scan-parents"
 
+    @classmethod
+    def deserialize(cls, serialized_result: SerializedResult) -> ScanParentsResult:
+        (serialized_results,) = literal_eval(serialized_result)
+        results = [
+            GatewayResult(
+                gateway=Gateway(*gw) if gw else None,
+                state=state,
+                ping_fails=ping_fails,
+                message=message,
+            )
+            for gw, state, ping_fails, message in serialized_results
+        ]
+        return cls(results=results)
+
 
 result_type_registry.register(ScanParentsResult)
+
+
+@dataclass
+class DiagSpecialAgentHostConfig:
+    host_name: HostName
+    host_alias: str
+    ip_address: HostAddress | None = None
+    ip_stack_config: IPStackConfig = IPStackConfig.NO_IP
+    host_attrs: Mapping[str, str] = field(default_factory=dict)
+    macros: Mapping[str, object] = field(default_factory=dict)
+    host_primary_family: Literal[
+        socket.AddressFamily.AF_INET,
+        socket.AddressFamily.AF_INET6,
+    ] = socket.AddressFamily.AF_INET
+    host_additional_addresses_ipv4: list[HostAddress] = field(default_factory=list)
+    host_additional_addresses_ipv6: list[HostAddress] = field(default_factory=list)
+
+    @classmethod
+    def deserialize(cls, serialized_input: str) -> DiagSpecialAgentHostConfig:
+        raw = json.loads(serialized_input)
+        deserialized = {
+            "host_name": HostName(raw["host_name"]),
+            "host_alias": raw["host_alias"],
+        }
+        if "ip_address" in raw:
+            deserialized["ip_address"] = (
+                HostAddress(raw["ip_address"]) if raw["ip_address"] else None
+            )
+        if "ip_stack_config" in raw:
+            deserialized["ip_stack_config"] = IPStackConfig(raw["ip_stack_config"])
+        if "host_attrs" in raw:
+            deserialized["host_attrs"] = raw["host_attrs"]
+        if "macros" in raw:
+            deserialized["macros"] = raw["macros"]
+        if "host_primary_family" in raw:
+            deserialized["host_primary_family"] = cls.deserialize_host_primary_family(
+                raw["host_primary_family"]
+            )
+        if "host_additional_addresses_ipv4" in raw:
+            deserialized["host_additional_addresses_ipv4"] = [
+                HostAddress(ip) for ip in raw["host_additional_addresses_ipv4"]
+            ]
+        if "host_additional_addresses_ipv6" in raw:
+            deserialized["host_additional_addresses_ipv6"] = [
+                HostAddress(ip) for ip in raw["host_additional_addresses_ipv6"]
+            ]
+        return cls(**deserialized)
+
+    @staticmethod
+    def deserialize_host_primary_family(
+        raw: int,
+    ) -> Literal[
+        socket.AddressFamily.AF_INET,
+        socket.AddressFamily.AF_INET6,
+    ]:
+        address_family = socket.AddressFamily(raw)
+        if address_family is socket.AddressFamily.AF_INET:
+            return socket.AddressFamily.AF_INET
+        if address_family is socket.AddressFamily.AF_INET6:
+            return socket.AddressFamily.AF_INET6
+        raise ValueError(f"Invalid address family: {address_family}")
+
+    def serialize(self, _for_cmk_version: cmk_version.Version) -> str:
+        return json.dumps(
+            {
+                "host_name": str(self.host_name),
+                "host_alias": self.host_alias,
+                "ip_address": str(self.ip_address) if self.ip_address else None,
+                "ip_stack_config": self.ip_stack_config.value,
+                "host_attrs": self.host_attrs,
+                "macros": self.macros,
+                "host_primary_family": self.host_primary_family.value,
+                "host_additional_addresses_ipv4": [
+                    str(ip) for ip in self.host_additional_addresses_ipv4
+                ],
+                "host_additional_addresses_ipv6": [
+                    str(ip) for ip in self.host_additional_addresses_ipv6
+                ],
+            }
+        )
+
+
+@dataclass
+class DiagSpecialAgentInput:
+    host_config: DiagSpecialAgentHostConfig
+    agent_name: str
+    params: Mapping[str, object]
+    passwords: Mapping[str, str]
+    http_proxies: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    is_cmc: bool = True
+
+    @classmethod
+    def deserialize(cls, serialized_input: str) -> DiagSpecialAgentInput:
+        raw = json.loads(serialized_input)
+        deserialized = {
+            "host_config": DiagSpecialAgentHostConfig.deserialize(raw["host_config"]),
+            "agent_name": raw["agent_name"],
+            # TODO: at the moment there is no validation for params input possible
+            #  this could change when being able to use the formspec vue visitor for
+            #  (de)serialization in the future.
+            "params": literal_eval(raw["params"]),
+            "passwords": raw["passwords"],
+        }
+        if "http_proxies" in raw:
+            deserialized["http_proxies"] = raw["http_proxies"]
+        if "is_cmc" in raw:
+            deserialized["is_cmc"] = raw["is_cmc"]
+        return cls(**deserialized)
+
+    def serialize(self, _for_cmk_version: cmk_version.Version) -> str:
+        return json.dumps(
+            {
+                "host_config": self.host_config.serialize(_for_cmk_version),
+                "agent_name": self.agent_name,
+                "params": repr(self.params),
+                "passwords": self.passwords,
+                "http_proxies": self.http_proxies,
+                "is_cmc": self.is_cmc,
+            }
+        )
+
+
+@dataclass
+class SpecialAgentResult:
+    return_code: int
+    response: str
+
+
+@dataclass
+class DiagSpecialAgentResult(ABCAutomationResult):
+    results: Sequence[SpecialAgentResult]
+
+    @staticmethod
+    def automation_call() -> str:
+        return "diag-special-agent"
+
+    def serialize(self, for_cmk_version: cmk_version.Version) -> SerializedResult:
+        return SerializedResult(
+            json.dumps(
+                {
+                    "results": [asdict(r) for r in self.results],
+                }
+            )
+        )
+
+    @classmethod
+    def deserialize(cls, serialized_result: SerializedResult) -> DiagSpecialAgentResult:
+        raw = json.loads(serialized_result)
+        return cls(
+            results=[SpecialAgentResult(**r) for r in raw["results"]],
+        )
+
+
+result_type_registry.register(DiagSpecialAgentResult)
 
 
 @dataclass
@@ -395,6 +705,16 @@ result_type_registry.register(UpdateDNSCacheResult)
 
 
 @dataclass
+class UpdatePasswordsMergedFileResult(ABCAutomationResult):
+    @staticmethod
+    def automation_call() -> str:
+        return "update-passwords-merged-file"
+
+
+result_type_registry.register(UpdatePasswordsMergedFileResult)
+
+
+@dataclass
 class GetAgentOutputResult(ABCAutomationResult):
     success: bool
     service_details: ServiceDetails
@@ -431,6 +751,18 @@ result_type_registry.register(NotificationAnalyseResult)
 
 
 @dataclass
+class NotificationTestResult(ABCAutomationResult):
+    result: NotifyAnalysisInfo | None
+
+    @staticmethod
+    def automation_call() -> str:
+        return "notification-test"
+
+
+result_type_registry.register(NotificationTestResult)
+
+
+@dataclass
 class NotificationGetBulksResult(ABCAutomationResult):
     result: NotifyBulks
 
@@ -458,7 +790,7 @@ result_type_registry.register(CreateDiagnosticsDumpResult)
 
 @dataclass
 class BakeAgentsResult(ABCAutomationResult):
-    warnings_as_json: str
+    output: str | None
 
     @staticmethod
     def automation_call() -> str:

@@ -8,16 +8,14 @@
 
 #include <string>
 
-#include "livestatus/Row.h"
 #include "livestatus/TableEventConsole.h"
-class MonitoringCore;
 
 class TableEventConsoleStatus : public TableEventConsole {
 public:
-    explicit TableEventConsoleStatus(MonitoringCore *mc);
+    TableEventConsoleStatus();
     [[nodiscard]] std::string name() const override;
     [[nodiscard]] std::string namePrefix() const override;
-    [[nodiscard]] Row getDefault() const override;
+    [[nodiscard]] Row getDefault(const ICore &core) const override;
 };
 
 #endif  // TableEventConsoleStatus_h

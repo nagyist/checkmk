@@ -4,10 +4,11 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 import abc
+import re
 from collections.abc import Iterable, Sequence
-from typing import NamedTuple
+from typing import NamedTuple, override
 
-import cmk.utils.plugin_registry
+import cmk.ccc.plugin_registry
 
 from cmk.gui.breadcrumb import BreadcrumbItem
 from cmk.gui.http import request
@@ -18,8 +19,14 @@ from cmk.gui.utils.urls import makeuri_contextless
 
 
 class MenuItem:
-    def __init__(  # type: ignore[no-untyped-def]
-        self, mode_or_url, title, icon, permission, description, sort_index=20
+    def __init__(
+        self,
+        mode_or_url: str,
+        title: str,
+        icon: Icon,
+        permission: str | None,
+        description: str,
+        sort_index: int = 20,
     ) -> None:
         self._mode_or_url = mode_or_url
         self._title = title
@@ -56,7 +63,7 @@ class MenuItem:
     def enabled(self) -> bool:
         return True
 
-    def may_see(self):
+    def may_see(self) -> bool:
         """Whether or not the currently logged in user is allowed to see this module"""
         if not self.enabled:
             return False
@@ -71,25 +78,15 @@ class MenuItem:
 
         return user.may(permission) or user.may("wato.seeall")
 
-    def get_url(self):
+    def get_url(self) -> str:
         mode_or_url = self.mode_or_url
         if "?" in mode_or_url or "/" in mode_or_url or mode_or_url.endswith(".py"):
             return mode_or_url
         return makeuri_contextless(request, [("mode", mode_or_url)], filename="wato.py")
 
+    @override
     def __repr__(self) -> str:
-        return (
-            "%s(mode_or_url=%r, title=%r, icon=%r, permission=%r, description=%r, sort_index=%r)"
-            % (
-                self.__class__.__name__,
-                self.mode_or_url,
-                self.title,
-                self.icon,
-                self.permission,
-                self.description,
-                self.sort_index,
-            )
-        )
+        return f"{self.__class__.__name__}(mode_or_url={self.mode_or_url!r}, title={self.title!r}, icon={self.icon!r}, permission={self.permission!r}, description={self.description!r}, sort_index={self.sort_index!r})"
 
 
 class MainModuleTopic(NamedTuple):
@@ -99,7 +96,8 @@ class MainModuleTopic(NamedTuple):
     sort_index: int
 
 
-class MainModuleTopicRegistry(cmk.utils.plugin_registry.Registry[MainModuleTopic]):
+class MainModuleTopicRegistry(cmk.ccc.plugin_registry.Registry[MainModuleTopic]):
+    @override
     def plugin_name(self, instance: MainModuleTopic) -> str:
         return instance.name
 
@@ -111,12 +109,11 @@ class ABCMainModule(MenuItem, abc.ABC):
     def __init__(self) -> None:
         # TODO: Cleanup hierarchy
         super().__init__(
-            mode_or_url=None,
-            title=None,
-            icon=None,
+            mode_or_url="",
+            title="",
+            icon="menu",
             permission=None,
-            description=None,
-            sort_index=None,
+            description="",
         )
 
     @property
@@ -126,31 +123,37 @@ class ABCMainModule(MenuItem, abc.ABC):
 
     @property
     @abc.abstractmethod
+    @override
     def mode_or_url(self) -> str:
         raise NotImplementedError()
 
     @property
     @abc.abstractmethod
+    @override
     def title(self) -> str:
         raise NotImplementedError()
 
     @property
     @abc.abstractmethod
+    @override
     def icon(self) -> Icon:
         raise NotImplementedError()
 
     @property
     @abc.abstractmethod
+    @override
     def permission(self) -> None | str:
         raise NotImplementedError()
 
     @property
     @abc.abstractmethod
+    @override
     def description(self) -> str:
         raise NotImplementedError()
 
     @property
     @abc.abstractmethod
+    @override
     def sort_index(self) -> int:
         raise NotImplementedError()
 
@@ -163,17 +166,47 @@ class ABCMainModule(MenuItem, abc.ABC):
     def additional_breadcrumb_items(cls) -> Iterable[BreadcrumbItem]:
         """This class method allows for adding additional items to the breadcrumb navigation"""
         return
-        yield  # pylint: disable=unreachable
+        yield
 
     @classmethod
-    def additional_matches_setup_search(cls) -> Sequence[str]:
+    def megamenu_search_terms(cls) -> Sequence[str]:
         """This class method allows adding additional match texts for the search"""
         return []
 
 
-class MainModuleRegistry(cmk.utils.plugin_registry.Registry[type[ABCMainModule]]):
-    def plugin_name(self, instance):
+class MainModuleRegistry(cmk.ccc.plugin_registry.Registry[type[ABCMainModule]]):
+    @override
+    def plugin_name(self, instance: type[ABCMainModule]) -> str:
         return instance().mode_or_url
 
 
 main_module_registry = MainModuleRegistry()
+
+
+class WatoModule(MenuItem):
+    """Used with register_modules() in pre 1.6 versions to register main modules"""
+
+
+def register_modules(*args: WatoModule) -> None:
+    """Register one or more top level modules to Checkmk Setup.
+    The registered modules are displayed in the navigation of Setup."""
+    for wato_module in args:
+        assert isinstance(wato_module, WatoModule)
+
+        internal_name = re.sub("[^a-zA-Z]", "", wato_module.mode_or_url)
+
+        cls = type(
+            "LegacyMainModule%s" % internal_name.title(),
+            (ABCMainModule,),
+            {
+                "mode_or_url": wato_module.mode_or_url,
+                "topic": main_module_topic_registry["exporter"],
+                "title": wato_module.title,
+                "icon": wato_module.icon,
+                "permission": wato_module.permission,
+                "description": wato_module.description,
+                "sort_index": wato_module.sort_index,
+                "is_show_more": False,
+            },
+        )
+        main_module_registry.register(cls)

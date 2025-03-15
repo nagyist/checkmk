@@ -5,10 +5,12 @@
 
 #include "livestatus/ListFilter.h"
 
+#include <optional>
 #include <utility>
 
 #include "livestatus/Logger.h"
 #include "livestatus/RegExp.h"
+#include "livestatus/opids.h"
 
 namespace {
 RelationalOperator relOpForElement(RelationalOperator relOp) {

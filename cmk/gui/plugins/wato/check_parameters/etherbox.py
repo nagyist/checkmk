@@ -3,17 +3,24 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 from cmk.gui.i18n import _
 from cmk.gui.plugins.wato.utils import (
     CheckParameterRulespecWithItem,
-    Levels,
     rulespec_registry,
     RulespecGroupCheckParametersApplications,
 )
-from cmk.gui.valuespec import Dictionary, TextInput, ValueSpec
+from cmk.gui.plugins.wato.utils.simple_levels import SimpleLevels
+from cmk.gui.valuespec import (
+    CascadingDropdown,
+    Dictionary,
+    MonitoringState,
+    TextInput,
+    Tuple,
+)
 
 
-def _item_spec() -> ValueSpec:
+def _item_spec() -> TextInput:
     return TextInput(
         title=_("Contact sensor type"),
         help=_(
@@ -24,31 +31,40 @@ def _item_spec() -> ValueSpec:
     )
 
 
-def _vs_voltage() -> ValueSpec:
+def _vs_smoke() -> Dictionary:
     return Dictionary(
-        title=_("Voltage levels"),
-        elements=[("levels", Levels(title=_("Voltage Levels")))],
-        required_keys=["levels"],
-    )
-
-
-rulespec_registry.register(
-    CheckParameterRulespecWithItem(
-        check_group_name="etherbox_voltage",
-        group=RulespecGroupCheckParametersApplications,
-        match_type="dict",
-        parameter_valuespec=_vs_voltage,
-        title=lambda: _("Etherbox voltage"),
-        item_spec=_item_spec,
-    )
-)
-
-
-def _vs_smoke() -> ValueSpec:
-    return Dictionary(
-        title=_("Smoke levels"),
-        elements=[("levels", Levels(title=_("Smoke Levels")))],
-        required_keys=["levels"],
+        title=_("Smoke monitoring"),
+        elements=[
+            (
+                "smoke_handling",
+                CascadingDropdown(
+                    title=_("Smoke handling"),
+                    choices=[
+                        (
+                            "binary",
+                            _("Set monitoring states for no-smoke and smoke cases"),
+                            Tuple(
+                                elements=[
+                                    MonitoringState(
+                                        title=_("Monitoring state if no smoke is detected"),
+                                    ),
+                                    MonitoringState(
+                                        title=_("Monitoring state if smoke is detected"),
+                                    ),
+                                ],
+                            ),
+                        ),
+                        (
+                            "levels",
+                            _("Configure levels on smoke"),
+                            SimpleLevels(title=_("Smoke Levels")),
+                        ),
+                    ],
+                    sorted=False,
+                ),
+            )
+        ],
+        optional_keys=[],
     )
 
 

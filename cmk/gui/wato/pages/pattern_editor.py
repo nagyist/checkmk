@@ -5,19 +5,17 @@
 """Mode for trying out the logwatch patterns"""
 
 import re
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 
-from cmk.utils.labels import Labels
-from cmk.utils.type_defs import CheckPluginNameStr, HostName, Item, ServiceName
+from livestatus import SiteId
 
-# Tolerate this for 1.6. Should be cleaned up in future versions,
-# e.g. by trying to move the common code to a common place
-import cmk.base.export  # pylint: disable=cmk-module-layer-violation
+from cmk.utils.hostaddress import HostName
 
-import cmk.gui.forms as forms
+from cmk.checkengine.checking import CheckPluginName
+
+from cmk.gui import forms
 from cmk.gui.breadcrumb import Breadcrumb
 from cmk.gui.exceptions import MKUserError
-from cmk.gui.htmllib.foldable_container import foldable_container
 from cmk.gui.htmllib.generator import HTMLWriter
 from cmk.gui.htmllib.html import html
 from cmk.gui.http import request
@@ -29,27 +27,39 @@ from cmk.gui.page_menu import (
     PageMenuEntry,
     PageMenuTopic,
 )
-from cmk.gui.plugins.wato.utils import mode_registry, WatoMode
-from cmk.gui.table import table_element
+from cmk.gui.table import Foldable, table_element
 from cmk.gui.type_defs import PermissionName
-from cmk.gui.utils.escaping import escape_to_html
 from cmk.gui.utils.html import HTML
 from cmk.gui.utils.urls import makeuri_contextless
 from cmk.gui.wato.pages.rulesets import ModeEditRuleset
-from cmk.gui.watolib.check_mk_automations import analyse_service
+from cmk.gui.watolib.check_mk_automations import (
+    analyse_service,
+    analyze_service_rule_matches,
+    get_service_name,
+)
 from cmk.gui.watolib.config_hostname import ConfigHostname
-from cmk.gui.watolib.hosts_and_folders import Folder, folder_preserving_link
-from cmk.gui.watolib.rulesets import SingleRulesetRecursively
+from cmk.gui.watolib.hosts_and_folders import folder_from_request, folder_preserving_link
+from cmk.gui.watolib.mode import ModeRegistry, WatoMode
+from cmk.gui.watolib.rulesets import Rule, rules_grouped_by_folder, SingleRulesetRecursively
 from cmk.gui.watolib.search import (
     ABCMatchItemGenerator,
-    match_item_generator_registry,
     MatchItem,
+    MatchItemGeneratorRegistry,
     MatchItems,
 )
 from cmk.gui.watolib.utils import mk_repr
 
 
-@mode_registry.register
+def register(
+    mode_registry: ModeRegistry,
+    match_item_generator_registry: MatchItemGeneratorRegistry,
+) -> None:
+    mode_registry.register(ModePatternEditor)
+    match_item_generator_registry.register(
+        MatchItemGeneratorLogfilePatternAnalyzer("logfile_pattern_analyzer")
+    )
+
+
 class ModePatternEditor(WatoMode):
     @classmethod
     def name(cls) -> str:
@@ -83,7 +93,7 @@ class ModePatternEditor(WatoMode):
         self._item = request.get_str_input_mandatory("file", "")
         self._match_txt = request.get_str_input_mandatory("match", "")
 
-        self._host = Folder.current().host(self._hostname)
+        self._host = folder_from_request(request.var("folder"), self._hostname).host(self._hostname)
 
         if self._hostname and not self._host:
             raise MKUserError(None, _("This host does not exist."))
@@ -160,33 +170,32 @@ class ModePatternEditor(WatoMode):
         self._show_patterns()
 
     def _show_try_form(self):
-        html.begin_form("try")
-        forms.header(_("Try Pattern Match"))
-        forms.section(_("Hostname"))
-        self._vs_host().render_input("host", self._hostname)
-        forms.section(_("Logfile"))
-        html.help(_("Here you need to insert the original file or pathname"))
-        html.text_input("file", size=80)
-        forms.section(_("Text to match"))
-        html.help(
-            _(
-                "You can insert some text (e.g. a line of the logfile) to test the patterns defined "
-                "for this logfile. All patterns for this logfile are listed below. Matching patterns "
-                'will be highlighted after clicking the "Try out" button.'
+        with html.form_context("try"):
+            forms.header(_("Try pattern match"))
+            forms.section(_("Host name"))
+            self._vs_host().render_input("host", self._hostname)
+            forms.section(_("Logfile"))
+            html.help(_("Here you need to insert the original file or pathname"))
+            html.text_input("file", size=80)
+            forms.section(_("Text to match"))
+            html.help(
+                _(
+                    "You can insert some text (e.g. a line of the logfile) to test the patterns defined "
+                    "for this logfile. All patterns for this logfile are listed below. Matching patterns "
+                    'will be highlighted after clicking the "Try out" button.'
+                )
             )
-        )
-        html.text_input("match", cssclass="match", size=100)
-        forms.end()
-        html.button("_try", _("Try out"))
-        request.del_var("folder")  # Never hand over the folder here
-        html.hidden_fields()
-        html.end_form()
+            html.text_input("match", cssclass="match", size=100)
+            forms.end()
+            html.button("_try", _("Try out"))
+            request.del_var("folder")  # Never hand over the folder here
+            html.hidden_fields()
 
     def _vs_host(self):
         return ConfigHostname()
 
-    def _show_patterns(self):  # pylint: disable=too-many-branches
-        import cmk.gui.logwatch as logwatch
+    def _show_patterns(self):
+        from cmk.gui import logwatch
 
         ruleset = SingleRulesetRecursively.load_single_ruleset_recursively("logwatch_rules").get(
             "logwatch_rules"
@@ -195,7 +204,7 @@ class ModePatternEditor(WatoMode):
         html.h3(_("Logfile patterns"))
         if ruleset.is_empty():
             html.open_div(class_="info")
-            html.write_text(
+            html.write_text_permissive(
                 "There are no logfile patterns defined. You may create "
                 'logfile patterns using the <a href="%s">Rule Editor</a>.'
                 % folder_preserving_link(
@@ -210,136 +219,150 @@ class ModePatternEditor(WatoMode):
         # Loop all rules for this ruleset
         already_matched = False
         abs_rulenr = 0
-        service_labels: Labels = {}
-        if self._hostname:
-            service_desc = self._get_service_description(self._hostname, "logwatch", self._item)
-            host = Folder.current().host(self._hostname)
-            if not host:
-                raise MKUserError("host", _("The given host does not exist"))
-            service_labels = analyse_service(
-                host.site_id(),
-                self._hostname,
-                service_desc,
-            ).labels
-        for folder, rulenr, rule in ruleset.get_rules():
-            # Check if this rule applies to the given host/service
-            if self._hostname:
-                service_desc = self._get_service_description(self._hostname, "logwatch", self._item)
+        folder = folder_from_request(request.var("folder"), request.get_ascii_input("host"))
 
-                # If hostname (and maybe filename) try match it
-                rule_matches = rule.matches_host_and_item(
-                    Folder.current(),
-                    self._hostname,
-                    self._item,
-                    service_desc,
-                    service_labels=service_labels,
-                )
-            else:
-                # If no host/file given match all rules
-                rule_matches = True
+        rules = ruleset.get_rules()
+        rule_match_results = (
+            self._analyze_rule_matches(
+                self._host.site_id(), self._hostname, self._item, [r[2] for r in rules]
+            )
+            if self._hostname and self._host
+            else {}
+        )
 
-            with foldable_container(
-                treename="rule",
-                id_=str(abs_rulenr),
-                isopen=True,
-                title=HTML("<b>Rule #%d</b>" % (abs_rulenr + 1)),
-                indent=False,
-            ), table_element(
-                "pattern_editor_rule_%d" % abs_rulenr, sortable=False, css="logwatch"
+        for folder, folder_rules in rules_grouped_by_folder(rules, folder):
+            with table_element(
+                f"logfile_patterns_{folder.ident()}",
+                title="%s %s (%d)"
+                % (
+                    _("Rules in folder"),
+                    folder.alias_path(),
+                    ruleset.num_rules_in_folder(folder),
+                ),
+                css="logwatch",
+                searchable=False,
+                sortable=False,
+                limit=None,
+                foldable=Foldable.FOLDABLE_SAVE_STATE,
+                omit_update_header=True,
             ) as table:
-                abs_rulenr += 1
+                for _folder, rulenr, rule in folder_rules:
+                    # If no host/file given match all rules
+                    rule_matches = rule_match_results[rule.id] if rule_match_results else False
 
-                # TODO: What's this?
-                pattern_list = rule.value
-                if isinstance(pattern_list, dict):
-                    pattern_list = pattern_list["reclassify_patterns"]
+                    abs_rulenr += 1
 
-                # Each rule can hold no, one or several patterns. Loop them all here
-                for state, pattern, comment in pattern_list:
-                    match_class = ""
-                    disp_match_txt = HTML("")
-                    match_img = ""
-                    if rule_matches:
-                        # Applies to the given host/service
-                        matched = re.search(pattern, self._match_txt)
-                        if matched:
-                            # Prepare highlighted search txt
-                            match_start = matched.start()
-                            match_end = matched.end()
-                            disp_match_txt = (
-                                escape_to_html(self._match_txt[:match_start])
-                                + HTMLWriter.render_span(
-                                    self._match_txt[match_start:match_end], class_="match"
+                    # TODO: What's this?
+                    pattern_list = rule.value
+                    if isinstance(pattern_list, dict):
+                        pattern_list = pattern_list["reclassify_patterns"]
+
+                    # Each rule can hold no, one or several patterns. Loop them all here
+                    for state, pattern, comment in pattern_list:
+                        match_class = ""
+                        disp_match_txt = HTML.empty()
+                        match_img = ""
+                        if rule_matches:
+                            # Applies to the given host/service
+                            matched = re.search(pattern, self._match_txt)
+                            if matched:
+                                # Prepare highlighted search txt
+                                match_start = matched.start()
+                                match_end = matched.end()
+                                disp_match_txt = (
+                                    HTML.with_escaping(self._match_txt[:match_start])
+                                    + HTMLWriter.render_span(
+                                        self._match_txt[match_start:match_end], class_="match"
+                                    )
+                                    + HTML.with_escaping(self._match_txt[match_end:])
                                 )
-                                + escape_to_html(self._match_txt[match_end:])
-                            )
 
-                            if not already_matched:
-                                # First match
-                                match_class = "match first"
-                                match_img = "match"
-                                match_title = _(
-                                    "This logfile pattern matches first and will be used for "
-                                    "defining the state of the given line."
-                                )
-                                already_matched = True
+                                if not already_matched:
+                                    # First match
+                                    match_class = "match first"
+                                    match_img = "checkmark"
+                                    match_title = _(
+                                        "This logfile pattern matches first and will be used for "
+                                        "defining the state of the given line."
+                                    )
+                                    already_matched = True
+                                else:
+                                    # subsequent match
+                                    match_class = "match"
+                                    match_img = "checkmark_orange"
+                                    match_title = _(
+                                        "This logfile pattern matches but another matched first."
+                                    )
                             else:
-                                # subsequent match
-                                match_class = "match"
-                                match_img = "imatch"
+                                match_img = "hyphen"
                                 match_title = _(
-                                    "This logfile pattern matches but another matched first."
+                                    "This logfile pattern does not match the given string."
                                 )
                         else:
-                            match_img = "nmatch"
-                            match_title = _("This logfile pattern does not match the given string.")
-                    else:
-                        # rule does not match
-                        match_img = "nmatch"
-                        match_title = _("The rule conditions do not match.")
+                            # rule does not match
+                            match_img = "hyphen"
+                            match_title = _("The rule conditions do not match.")
 
-                    table.row()
-                    table.cell(_("Match"))
-                    html.icon("rule%s" % match_img, match_title)
+                        table.row()
+                        table.cell("#", css=["narrow nowrap"])
+                        html.write_text_permissive(rulenr)
+                        table.cell(_("Match"))
+                        html.icon(match_img, match_title)
 
-                    cls = (
-                        ["state%d" % logwatch.level_state(state), "fillbackground"]
-                        if match_class == "match first"
-                        else []
+                        cls = (
+                            ["state%d" % logwatch.level_state(state), "fillbackground"]
+                            if match_class == "match first"
+                            else []
+                        )
+
+                        table.cell(
+                            _("Checkmk state"),
+                            HTMLWriter.render_span(logwatch.level_name(state)),
+                            css=cls,
+                        )
+                        table.cell(
+                            _("Logwatch state"),
+                            HTMLWriter.render_span(logwatch.logwatch_level_name(state)),
+                            css=cls,
+                        )
+                        table.cell(_("Pattern"), HTMLWriter.render_tt(pattern))
+                        table.cell(_("Comment"), comment)
+                        table.cell(_("Matched line"), disp_match_txt)
+
+                    table.row(fixed=True, collect_headers=False)
+                    table.cell(colspan=7)
+                    edit_url = folder_preserving_link(
+                        [
+                            ("mode", "edit_rule"),
+                            ("varname", "logwatch_rules"),
+                            ("rulenr", rulenr),
+                            ("item", mk_repr(self._item).decode()),
+                            ("rule_folder", folder.path()),
+                            ("rule_id", rule.id),
+                        ]
                     )
+                    html.icon_button(edit_url, _("Edit this rule"), "edit")
 
-                    table.cell(
-                        _("Checkmk state"),
-                        HTMLWriter.render_span(logwatch.level_name(state)),
-                        css=cls,
-                    )
-                    table.cell(
-                        _("Logwatch state"),
-                        HTMLWriter.render_span(logwatch.logwatch_level_name(state)),
-                        css=cls,
-                    )
-                    table.cell(_("Pattern"), HTMLWriter.render_tt(pattern))
-                    table.cell(_("Comment"), comment)
-                    table.cell(_("Matched line"), disp_match_txt)
+    def _analyze_rule_matches(
+        self, site_id: SiteId, host_name: HostName, item: str, rules: Sequence[Rule]
+    ) -> dict[str, bool]:
+        service_desc = get_service_name(host_name, CheckPluginName("logwatch"), item).service_name
+        service_labels = analyse_service(
+            site_id,
+            host_name,
+            service_desc,
+        ).labels
 
-                table.row(fixed=True)
-                table.cell(colspan=5)
-                edit_url = folder_preserving_link(
-                    [
-                        ("mode", "edit_rule"),
-                        ("varname", "logwatch_rules"),
-                        ("rulenr", rulenr),
-                        ("item", mk_repr(self._item).decode()),
-                        ("rule_folder", folder.path()),
-                        ("rule_id", rule.id),
-                    ]
-                )
-                html.icon_button(edit_url, _("Edit this rule"), "edit")
-
-    def _get_service_description(
-        self, hostname: HostName, check_plugin_name: CheckPluginNameStr, item: Item
-    ) -> ServiceName:
-        return cmk.base.export.service_description(hostname, check_plugin_name, item)
+        return {
+            rule_id: bool(matches)
+            for rule_id, matches in analyze_service_rule_matches(
+                host_name,
+                item,
+                service_labels,
+                [r.to_single_base_ruleset() for r in rules],
+            ).results.items()
+            for rule in rules
+        }
 
 
 class MatchItemGeneratorLogfilePatternAnalyzer(ABCMatchItemGenerator):
@@ -363,8 +386,3 @@ class MatchItemGeneratorLogfilePatternAnalyzer(ABCMatchItemGenerator):
     @property
     def is_localization_dependent(self) -> bool:
         return True
-
-
-match_item_generator_registry.register(
-    MatchItemGeneratorLogfilePatternAnalyzer("logfile_pattern_analyzer")
-)

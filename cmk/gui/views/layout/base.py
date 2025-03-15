@@ -6,9 +6,8 @@
 import abc
 from collections.abc import Sequence
 
+from cmk.gui.painter.v0 import Cell
 from cmk.gui.type_defs import Rows, ViewSpec
-
-from ..painter.v0.base import Cell
 
 
 class Layout(abc.ABC):
@@ -51,6 +50,11 @@ class Layout(abc.ABC):
     @property
     def has_individual_csv_export(self) -> bool:
         """Whether this layout has an individual CSV export implementation"""
+        return False
+
+    @property
+    def hide_entries_per_row(self) -> bool:
+        """Whether this layout has displays the entries per row option"""
         return False
 
     def csv_export(

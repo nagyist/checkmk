@@ -8,17 +8,20 @@ import contextlib
 import http.client
 from collections.abc import Iterator
 from datetime import datetime
+from urllib.parse import unquote
+
+import cmk.ccc.version as cmk_version
+from cmk.ccc.site import omd_site, url_prefix
 
 import cmk.utils.paths
-import cmk.utils.version as cmk_version
-from cmk.utils.crypto.password import Password
 from cmk.utils.licensing.handler import LicenseStateError, RemainingTrialTime
-from cmk.utils.licensing.registry import get_remaining_trial_time
-from cmk.utils.site import omd_site, url_prefix
-from cmk.utils.type_defs import UserId
+from cmk.utils.licensing.registry import get_remaining_trial_time_rounded
+from cmk.utils.log.security_event import log_security_event
+from cmk.utils.urls import is_allowed_url
+from cmk.utils.user import UserId
 
 import cmk.gui.mobile
-import cmk.gui.userdb as userdb
+from cmk.gui import userdb
 from cmk.gui.auth import is_site_login
 from cmk.gui.breadcrumb import Breadcrumb
 from cmk.gui.config import active_config
@@ -27,21 +30,40 @@ from cmk.gui.htmllib.generator import HTMLWriter
 from cmk.gui.htmllib.header import make_header
 from cmk.gui.htmllib.html import html
 from cmk.gui.http import request, response
-from cmk.gui.i18n import _
-from cmk.gui.logged_in import LoggedInNobody, LoggedInUser, user
+from cmk.gui.i18n import _, ungettext
+from cmk.gui.logged_in import (
+    LoggedInNobody,
+    LoggedInRemoteSite,
+    LoggedInSuperUser,
+    LoggedInUser,
+    user,
+)
 from cmk.gui.main import get_page_heading
-from cmk.gui.pages import Page, page_registry
-from cmk.gui.plugins.userdb.utils import active_connections_by_type
+from cmk.gui.pages import Page, PageRegistry
 from cmk.gui.session import session, UserContext
+from cmk.gui.theme.current_theme import theme
+from cmk.gui.userdb import get_active_saml_connections
 from cmk.gui.userdb.session import auth_cookie_name
-from cmk.gui.utils.escaping import escape_to_html
+from cmk.gui.utils import roles
 from cmk.gui.utils.html import HTML
 from cmk.gui.utils.login import show_saml2_login, show_user_errors
 from cmk.gui.utils.mobile import is_mobile
-from cmk.gui.utils.theme import theme
+from cmk.gui.utils.security_log_events import AuthenticationFailureEvent, AuthenticationSuccessEvent
 from cmk.gui.utils.transaction_manager import transactions
 from cmk.gui.utils.urls import makeuri, requested_file_name, urlencode
 from cmk.gui.utils.user_errors import user_errors
+
+from cmk.crypto.password import Password
+
+
+def register(page_registry: PageRegistry) -> None:
+    # TODO: only overwrite this in cse specific files
+    if cmk_version.edition(cmk.utils.paths.omd_root) == cmk_version.Edition.CSE:
+        page_registry.register_page("login")(SaasLoginPage)
+        page_registry.register_page("logout")(SaasLogoutPage)
+    else:
+        page_registry.register_page("login")(LoginPage)
+        page_registry.register_page("logout")(LogoutPage)
 
 
 @contextlib.contextmanager
@@ -59,6 +81,10 @@ def authenticate() -> Iterator[bool]:
     automation secret authentication."""
     if isinstance(session.user, LoggedInNobody):
         yield False
+    elif isinstance(session.user, (LoggedInSuperUser, LoggedInRemoteSite)):
+        # This is used with the internaltoken auth
+        # Let's hope we do not need the transactions for this user...
+        yield True
     else:
         assert session.session_info.auth_type
         with TransactionIdContext(session.user.ident):
@@ -75,10 +101,6 @@ def TransactionIdContext(user_id: UserId) -> Iterator[None]:
 
     """
     with UserContext(user_id):
-        # Auth with automation secret succeeded before - mark transid as
-        # unneeded in this case
-        if session.session_info.auth_type == "automation":
-            transactions.ignore()
         try:
             yield
         finally:
@@ -94,6 +116,16 @@ def del_auth_cookie() -> None:
     response.unset_http_cookie(cookie_name)
 
 
+class SaasLoginPage(Page):
+    def page(self) -> None:
+        raise HTTPRedirect("cognito_sso.py")
+
+
+class SaasLogoutPage(Page):
+    def page(self) -> None:
+        raise HTTPRedirect("cognito_logout.py")
+
+
 # TODO: Needs to be cleaned up. When using HTTP header auth or web server auth it is not
 # ensured that a user exists after letting the user in. This is a problem for the following
 # code! We need to define a point where the following code can rely on an existing user
@@ -104,11 +136,12 @@ def del_auth_cookie() -> None:
 # - It calls connection.is_locked() but we don't
 
 
-@page_registry.register_page("login")
 class LoginPage(Page):
     def __init__(self) -> None:
         super().__init__()
         self._no_html_output = False
+        self._username_varname = "_username"
+        self._password_varname = "_password"
 
     def set_no_html_output(self, no_html_output: bool) -> None:
         self._no_html_output = no_html_output
@@ -135,6 +168,8 @@ class LoginPage(Page):
             return
 
         try:
+            username: UserId | None = None  # make sure it's defined in the except block
+
             if not active_config.user_login and not is_site_login():
                 raise MKUserError(None, _("Login is not allowed on this site."))
 
@@ -145,13 +180,24 @@ class LoginPage(Page):
             if request.request_method != "POST" and not active_config.enable_login_via_get:
                 raise MKUserError(None, _("Method not allowed"))
 
-            username_var = request.get_str_input("_username", "")
-            assert username_var is not None
-            username = UserId(username_var.rstrip())
-            if not username:
-                raise MKUserError("_username", _("Missing username"))
+            username_var = request.get_str_input(self._username_varname, "")
+            if not username_var:
+                raise MKUserError(
+                    self._username_varname, _("No username entered. Please enter a username.")
+                )
 
-            password = request.get_validated_type_input_mandatory(Password, "_password")
+            password_var = request.get_str_input(self._password_varname, "")
+            if not password_var:
+                raise MKUserError(
+                    self._password_varname, _("No password entered. Please enter a password.")
+                )
+
+            try:
+                username = UserId(username_var.rstrip())
+                password = Password(password_var)
+            except ValueError:
+                # If type validation fails the credentials cannot be valid. Show the generic error.
+                raise MKUserError(None, self._default_login_error_msg)
 
             default_origtarget = url_prefix() + "check_mk/"
             origtarget = request.get_url_input("_origtarget", default_origtarget)
@@ -169,6 +215,9 @@ class LoginPage(Page):
                 # from mixed case to lower case.
                 username = result
 
+                if roles.is_automation_user(username):
+                    raise MKUserError(None, _("Automation user rejected"))
+
                 # The login succeeded! Now:
                 # a) Set the auth cookie
                 # b) Unset the login vars in further processing
@@ -182,27 +231,58 @@ class LoginPage(Page):
                         "user_login_two_factor.py?_origtarget=%s" % urlencode(makeuri(request, []))
                     )
 
-                # Never use inplace redirect handling anymore as used in the past. This results
-                # in some unexpected situations. We simpy use 302 redirects now. So we have a
-                # clear situation.
-                # userdb.need_to_change_pw returns either False or the reason description why the
+                # Having this before password updating to prevent redirect access issues
+                if (
+                    active_config.require_two_factor_all_users
+                    or roles.is_two_factor_required(username)
+                ) and not session.session_info.two_factor_completed:
+                    session.session_info.two_factor_required = True
+                    raise HTTPRedirect(
+                        "user_two_factor_enforce.py?_origtarget=%s"
+                        % urlencode(makeuri(request, []))
+                    )
+
+                log_security_event(
+                    AuthenticationSuccessEvent(
+                        auth_method="login_form", username=username, remote_ip=request.remote_ip
+                    )
+                )
+
+                # userdb.need_to_change_pw returns either None or the reason description why the
                 # password needs to be changed
                 if change_reason := userdb.need_to_change_pw(username, now):
                     raise HTTPRedirect(
                         f"user_change_pw.py?_origtarget={urlencode(origtarget)}&reason={change_reason}"
                     )
 
+                # If user pasted e.g. a view to a link in mobile mode, redirect
+                # to the correct page
+                if is_mobile(request, response) and "start_url" in origtarget:
+                    url = unquote(origtarget.split("start_url=")[1])
+                    if not is_allowed_url(url):
+                        url = default_origtarget
+                    raise HTTPRedirect(url)
+
                 raise HTTPRedirect(origtarget)
 
             userdb.on_failed_login(username, now)
-            raise MKUserError(None, _("Invalid login"))
+            raise MKUserError(self._password_varname, self._default_login_error_msg)
+
         except MKUserError as e:
+            log_security_event(
+                AuthenticationFailureEvent(
+                    user_error=e.message,
+                    auth_method="login_form",
+                    username=username,
+                    remote_ip=request.remote_ip,
+                )
+            )
             user_errors.add(e)
 
     def _show_login_page(self) -> None:
         html.render_headfoot = False
         html.add_body_css_class("login")
-        make_header(html, get_page_heading(), Breadcrumb(), javascripts=[])
+        make_header(html, get_page_heading(), Breadcrumb())
 
         default_origtarget = (
             "index.py"
@@ -238,93 +318,116 @@ class LoginPage(Page):
         html.close_a()
 
         try:
-            _show_remaining_trial_time(get_remaining_trial_time())
+            _show_remaining_trial_time(get_remaining_trial_time_rounded())
         except LicenseStateError:
             pass
 
-        html.begin_form("login", method="POST", add_transid=False, action="login.py")
-        html.hidden_field("_login", "1")
-        html.hidden_field("_origtarget", origtarget)
+        with html.form_context("login", method="POST", add_transid=False, action="login.py"):
+            html.hidden_field("_login", "1")
+            html.hidden_field("_origtarget", origtarget)
 
-        saml2_user_error: str | None = None
-        if saml_connections := [
-            c for c in active_connections_by_type("saml2") if c["owned_by_site"] == omd_site()
-        ]:
-            saml2_user_error = show_saml2_login(saml_connections, saml2_user_error, origtarget)
+            saml2_user_error: str | None = None
+            if saml_connections := [
+                c
+                for c in get_active_saml_connections().values()
+                if c["owned_by_site"] == omd_site()
+            ]:
+                saml2_user_error = show_saml2_login(saml_connections, saml2_user_error, origtarget)
 
-        html.open_table()
-        html.open_tr()
-        html.td(
-            html.render_label(
-                "%s:" % _("Username"), id_="label_user", class_=["legend"], for_="_username"
-            ),
-            class_="login_label",
-        )
-        html.open_td(class_="login_input")
-        html.text_input("_username", id_="input_user")
-        html.close_td()
-        html.close_tr()
-        html.open_tr()
-        html.td(
-            html.render_label(
-                "%s:" % _("Password"), id_="label_pass", class_=["legend"], for_="_password"
-            ),
-            class_="login_label",
-        )
-        html.open_td(class_="login_input")
-        html.password_input("_password", id_="input_pass", size=None)
-        html.close_td()
-        html.close_tr()
-        html.close_table()
+            html.open_table()
+            html.open_tr()
+            html.td(
+                html.render_label(
+                    "%s:" % _("Username"),
+                    id_="label_user",
+                    class_=["legend"],
+                    for_=self._username_varname,
+                ),
+                class_="login_label",
+            )
+            html.open_td(class_="login_input")
+            html.text_input(self._username_varname, id_="input_user")
+            html.close_td()
+            html.close_tr()
+            html.open_tr()
+            html.td(
+                html.render_label(
+                    "%s:" % _("Password"),
+                    id_="label_pass",
+                    class_=["legend"],
+                    for_=self._password_varname,
+                ),
+                class_="login_label",
+            )
+            html.open_td(class_="login_input")
+            html.password_input(self._password_varname, id_="input_pass", size=None)
+            html.close_td()
+            html.close_tr()
+            html.close_table()
 
-        html.open_div(id_="button_text")
-        html.button("_login", _("Login"), cssclass=None if saml_connections else "hot")
-        html.close_div()
-
-        if user_errors and not saml2_user_error:
-            show_user_errors("login_error")
-
-        html.close_div()
-
-        html.open_div(id_="foot")
-
-        if active_config.login_screen.get("login_message"):
-            html.open_div(id_="login_message")
-            html.show_message(active_config.login_screen["login_message"])
+            html.open_div(id_="button_text")
+            html.button("_login", _("Login"), cssclass=None if saml_connections else "hot")
             html.close_div()
 
-        footer: list[HTML] = []
-        for title, url, target in active_config.login_screen.get("footer_links", []):
-            footer.append(HTMLWriter.render_a(title, href=url, target=target))
+            if user_errors and not saml2_user_error:
+                show_user_errors("login_error")
 
-        if "hide_version" not in active_config.login_screen:
-            footer.append(escape_to_html("Version: %s" % cmk_version.__version__))
+            html.close_div()
 
-        footer.append(
-            HTML(
-                "&copy; %s"
-                % HTMLWriter.render_a("Checkmk GmbH", href="https://tribe29.com", target="_blank")
+            html.open_div(id_="foot")
+
+            if active_config.login_screen.get("login_message"):
+                html.open_div(id_="login_message")
+                html.show_message(active_config.login_screen["login_message"])
+                html.close_div()
+
+            footer: list[HTML] = []
+            for title, url, target in active_config.login_screen.get("footer_links", []):
+                footer.append(HTMLWriter.render_a(title, href=url, target=target))
+
+            if "hide_version" not in active_config.login_screen:
+                footer.append(HTML.with_escaping("Version: %s" % cmk_version.__version__))
+
+            footer.append(
+                HTML.without_escaping("&copy; ")
+                + HTMLWriter.render_a("Checkmk GmbH", href="https://checkmk.com", target="_blank")
             )
-        )
 
-        html.write_html(HTML(" - ").join(footer))
+            html.write_html(HTML.without_escaping(" - ").join(footer))
 
-        html.close_div()
+            html.close_div()
 
-        html.set_focus("_username")
-        html.hidden_fields()
-        html.end_form()
+            html.set_focus(self._username_varname)
+            html.hidden_fields()
         html.close_div()
 
         html.footer()
 
+    @property
+    def _default_login_error_msg(self) -> str:
+        return _("Incorrect username or password. Please try again.")
+
 
 def _show_remaining_trial_time(remaining_trial_time: RemainingTrialTime) -> None:
+    # remaining_trial_time has already been adjusted for display purposes
+    # so that 29d 23h turns into 30d
+    # and 0d 0h 30m turns into 1h
+    # Note: Once the actual remaining trial time <= 0 seconds,
+    #       this code is not reached anymore (license switch from trial to free)
     remaining_days: int = remaining_trial_time.days
+    remaining_hours: int = remaining_trial_time.hours
     remaining_percentage: float = remaining_trial_time.perc
 
     html.open_div(class_="trial_expiration_info" + (" warning" if remaining_days < 8 else ""))
-    html.span(_("%d days") % remaining_days, class_="remaining_days")
+    html.span(
+        (
+            _("%d days") % remaining_days
+            if remaining_days > 1
+            else "%d " % remaining_hours + ungettext("hour", "hours", remaining_hours)
+        ),
+        class_="remaining_time",
+    )
+
     html.span(_(" left in your free trial"))
 
     html.open_div(class_="time_bar")
@@ -343,7 +446,6 @@ def _show_remaining_trial_time(remaining_trial_time: RemainingTrialTime) -> None
     html.close_div()
 
 
-@page_registry.register_page("logout")
 class LogoutPage(Page):
     def page(self) -> None:
         assert user.id is not None

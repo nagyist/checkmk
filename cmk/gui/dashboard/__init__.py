@@ -3,64 +3,51 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-import cmk.utils.version as cmk_version
+import cmk.ccc.version as cmk_version
 
-import cmk.gui.utils as utils
-import cmk.gui.visuals as visuals
+from cmk.utils import paths
+
+from cmk.gui import utils, visuals
 from cmk.gui.config import default_authorized_builtin_role_ids
 from cmk.gui.i18n import _
-from cmk.gui.pages import PageRegistry
-from cmk.gui.permissions import (
-    declare_dynamic_permissions,
-    declare_permission,
-    permission_registry,
-    PermissionSection,
-    PermissionSectionRegistry,
-)
-from cmk.gui.plugins.visuals.utils import VisualTypeRegistry
+from cmk.gui.permissions import declare_dynamic_permissions, declare_permission, permission_registry
 
-from .builtin_dashboards import builtin_dashboards, GROW, MAX
-from .cre_dashboards import register_builtin_dashboards
+from ._network_topology import get_topology_context_and_filters
+from .builtin_dashboards import (
+    builtin_dashboard_extender_registry,
+    builtin_dashboards,
+    BuiltinDashboardExtender,
+    BuiltinDashboardExtenderRegistry,
+    GROW,
+    MAX,
+    noop_builtin_dashboard_extender,
+)
 from .dashlet import (
     ABCFigureDashlet,
     Dashlet,
     dashlet_registry,
     DashletConfig,
     DashletRegistry,
-    FigureDashletPage,
     IFrameDashlet,
     LinkedViewDashletConfig,
-    register_dashlets,
     StaticTextDashletConfig,
     ViewDashletConfig,
 )
-from .page_create_dashboard import page_create_dashboard
-from .page_create_view_dashlet import (
-    page_create_link_view_dashlet,
-    page_create_view_dashlet,
-    page_create_view_dashlet_infos,
-)
-from .page_edit_dashboard import page_edit_dashboard
-from .page_edit_dashboard_actions import ajax_dashlet_pos, page_clone_dashlet, page_delete_dashlet
-from .page_edit_dashboards import page_edit_dashboards
-from .page_edit_dashlet import EditDashletPage
-from .page_show_dashboard import (
-    ajax_dashlet,
-    AjaxInitialDashboardFilters,
-    get_topology_context_and_filters,
-    page_dashboard,
-)
 from .store import get_all_dashboards, get_dashlet, get_permitted_dashboards
 from .title_macros import render_title_with_macros_string
-from .type_defs import DashboardConfig
+from .type_defs import DashboardConfig, DashboardName
 from .visual_type import VisualTypeDashboards
 
 __all__ = [
-    "register",
     "load_plugins",
     "DashletConfig",
+    "DashletRegistry",
+    "DashboardName",
     "DashboardConfig",
+    "builtin_dashboard_extender_registry",
     "builtin_dashboards",
+    "BuiltinDashboardExtender",
+    "BuiltinDashboardExtenderRegistry",
     "MAX",
     "GROW",
     "dashlet_registry",
@@ -71,59 +58,19 @@ __all__ = [
     "get_topology_context_and_filters",
     "get_all_dashboards",
     "get_permitted_dashboards",
+    "noop_builtin_dashboard_extender",
     "render_title_with_macros_string",
     "ABCFigureDashlet",
+    "IFrameDashlet",
+    "VisualTypeDashboards",
 ]
-
-
-def register(
-    permission_section_registry: PermissionSectionRegistry,
-    page_registry: PageRegistry,
-    visual_type_registry: VisualTypeRegistry,
-    dashlet_registry_: DashletRegistry,
-) -> None:
-    visual_type_registry.register(VisualTypeDashboards)
-    permission_section_registry.register(PermissionSectionDashboard)
-
-    page_registry.register_page("ajax_figure_dashlet_data")(FigureDashletPage)
-    page_registry.register_page("ajax_initial_dashboard_filters")(AjaxInitialDashboardFilters)
-    page_registry.register_page("edit_dashlet")(EditDashletPage)
-    page_registry.register_page_handler("delete_dashlet", page_delete_dashlet)
-    page_registry.register_page_handler("dashboard", page_dashboard)
-    page_registry.register_page_handler("dashboard_dashlet", ajax_dashlet)
-    page_registry.register_page_handler("edit_dashboards", page_edit_dashboards)
-    page_registry.register_page_handler("create_dashboard", page_create_dashboard)
-    page_registry.register_page_handler("edit_dashboard", page_edit_dashboard)
-    page_registry.register_page_handler("create_link_view_dashlet", page_create_link_view_dashlet)
-    page_registry.register_page_handler("create_view_dashlet", page_create_view_dashlet)
-    page_registry.register_page_handler("create_view_dashlet_infos", page_create_view_dashlet_infos)
-    page_registry.register_page_handler("clone_dashlet", page_clone_dashlet)
-    page_registry.register_page_handler("delete_dashlet", page_delete_dashlet)
-    page_registry.register_page_handler("ajax_dashlet_pos", ajax_dashlet_pos)
-
-    register_dashlets(dashlet_registry_)
-    register_builtin_dashboards(builtin_dashboards)
-
-
-class PermissionSectionDashboard(PermissionSection):
-    @property
-    def name(self) -> str:
-        return "dashboard"
-
-    @property
-    def title(self) -> str:
-        return _("Dashboards")
-
-    @property
-    def do_sort(self):
-        return True
 
 
 def load_plugins() -> None:
     """Plugin initialization hook (Called by cmk.gui.main_modules.load_plugins())"""
     _register_pre_21_plugin_api()
 
-    # Load plugins for dashboards. Currently these files
+    # Load plug-ins for dashboards. Currently these files
     # just may add custom dashboards by adding to builtin_dashboards.
     utils.load_web_plugins("dashboard", globals())
 
@@ -136,9 +83,9 @@ def load_plugins() -> None:
         # the individual user permissions. Only the problem graphs are not able to respect these
         # permissions. To not confuse the users we make the "main" dashboard in the enterprise
         # editions only visible to the roles that have the "general.see_all" permission.
-        if name == "main" and not cmk_version.is_raw_edition():
+        if name == "main" and cmk_version.edition(paths.omd_root) is not cmk_version.Edition.CRE:
             # Please note: This permitts the following roles: ["admin", "guest"]. Even if the user
-            # overrides the permissions of these builtin roles in his configuration , this can not
+            # overrides the permissions of these built-in roles in his configuration , this can not
             # be respected here. This is because the config of the user is not loaded yet. The user
             # would have to manually adjust the permissions on the main dashboard on his own.
             default_permissions = permission_registry["general.see_all"].defaults
@@ -147,7 +94,7 @@ def load_plugins() -> None:
 
         declare_permission(
             "dashboard.%s" % name,
-            board["title"],
+            f"{board['title']} ({board['name']})",
             board.get("description", ""),
             default_permissions,
         )
@@ -160,19 +107,19 @@ def load_plugins() -> None:
 def _register_pre_21_plugin_api() -> None:
     """Register pre 2.1 "plugin API"
 
-    This was never an official API, but the names were used by builtin and also 3rd party plugins.
+    This was never an official API, but the names were used by built-in and also 3rd party plugins.
 
-    Our builtin plugin have been changed to directly import from the .utils module. We add these old
-    names to remain compatible with 3rd party plugins for now.
+    Our built-in plug-in have been changed to directly import from the .utils module. We add these old
+    names to remain compatible with 3rd party plug-ins for now.
 
-    In the moment we define an official plugin API, we can drop this and require all plugins to
+    In the moment we define an official plug-in API, we can drop this and require all plug-ins to
     switch to the new API. Until then let's not bother the users with it.
 
     CMK-12228
     """
-    # Needs to be a local import to not influence the regular plugin loading order
-    import cmk.gui.plugins.dashboard as api_module
-    import cmk.gui.plugins.dashboard.utils as plugin_utils
+    # Needs to be a local import to not influence the regular plug-in loading order
+    import cmk.gui.plugins.dashboard as api_module  # pylint: disable=cmk-module-layer-violation
+    import cmk.gui.plugins.dashboard.utils as plugin_utils  # pylint: disable=cmk-module-layer-violation
 
     for name, val in (
         ("ABCFigureDashlet", ABCFigureDashlet),

@@ -3,28 +3,27 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-import functools
-import json  # pylint: disable=unused-import  # noqa: F401
 import time
+from collections.abc import Callable, Iterable, Mapping
+from typing import TypeVar
 
-from cmk.base.check_api import (
-    check_levels,
-    get_bytes_human_readable,
-    get_percent_human_readable,
+from cmk.agent_based.legacy.v0_unstable import check_levels, LegacyResult
+from cmk.agent_based.v2 import (
     get_rate,
-    MKCounterWrapped,
+    get_value_store,
+    IgnoreResultsError,
+    render,
+    Service,
 )
-from cmk.base.plugins.agent_based.agent_based_api.v1 import render
-from cmk.base.plugins.agent_based.utils.azure import (  # pylint: disable=unused-import  # noqa: F401
-    AZURE_AGENT_SEPARATOR,
-    iter_resource_attributes,
-    parse_resources,
+from cmk.plugins.lib.azure import (
+    get_service_labels_from_resource_tags,
+    Resource,
 )
 
 _AZURE_METRIC_FMT = {
     "count": lambda n: "%d" % n,
-    "percent": get_percent_human_readable,
-    "bytes": get_bytes_human_readable,
+    "percent": render.percent,
+    "bytes": render.bytes,
     "bytes_per_second": render.iobandwidth,
     "seconds": lambda s: "%.2f s" % s,
     "milli_seconds": lambda ms: "%d ms" % (ms * 1000),
@@ -32,32 +31,33 @@ _AZURE_METRIC_FMT = {
 }
 
 
-def get_data_or_go_stale(check_function):
-    """Variant of get_parsed_item_data that raises MKCounterWrapped
-    if data is not found.
-    """
-
-    @functools.wraps(check_function)
-    def wrapped_check_function(item, params, parsed):
-        if not isinstance(parsed, dict):
-            return 3, "Wrong usage of decorator: parsed is not a dict"
-        if item not in parsed or not parsed[item]:
-            raise MKCounterWrapped("Data not present at the moment")
-        return check_function(item, params, parsed[item])
-
-    return wrapped_check_function
+_Data = TypeVar("_Data")
 
 
-def check_azure_metric(  # pylint: disable=too-many-locals
-    resource, metric_key, cmk_key, display_name, levels=None, levels_lower=None, use_rate=False
-):
+def get_data_or_go_stale(item: str, section: Mapping[str, _Data]) -> _Data:
+    if resource := section.get(item):
+        return resource
+    raise IgnoreResultsError("Data not present at the moment")
+
+
+def check_azure_metric(
+    resource: Resource,
+    metric_key: str,
+    cmk_key: str,
+    display_name: str,
+    levels: tuple[float, float] | None = None,
+    levels_lower: tuple[float, float] | None = None,
+    use_rate: bool = False,
+) -> None | LegacyResult:
     metric = resource.metrics.get(metric_key)
     if metric is None:
         return None
 
     if use_rate:
         countername = f"{resource.id}.{metric_key}"
-        value = get_rate(countername, time.time(), metric.value)
+        value = get_rate(
+            get_value_store(), countername, time.time(), metric.value, raise_overflow=True
+        )
         unit = "%s_rate" % metric.unit
     else:
         value = metric.value
@@ -81,33 +81,22 @@ def check_azure_metric(  # pylint: disable=too-many-locals
         cmk_key,
         (levels or (None, None)) + (levels_lower or (None, None)),
         infoname=display_name,
-        human_readable_func=_AZURE_METRIC_FMT.get(unit, str),  # type: ignore[arg-type]
+        human_readable_func=_AZURE_METRIC_FMT.get(unit, lambda x: f"{x}"),
         boundaries=(0, None),
     )
 
 
-# .
-
-#   .--Discovery-----------------------------------------------------------.
-#   |              ____  _                                                 |
-#   |             |  _ \(_)___  ___ _____   _____ _ __ _   _               |
-#   |             | | | | / __|/ __/ _ \ \ / / _ \ '__| | | |              |
-#   |             | |_| | \__ \ (_| (_) \ V /  __/ |  | |_| |              |
-#   |             |____/|_|___/\___\___/ \_/ \___|_|   \__, |              |
-#   |                                                  |___/               |
-#   +----------------------------------------------------------------------+
-
-
-def discover_azure_by_metrics(*desired_metrics):
+def discover_azure_by_metrics(
+    *desired_metrics: str,
+) -> Callable[[Mapping[str, Resource]], Iterable[Service]]:
     """Return a discovery function, that will discover if any of the metrics are found"""
 
     def discovery_function(parsed):
         for name, resource in parsed.items():
             metr = resource.metrics
             if set(desired_metrics) & set(metr):
-                yield name, {}
+                yield Service(
+                    item=name, labels=get_service_labels_from_resource_tags(resource.tags)
+                )
 
     return discovery_function
-
-
-# .

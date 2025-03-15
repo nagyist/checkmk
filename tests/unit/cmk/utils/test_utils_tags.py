@@ -7,8 +7,9 @@ from collections.abc import Mapping
 
 import pytest
 
-import cmk.utils.tags as tags
-from cmk.utils.exceptions import MKGeneralException
+from cmk.ccc.exceptions import MKGeneralException
+
+from cmk.utils import tags
 from cmk.utils.tags import AuxTag, GroupedTag, TagConfig, TagGroup, TagGroupID, TagID
 
 
@@ -150,17 +151,16 @@ def test_tag_config_get_topic_choices(test_cfg: TagConfig) -> None:
 
 
 def test_tag_groups_by_topic(test_cfg: TagConfig) -> None:
-    expected_groups = {
-        "Blubberei": ["criticality"],
-        "Tags": ["networking", "none_choice", "none_2"],
-    }
+    value = [
+        (tag_group, [tag.id for tag in tags])
+        for tag_group, tags in test_cfg.get_tag_groups_by_topic()
+    ]
+    expected = [
+        ("Blubberei", ["criticality"]),
+        ("Tags", ["networking", "none_choice", "none_2"]),
+    ]
 
-    actual_groups = dict(test_cfg.get_tag_groups_by_topic())
-    assert sorted(actual_groups.keys()) == sorted(expected_groups.keys())
-
-    for topic, tag_group_ids in expected_groups.items():
-        tg_ids = [tg.id for tg in actual_groups[topic] if tg.id is not None]
-        assert sorted(tg_ids) == sorted(tag_group_ids)
+    assert value == expected
 
 
 def test_tag_group_exists(test_cfg: TagConfig) -> None:

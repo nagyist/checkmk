@@ -34,8 +34,6 @@ MutableParamType = MutableMapping[str, Any]
 class FilesystemElements(Enum):
     levels = "levels"
     levels_percent = "levels_percent"  # sansymphony_pool
-    levels_unbound = "levels_unbound"  # These are percentage levels with no maximum value.
-    # I assume this is due to overprovisioning of virtual filesystems, see netapp_volumes
     show_levels = "show_levels"  # TODO: deprecate
     magic_factor = "magic_factor"
     reserved = "reserved"
@@ -61,11 +59,10 @@ def match_dual_level_type(value):
     return 0
 
 
-def _get_free_used_dynamic_valuespec(  # type: ignore[no-untyped-def]
+def _get_free_used_dynamic_valuespec(
     level_perspective: Literal["used", "free"],
-    default_value=(80.0, 90.0),
+    default_value: tuple[float, float] = (80.0, 90.0),
     *,
-    maxvalue: None | float,
     do_include_absolutes: bool = True,
 ) -> ValueSpec:
     if level_perspective == "used":
@@ -84,13 +81,13 @@ def _get_free_used_dynamic_valuespec(  # type: ignore[no-untyped-def]
                     title=_("Warning if %s") % course,
                     unit="%",
                     minvalue=0.0 if level_perspective == "used" else 0.0001,
-                    maxvalue=maxvalue,
+                    maxvalue=None,
                 ),
                 Percentage(
                     title=_("Critical if %s") % course,
                     unit="%",
                     minvalue=0.0 if level_perspective == "used" else 0.0001,
-                    maxvalue=maxvalue,
+                    maxvalue=None,
                 ),
             ],
         )
@@ -155,7 +152,6 @@ def _transform_filesystem_free(value):
 
 
 def _filesystem_levels_elements(
-    maxvalue: float | None = 101.0,
     do_include_absolutes: bool = True,
 ) -> list[DictionaryEntry]:
     return [
@@ -169,14 +165,12 @@ def _filesystem_levels_elements(
                 elements=[
                     _get_free_used_dynamic_valuespec(
                         "used",
-                        maxvalue=maxvalue,
                         do_include_absolutes=do_include_absolutes,
                     ),
                     Transform(
                         valuespec=_get_free_used_dynamic_valuespec(
                             "free",
                             default_value=(20.0, 10.0),
-                            maxvalue=maxvalue,
                             do_include_absolutes=do_include_absolutes,
                         ),
                         title=_("Levels for free space"),
@@ -187,14 +181,6 @@ def _filesystem_levels_elements(
             ),
         ),
     ]
-
-
-def _filesystem_levels_elements_bound() -> list[DictionaryEntry]:
-    return _filesystem_levels_elements()
-
-
-def _filesystem_levels_elements_unbound() -> list[DictionaryEntry]:
-    return _filesystem_levels_elements(maxvalue=None)
 
 
 def _filesystem_levels_percent_only() -> list[DictionaryEntry]:
@@ -242,7 +228,8 @@ def _filesystem_reserved_elements() -> list[DictionaryEntry]:
             DropdownChoice(
                 title=_("Show space reserved for the <tt>root</tt> user"),
                 help=_(
-                    "Check_MK treats space that is reserved for the <tt>root</tt> user on Linux and Unix as "
+                    # xgettext: no-python-format
+                    "Checkmk treats space that is reserved for the <tt>root</tt> user on Linux and Unix as "
                     "used space. Usually, 5% are being reserved for root when a new filesystem is being created. "
                     "With this option you can have Checkmk display the current amount of reserved but yet unused "
                     "space."
@@ -260,6 +247,7 @@ def _filesystem_reserved_elements() -> list[DictionaryEntry]:
                     "Exclude space reserved for the <tt>root</tt> user from calculation of used space"
                 ),
                 help=_(
+                    # xgettext: no-python-format
                     "By default Checkmk treats space that is reserved for the <tt>root</tt> user on Linux and Unix as "
                     "used space. Usually, 5% are being reserved for root when a new filesystem is being created. "
                     "With this option you can have Checkmk exclude the current amount of reserved but yet unused "
@@ -339,7 +327,11 @@ def _filesystem_inodes_elements() -> list[DictionaryEntry]:
                 title=_("Display inode usage in check output..."),
                 choices=[
                     ("onproblem", _("Only in case of a problem")),
-                    ("onlow", _("Only in case of a problem or if inodes are below 50%")),
+                    (
+                        "onlow",
+                        # xgettext: no-python-format
+                        _("Only in case of a problem or if inodes are below 50%"),
+                    ),
                     ("always", _("Always")),
                 ],
                 default_value="onlow",
@@ -505,9 +497,8 @@ def size_trend_elements() -> list[DictionaryEntry]:
 
 
 FILESYSTEM_ELEMENTS_SELECTOR: Mapping[FilesystemElements, Callable[[], list[DictionaryEntry]]] = {
-    FilesystemElements.levels: _filesystem_levels_elements_bound,
+    FilesystemElements.levels: _filesystem_levels_elements,
     FilesystemElements.levels_percent: _filesystem_levels_percent_only,
-    FilesystemElements.levels_unbound: _filesystem_levels_elements_unbound,
     FilesystemElements.show_levels: _filesystem_show_levels_elements,
     FilesystemElements.reserved: _filesystem_reserved_elements,
     FilesystemElements.volume_name: _filesystem_volume_name,

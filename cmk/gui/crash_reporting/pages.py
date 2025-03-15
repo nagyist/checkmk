@@ -11,20 +11,17 @@ import pprint
 import tarfile
 import time
 import traceback
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Final, TypedDict
 
 import livestatus
 from livestatus import SiteId
 
-import cmk.utils.crash_reporting
-import cmk.utils.version as cmk_version
-from cmk.utils.crash_reporting import CrashInfo
+import cmk.ccc.crash_reporting
+import cmk.ccc.version as cmk_version
+from cmk.ccc.crash_reporting import CrashInfo
 
-import cmk.gui.forms as forms
-import cmk.gui.pages
-import cmk.gui.userdb as userdb
-import cmk.gui.utils.escaping as escaping
+from cmk.gui import forms, userdb
 from cmk.gui.breadcrumb import (
     Breadcrumb,
     BreadcrumbItem,
@@ -38,7 +35,7 @@ from cmk.gui.htmllib.generator import HTMLWriter
 from cmk.gui.htmllib.header import make_header
 from cmk.gui.htmllib.html import html
 from cmk.gui.htmllib.tag_rendering import HTMLContent
-from cmk.gui.http import request, response
+from cmk.gui.http import ContentDispositionType, request, response
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
 from cmk.gui.main_menu import mega_menu_registry
@@ -49,7 +46,9 @@ from cmk.gui.page_menu import (
     PageMenuEntry,
     PageMenuTopic,
 )
+from cmk.gui.pages import Page, PageRegistry
 from cmk.gui.pagetypes import PagetypeTopics
+from cmk.gui.utils import escaping
 from cmk.gui.utils.html import HTML
 from cmk.gui.utils.transaction_manager import transactions
 from cmk.gui.utils.urls import makeuri, makeuri_contextless, urlencode, urlencode_vars
@@ -62,12 +61,21 @@ from .views import CrashReportsRowTable
 CrashReportRow = dict[str, str]
 
 
+def register(page_registry: PageRegistry) -> None:
+    page_registry.register_page("crash")(PageCrash)
+    page_registry.register_page("download_crash_report")(PageDownloadCrashReport)
+    report_renderer_registry.register(ReportRendererGeneric)
+    report_renderer_registry.register(ReportRendererSection)
+    report_renderer_registry.register(ReportRendererCheck)
+    report_renderer_registry.register(ReportRendererGUI)
+
+
 class ReportSubmitDetails(TypedDict):
     name: str
     mail: str
 
 
-class ABCCrashReportPage(cmk.gui.pages.Page, abc.ABC):
+class ABCCrashReportPage(Page, abc.ABC):
     def __init__(self) -> None:
         super().__init__()
         self._crash_id: Final = request.get_str_input_mandatory("crash_id")
@@ -90,16 +98,18 @@ class ABCCrashReportPage(cmk.gui.pages.Page, abc.ABC):
         )
 
     def _get_crash_report_row(self, crash_id: str, *, site_id: str) -> CrashReportRow | None:
-        if rows := CrashReportsRowTable().get_crash_report_rows(
+        rows = CrashReportsRowTable().get_crash_report_rows(
             only_sites=[SiteId(site_id)],
             filter_headers="Filter: id = %s" % livestatus.lqencode(crash_id),
-        ):
-            return rows[0]
-        return None
+        )
+        try:
+            return next(rows)
+        except StopIteration:
+            return None
 
-    def _get_serialized_crash_report(self):
+    def _get_serialized_crash_report(self) -> Mapping[str, bytes | None]:
         return {
-            k: v
+            k: v.encode()
             for k, v in self._get_crash_row().items()
             if k not in ["site", "crash_id", "crash_type"]
         }
@@ -272,14 +282,13 @@ class PageCrash(ABCCrashReportPage):
             html.show_error(
                 _(
                     "Failed to send the crash report. Please download it manually and send it "
-                    'to <a href="%s">%s</a>'
+                    'to <a href="%s">%s</a> or try again later.'
                 )
                 % (report_url, self._get_crash_report_target())
             )
             html.close_div()
             html.javascript(
-                "cmk.transfer.submit_crash_report(%s, %s);"
-                % (json.dumps(active_config.crash_report_url), json.dumps(url_encoded_params))
+                f"cmk.transfer.submit_crash_report({json.dumps(active_config.crash_report_url)}, {json.dumps(url_encoded_params)});"
             )
         except MKUserError as e:
             user_errors.add(e)
@@ -306,7 +315,7 @@ class PageCrash(ABCCrashReportPage):
                 (
                     "mail",
                     EmailAddress(
-                        title=_("Email Address"),
+                        title=_("Email address"),
                         allow_empty=False,
                     ),
                 ),
@@ -320,13 +329,15 @@ class PageCrash(ABCCrashReportPage):
         if not files:
             return
 
-        warn_text = escaping.escape_to_html(
+        warn_text = HTML.with_escaping(
             _(
                 "The following files located in the local hierarchy of your site are involved in this exception:"
             )
         )
-        warn_text += HTMLWriter.render_ul(HTML("\n").join(map(HTMLWriter.render_li, files)))
-        warn_text += escaping.escape_to_html(
+        warn_text += HTMLWriter.render_ul(
+            HTML.without_escaping("\n").join(map(HTMLWriter.render_li, files))
+        )
+        warn_text += HTML.with_escaping(
             _(
                 "Maybe these files are not compatible with your current Checkmk "
                 "version. Please verify and only report this crash when you think "
@@ -339,15 +350,14 @@ class PageCrash(ABCCrashReportPage):
         if crash_info["crash_type"] == "gui":
             self._add_gui_user_infos_to_details(details)
 
-        html.begin_form("report", method="GET")
-        html.show_user_errors()
-        vs = self._vs_crash_report()
-        vs.render_input("_report", details)
-        vs.set_focus("report")
-        forms.end()
-        html.button("_report", _("Submit report"), cssclass="hot")
-        html.hidden_fields()
-        html.end_form()
+        with html.form_context("report", method="GET"):
+            html.show_user_errors()
+            vs = self._vs_crash_report()
+            vs.render_input("_report", details)
+            vs.set_focus("report")
+            forms.end()
+            html.button("_report", _("Submit report"), cssclass="hot")
+            html.hidden_fields()
 
     def _add_gui_user_infos_to_details(self, details: ReportSubmitDetails) -> None:
         users = userdb.load_users()
@@ -369,7 +379,15 @@ class PageCrash(ABCCrashReportPage):
             pre=True,
         )
         _crash_row(
-            _("Traceback"), self._format_traceback(info["exc_traceback"]), odd=False, pre=True
+            _("Traceback"),
+            "".join(
+                [
+                    self._format_traceback(info["exc_traceback"]),
+                    info["exc_value"],
+                ]
+            ),
+            odd=False,
+            pre=True,
         )
         _crash_row(
             _("Local Variables"),
@@ -380,7 +398,9 @@ class PageCrash(ABCCrashReportPage):
 
         _crash_row(_("Crash Type"), info["crash_type"], odd=False, legend=True)
         _crash_row(
-            _("Time"), time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info["time"])), odd=True
+            _("Time"),
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(info["time"]))),
+            odd=True,
         )
         _crash_row(_("Operating System"), info["os"], False)
         _crash_row(_("Checkmk Version"), info["version"], True)
@@ -393,7 +413,7 @@ class PageCrash(ABCCrashReportPage):
 
         html.close_table()
 
-    def _format_traceback(self, tb: list[traceback.FrameSummary]) -> str:
+    def _format_traceback(self, tb: Sequence[tuple[str, int, str, str]]) -> str:
         return "".join(traceback.format_list(tb))
 
     def _show_crash_report_details(self, crash_info: CrashInfo, row: CrashReportRow) -> None:
@@ -422,7 +442,7 @@ class ABCReportRenderer(abc.ABC):
         raise NotImplementedError()
 
 
-class ReportRendererRegistry(cmk.utils.plugin_registry.Registry[type[ABCReportRenderer]]):
+class ReportRendererRegistry(cmk.ccc.plugin_registry.Registry[type[ABCReportRenderer]]):
     def plugin_name(self, instance):
         return instance.type()
 
@@ -430,7 +450,6 @@ class ReportRendererRegistry(cmk.utils.plugin_registry.Registry[type[ABCReportRe
 report_renderer_registry = ReportRendererRegistry()
 
 
-@report_renderer_registry.register
 class ReportRendererGeneric(ABCReportRenderer):
     @classmethod
     def type(cls):
@@ -454,7 +473,6 @@ class ReportRendererGeneric(ABCReportRenderer):
         html.pre(pprint.pformat(crash_info["details"]))
 
 
-@report_renderer_registry.register
 class ReportRendererSection(ABCReportRenderer):
     @classmethod
     def type(cls):
@@ -490,7 +508,6 @@ class ReportRendererSection(ABCReportRenderer):
         html.close_table()
 
 
-@report_renderer_registry.register
 class ReportRendererCheck(ABCReportRenderer):
     @classmethod
     def type(cls):
@@ -499,8 +516,9 @@ class ReportRendererCheck(ABCReportRenderer):
     def page_menu_entries_related_monitoring(
         self, crash_info: CrashInfo, site_id: SiteId
     ) -> Iterator[PageMenuEntry]:
-        host = crash_info["details"]["host"]
-        service = crash_info["details"]["description"]
+        details = crash_info["details"]
+        host = details["host"]
+        service = details["description"]
 
         host_url = makeuri(
             request,
@@ -541,7 +559,7 @@ class ReportRendererCheck(ABCReportRenderer):
         _show_agent_output(row)
 
     def _show_crashed_check_details(self, info: CrashInfo) -> None:
-        def format_bool(val):
+        def format_bool(val: bool | None) -> str:
             return {
                 True: _("Yes"),
                 False: _("No"),
@@ -554,23 +572,22 @@ class ReportRendererCheck(ABCReportRenderer):
         html.open_table(class_="data")
 
         _crash_row(_("Host"), details["host"], odd=False, legend=True)
-        _crash_row(_("Is Cluster Host"), format_bool(details.get("is_cluster")), odd=True)
-        _crash_row(_("Check Type"), details["check_type"], odd=False)
+        _crash_row(_("Is cluster host"), format_bool(details.get("is_cluster")), odd=True)
+        _crash_row(_("Check type"), details["check_type"], odd=False)
         _crash_row(
-            _("Enforced Service"), format_bool(details.get("enforced_service")), odd=True, pre=True
+            _("Enforced service"), format_bool(details.get("enforced_service")), odd=True, pre=True
         )
         _crash_row(_("Inline-SNMP"), format_bool(details.get("inline_snmp")), odd=True, pre=True)
-        _crash_row(_("Check Item"), details.get("item", "This check has no item."), odd=False)
+        _crash_row(_("Check item"), details.get("item", "This check has no item."), odd=False)
         _crash_row(_("Description"), details["description"], odd=True)
         if "params" in details:
             _crash_row(_("Parameters"), format_params(details["params"]), odd=False, pre=True)
         else:
-            _crash_row(_("Parameters"), "This Check has no parameters", odd=False)
+            _crash_row(_("Parameters"), "This check has no parameters", odd=False)
 
         html.close_table()
 
 
-@report_renderer_registry.register
 class ReportRendererGUI(ABCReportRenderer):
     @classmethod
     def type(cls):
@@ -631,7 +648,7 @@ def _show_output_box(title: str, content: bytes) -> None:
     html.h3(title, class_="table")
     html.open_div(class_="log_output")
     html.write_html(
-        HTML(
+        HTML.without_escaping(
             escaping.escape_attribute(content.decode(errors="surrogateescape"))
             .replace("\n", "<br>")
             .replace(" ", "&nbsp;")
@@ -643,8 +660,7 @@ def _show_output_box(title: str, content: bytes) -> None:
 def _show_agent_output(row: CrashReportRow) -> None:
     agent_output = row.get("agent_output")
     if agent_output:
-        assert isinstance(agent_output, bytes)
-        _show_output_box(_("Agent output"), agent_output)
+        _show_output_box(_("Agent output"), agent_output.encode())
 
 
 class PageDownloadCrashReport(ABCCrashReportPage):
@@ -656,9 +672,8 @@ class PageDownloadCrashReport(ABCCrashReportPage):
             urlencode(self._crash_id),
             time.strftime("%Y-%m-%d_%H-%M-%S"),
         )
-
-        response.headers["Content-Disposition"] = "Attachment; filename=%s" % filename
-        response.headers["Content-Type"] = "application/x-tar"
+        response.set_content_type("application/x-tgz")
+        response.set_content_disposition(ContentDispositionType.ATTACHMENT, filename)
         response.set_data(_pack_crash_report(self._get_serialized_crash_report()))
 
 

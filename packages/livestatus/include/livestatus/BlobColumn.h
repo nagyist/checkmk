@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "livestatus/Column.h"
+#include "livestatus/FileSystemHelper.h"
 #include "livestatus/Filter.h"
 #include "livestatus/Logger.h"
 #include "livestatus/Renderer.h"
@@ -27,7 +28,7 @@ class Aggregator;
 class RowRenderer;
 class User;
 
-template <class T>
+template <typename T>
 class BlobColumn : public Column {
 public:
     BlobColumn(const std::string &name, const std::string &description,
@@ -53,6 +54,11 @@ public:
                                  "' not supported");
     }
 
+    [[nodiscard]] std::unique_ptr<Sorter> createSorter() const override {
+        throw std::runtime_error("sorting on blob column '" + name() +
+                                 "' not supported");
+    }
+
     [[nodiscard]] std::unique_ptr<Aggregator> createAggregator(
         AggregationFactory /*factory*/) const override {
         throw std::runtime_error("aggregating on blob column '" + name() +
@@ -69,24 +75,18 @@ private:
     const std::function<std::vector<char>(const T &)> f_;
 };
 
-template <class T>
+template <typename T>
 class BlobFileReader {
 public:
-    BlobFileReader(std::function<std::filesystem::path()> basepath,
-                   std::function<std::filesystem::path(const T &)> filepath)
-        : _basepath{std::move(basepath)}
-        , _filepath{std::move(filepath)}
-        , _logger{"cmk.livestatus"} {}
+    explicit BlobFileReader(
+        std::function<std::filesystem::path(const T &)> path)
+        : _path{std::move(path)}, _logger{"cmk.livestatus"} {}
 
     std::vector<char> operator()(const T &data) const {
-        auto path = _basepath();
+        const auto path = _path(data);
         if (!std::filesystem::exists(path)) {
-            // The basepath is not configured.
+            // The path is not configured.
             return {};
-        }
-        auto filepath = _filepath(data);
-        if (!filepath.empty()) {
-            path /= filepath;
         }
         if (!std::filesystem::is_regular_file(path)) {
             Debug(logger()) << path << " is not a regular file";
@@ -113,8 +113,7 @@ public:
     Logger *logger() const { return &_logger; }
 
 private:
-    const std::function<std::filesystem::path()> _basepath;
-    const std::function<std::filesystem::path(const T &)> _filepath;
+    const std::function<std::filesystem::path(const T &)> _path;
     mutable ThreadNameLogger _logger;
 };
 

@@ -4,7 +4,7 @@
 
 
 #
-# Default Check MK configuration file
+# Default Checkmk configuration file
 #
 
 # $CUSTOM_PLUGINS_PATH$  -> is ProgramData/checkmk/agent/plugins
@@ -148,8 +148,8 @@ winperf:
     # no - nothing(default), yes output trace to the log/winperf.log
     trace: no
 
-    # yes - separate process for winnperf to prevent ahndle leaking, no - locally
-    fork: yes
+    # yes - fork process for winnperf to prevent potential handle leaking, no - internally
+    fork: no
 
     # changes only section name winperf_******
     prefix: winperf
@@ -276,6 +276,15 @@ mrpe:
         # - include = $CUSTOM_AGENT_PATH$\mrpe_checks.cfg
         # - include some_user_name = $CUSTOM_AGENT_PATH$\mrpe_checks.cfg
 
+extensions:
+    enabled: yes
+
+    execution:
+        - name        : "robot_mk"                                  # just a name
+          binary      : "$CUSTOM_AGENT_PATH$/bin/robotmk_ext.exe"   # what to run
+          command_line: "daemon"                                    # command line
+          run         : auto                                        # yes, no or auto(run if present)
+
 modules:
     enabled: yes
 
@@ -322,5 +331,4 @@ system:
         start_mode: auto       # Possible values are: auto - service starts with boot, demand - requires manual starting
                                # delayed - serice started automatically(delayed)
                                # disabled - service cannot be started manually and should be enabled
-
-
+    repair_invalid_utf: no

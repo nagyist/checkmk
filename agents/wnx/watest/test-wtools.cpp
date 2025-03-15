@@ -2,31 +2,35 @@
 // windows mostly
 
 #include "pch.h"
+// this file is fixed
 
 #include <fmt/format.h>
 #include <fmt/xchar.h>
 
 #include <chrono>
 #include <string_view>
+#include <unordered_set>
 
 #include "common/wtools.h"
-#include "test_tools.h"
+#include "common/wtools_user_control.h"
 #include "tools/_process.h"
 #include "tools/_raii.h"
+#include "watest/test_tools.h"
 
 using namespace std::string_literals;
 using namespace std::chrono_literals;
 namespace fs = std::filesystem;
+namespace rs = std::ranges;
 
 namespace {
 // Internal description of assorted counter params.
 // Should be valid for all windows versions
 struct CounterParam {
     const wchar_t *const name_;  // usually number
-    const uint32_t index_;       // the same as name
-    const uint32_t counters_count;
-    const uint32_t instances_min_;
-    const uint32_t instances_max_;
+    uint32_t index_;             // the same as name
+    uint32_t counters_count;
+    uint32_t instances_min_;
+    uint32_t instances_max_;
 };
 
 constexpr CounterParam g_cpu_counter = {.name_ = L"238",
@@ -42,7 +46,7 @@ constexpr CounterParam g_disk_counter = {.name_ = L"234",
 
 }  // namespace
 
-namespace wtools {  // to become friendly for cma::cfg classes
+namespace wtools {
 
 class WtoolsKillProcFixture : public ::testing::Test {
 protected:
@@ -50,12 +54,11 @@ protected:
     static constexpr std::wstring_view nameToUse() { return L"kill_proc.exe"; }
 
     static void KillTmpProcesses() {
-        // kill process
         ScanProcessList([](const PROCESSENTRY32 &entry) {
             if (std::wstring{entry.szExeFile} == nameToUse()) {
                 KillProcess(entry.th32ProcessID, 99);
             }
-            return true;  // continue scan
+            return ScanAction::advance;
         });
     }
 
@@ -64,12 +67,17 @@ protected:
 
         int count = 0;
         for (int i = 0; i < requested; i++) {
-            if (cma::tools::RunDetachedCommand(cmd)) {
+            if (cma::tools::RunDetachedCommand(cmd).has_value()) {
                 count++;
             }
         }
 
         return count;
+    }
+    [[nodiscard]] std::optional<uint32_t> RunProcess() const {
+        const auto cmd = fmt::format("{} -t 8.8.8.8", test_exe_);
+
+        return cma::tools::RunDetachedCommand(cmd);
     }
 
     static std::tuple<std::wstring, uint32_t> FindExpectedProcess() {
@@ -77,12 +85,12 @@ protected:
         std::wstring path;
         ScanProcessList([&](const PROCESSENTRY32 &entry) {
             if (std::wstring{entry.szExeFile} != nameToUse()) {
-                return true;  // continue scan
+                return ScanAction::advance;
             }
 
             path = GetProcessPath(entry.th32ProcessID);
             pid = entry.th32ProcessID;
-            return false;
+            return ScanAction::terminate;
         });
 
         return {path, pid};
@@ -94,7 +102,6 @@ protected:
         fs::create_directories(test_dir_);
         const fs::path ping(R"(c:\windows\system32\ping.exe)");
         ASSERT_TRUE(fs::copy_file(ping, test_exe_));
-        EXPECT_EQ(RunProcesses(1), 1);
     }
 
     void TearDown() override {
@@ -104,7 +111,8 @@ protected:
         fs::remove_all(test_dir_, ec);
         if (ec) {
             std::cerr << fmt::format(
-                "Attention: remove_all failed, some of temporary processes are busy. Exception: '{}' [{}]\n",
+                "Attention: remove_all failed, some of temporary processes are busy. "
+                "Exception: '{}' [{}]\n",
                 ec.message(), ec.value());
         }
     }
@@ -114,6 +122,7 @@ protected:
 };
 
 TEST_F(WtoolsKillProcFixture, KillProcByPid) {
+    EXPECT_EQ(RunProcesses(1), 1);
     auto [path, pid] = FindExpectedProcess();
     EXPECT_TRUE(!path.empty());
     ASSERT_NE(pid, 0);
@@ -129,16 +138,16 @@ TEST_F(WtoolsKillProcFixture, KillProcByPid) {
 }
 
 TEST_F(WtoolsKillProcFixture, KillProcsByDir) {
+    EXPECT_EQ(RunProcesses(1), 1);
     ASSERT_EQ(RunProcesses(1), 1);  // additional process
     auto test_dir = test_dir_.wstring();
     cma::tools::WideUpper(test_dir);
 
     EXPECT_EQ(KillProcessesByDir(test_dir), 2);
-    cma::tools::sleep(500ms);
-
-    auto [path, pid] = FindExpectedProcess();
-    EXPECT_TRUE(path.empty());
-    EXPECT_EQ(pid, 0);
+    EXPECT_TRUE(tst::WaitForSuccessSilent(1500ms, []() {
+        auto [path, pid] = FindExpectedProcess();
+        return path.empty() && pid == 0;
+    }));
 
     EXPECT_EQ(KillProcessesByDir(test_dir), 0);
     EXPECT_EQ(KillProcessesByDir(""), -1);
@@ -146,16 +155,59 @@ TEST_F(WtoolsKillProcFixture, KillProcsByDir) {
 }
 
 TEST_F(WtoolsKillProcFixture, KillProcsByFullPath) {
+    EXPECT_EQ(RunProcesses(1), 1);
     ASSERT_EQ(RunProcesses(1), 1);  // additional process
-    auto test_dir = test_dir_.wstring();
-    cma::tools::WideUpper(test_dir);
-
     KillProcessesByFullPath(test_exe_);
-    cma::tools::sleep(500ms);
+    EXPECT_TRUE(tst::WaitForSuccessSilent(1500ms, []() {
+        auto [path, pid] = FindExpectedProcess();
+        return path.empty() && pid == 0;
+    }));
+}
 
-    auto [path, pid] = FindExpectedProcess();
-    EXPECT_TRUE(path.empty());
-    EXPECT_EQ(pid, 0);
+TEST_F(WtoolsKillProcFixture, KillProcsByFullPathAndPidComponent) {
+    const auto maybe_pid = RunProcess();
+    ASSERT_TRUE(maybe_pid.has_value());
+
+    // bad pid
+    {
+        KillProcessesByPathEndAndPid(test_exe_.filename(), 4);
+        cma::tools::sleep(500ms);
+        auto [path, pid] = FindExpectedProcess();
+        EXPECT_FALSE(path.empty());
+        EXPECT_EQ(pid, *maybe_pid);
+    }
+
+    // bad path
+    {
+        KillProcessesByPathEndAndPid("aa.exe", *maybe_pid);
+        cma::tools::sleep(500ms);
+        auto [path, pid] = FindExpectedProcess();
+        EXPECT_FALSE(path.empty());
+        EXPECT_EQ(pid, *maybe_pid);
+    }
+
+    // should kill
+    {
+        KillProcessesByPathEndAndPid(test_exe_.filename(), *maybe_pid);
+        cma::tools::sleep(500ms);
+        auto [path, pid] = FindExpectedProcess();
+        EXPECT_TRUE(path.empty());
+        EXPECT_EQ(pid, 0);
+    }
+}
+
+TEST_F(WtoolsKillProcFixture, FindProcsByFullPathAndPidComponent) {
+    const auto maybe_pid = RunProcess();
+    ASSERT_TRUE(maybe_pid.has_value());
+
+    EXPECT_FALSE(FindProcessByPathEndAndPid(test_exe_.filename(), 4));
+    EXPECT_TRUE(tst::WaitForSuccessSilent(5000ms, [&]() {
+        return FindProcessByPathEndAndPid(test_exe_.filename(), *maybe_pid);
+    })) << fmt::format("process {} not found", test_exe_.filename());
+    KillProcessesByPathEndAndPid(test_exe_.filename(), *maybe_pid);
+    EXPECT_TRUE(tst::WaitForSuccessSilent(5000ms, [&]() {
+        return !FindProcessByPathEndAndPid(test_exe_.filename(), *maybe_pid);
+    })) << fmt::format("process {} still found", test_exe_.filename());
 }
 
 class WtoolsKillProcessTreeFixture : public ::testing::Test {
@@ -173,7 +225,7 @@ protected:
                     names.back(), entry.th32ProcessID,
                     entry.th32ParentProcessID, ::GetCurrentProcessId());
             }
-            return true;
+            return ScanAction::advance;
         });
         EXPECT_TRUE(!names.empty());
         for (auto &name : names) {
@@ -198,7 +250,9 @@ protected:
         tst::CreateTextFile(exe_b, "@echo start\n@call " + ToStr(exe_c));
         tst::CreateTextFile(exe_c,
                             "@echo start\n@powershell Start-Sleep 10000");
-        return cma::tools::RunStdCommand(exe_a.wstring(), false);
+        return cma::tools::RunStdCommand(exe_a.wstring(),
+                                         cma::tools::WaitForEnd::no)
+            .value_or(0);
     }
 
     static [[nodiscard]] bool findProcessByPid(uint32_t pid) {
@@ -206,9 +260,9 @@ protected:
         ScanProcessList([&](const PROCESSENTRY32 &entry) {
             if (entry.th32ProcessID == pid) {
                 found = true;
-                return false;
+                return ScanAction::terminate;
             }
-            return true;
+            return ScanAction::advance;
         });
         return found;
     }
@@ -218,9 +272,9 @@ protected:
         ScanProcessList([&](const PROCESSENTRY32 &entry) {
             if (entry.th32ParentProcessID == pid) {
                 found = true;
-                return false;
+                return ScanAction::terminate;
             }
-            return true;
+            return ScanAction::advance;
         });
         return found;
     }
@@ -231,11 +285,11 @@ protected:
         DWORD parent_process_id = 0;
         ScanProcessList([&](const PROCESSENTRY32 &entry) {
             if (entry.th32ProcessID != proc_id) {
-                return true;  // continue
+                return ScanAction::advance;
             }
             proc_name = entry.szExeFile;
             parent_process_id = entry.th32ParentProcessID;
-            return false;  // found
+            return ScanAction::terminate;
         });
 
         return {proc_name, parent_process_id};
@@ -261,7 +315,9 @@ TEST_F(WtoolsKillProcessTreeFixture, Component) {
     EXPECT_TRUE(proc_name == L"cmd.exe");
     EXPECT_EQ(parent_process_id, ::GetCurrentProcessId());
 
-    EXPECT_TRUE(findProcessByParentPid(proc_id)) << "child process absent";
+    ASSERT_TRUE(tst::WaitForSuccessSilent(2000ms, [&]() {
+        return findProcessByParentPid(proc_id);
+    })) << "child process absent";
 
     // killing
     KillProcessTree(proc_id);
@@ -475,7 +531,7 @@ TEST(Wtools, AppRunnerRunAndSTop) {
 #endif
 
 TEST(Wtools, SimplePipeBase) {
-    SimplePipe pipe;
+    DirectPipe pipe;
     EXPECT_EQ(pipe.getRead(), nullptr);
     EXPECT_EQ(pipe.getWrite(), nullptr);
 
@@ -659,7 +715,7 @@ TEST(Wtools, ToCanonical) {
 }
 
 TEST(PlayerTest, Pipe) {
-    const auto p = std::make_unique<SimplePipe>();
+    const auto p = std::make_unique<DirectPipe>();
     EXPECT_EQ(p->getRead(), nullptr);
     EXPECT_EQ(p->getWrite(), nullptr);
     p->create();
@@ -709,7 +765,7 @@ TEST(Wtools, ExecuteCommandsAsync) {
                                    ::GetCurrentProcessId());
     const std::vector<std::wstring> commands{L"echo x>" + output_file,
                                              L"@echo powershell Start-Sleep 1"};
-    const auto result = ExecuteCommandsAsync(L"test", commands);
+    const auto result = ExecuteCommands(L"test", commands, ExecuteMode::async);
     std::error_code ec;
     ON_OUT_OF_SCOPE({
         if (!result.empty()) {
@@ -740,6 +796,70 @@ TEST(Wtools, GetServiceStatus) {
     EXPECT_EQ(GetServiceStatus(L"snmptrap"), SERVICE_STOPPED);
     EXPECT_EQ(GetServiceStatus(L"vds-bad-service"), 0U);
     EXPECT_EQ(GetServiceStatus(L"SamSS"), SERVICE_RUNNING);
+}
+
+TEST(Wtools, InternalUsersDbIntegration) {
+    // Power Users
+    const auto group = SidToName(L"S-1-5-32-547", SidTypeGroup);
+    auto group_name = group;
+    rs::replace(group_name, ' ', '_');
+
+    auto iu = std::make_unique<InternalUsersDb>();
+    const auto nothing = iu->obtainUser(L"weird group");
+    EXPECT_TRUE(nothing.first.empty());
+
+    auto [name, pwd] = iu->obtainUser(group);
+    if (name.empty()) {
+        GTEST_SKIP() << "can't get user, admin rights?";
+    }
+
+    EXPECT_EQ(name, L"cmk_TST_"s + group_name);
+    EXPECT_EQ(iu->size(), 1U);
+
+    auto [name_2, pwd_2] = iu->obtainUser(group);
+    EXPECT_TRUE(!name_2.empty());
+    EXPECT_EQ(name_2, L"cmk_TST_"s + group_name);
+    EXPECT_EQ(name, name_2);
+    EXPECT_EQ(iu->size(), 1U);
+    iu.reset();
+    const uc::LdapControl lc;
+    ASSERT_EQ(lc.userDel(name), uc::Status::absent);
+}
+
+TEST(Wtools, MakeSafeFolderIntegration) {
+    const auto path = MakeSafeTempFolder("temp");  //
+    EXPECT_TRUE(fs::exists(*path));
+    fs::remove_all(*path);
+}
+
+TEST(Wtools, GetAdapterInfoStore) {
+    const auto store = GetAdapterInfoStore();
+    EXPECT_GE(store.size(), 1U);
+    std::unordered_set<IF_OPER_STATUS> types;
+    for (auto &&info : store | std::views::values) {
+        types.insert(info.oper_status);
+    }
+    EXPECT_TRUE(types.contains(IF_OPER_STATUS::IfOperStatusUp));
+    EXPECT_TRUE(types.contains(IF_OPER_STATUS::IfOperStatusDown));
+}
+
+TEST(Wtools, MangleNameForPerfCounter) {
+    EXPECT_EQ(MangleNameForPerfCounter(L"abc"), L"abc");
+    EXPECT_EQ(MangleNameForPerfCounter(L"/\\!@#$%^&**()__ `~'\""),
+              L"__!@_$%^&**[]__ `~'\"");
+}
+
+TEST(Wtools, OsInfo) {
+    const auto obtained = *GetOsInfo();
+    EXPECT_TRUE(obtained.name.starts_with(L"Microsoft Windows"));
+    EXPECT_TRUE(obtained.name.ends_with(L"Pro") ||      // local
+                obtained.name.ends_with(L"Standard"));  // CI
+
+    const auto num_strings = cma::tools::SplitString(obtained.version, L".");
+    // 10.0.14559
+    EXPECT_GE(std::stoi(num_strings[0]), 10);
+    EXPECT_GE(std::stoi(num_strings[1]), 0);
+    EXPECT_GE(std::stoi(num_strings[2]), 20);
 }
 
 }  // namespace wtools

@@ -24,6 +24,8 @@ public:
         explicit Name(std::string value) : _value(std::move(value)) {}
         [[nodiscard]] std::string string() const { return _value; }
 
+        auto operator<=>(const Name &) const = default;
+
     private:
         std::string _value;
     };
@@ -34,6 +36,8 @@ public:
             : _value(pnp_cleanup(name)) {}
         explicit MangledName(const Name &name) : MangledName(name.string()) {}
         [[nodiscard]] std::string string() const { return _value; }
+
+        auto operator<=>(const MangledName &) const = default;
 
     private:
         std::string _value;
@@ -55,6 +59,7 @@ public:
     [[nodiscard]] Name name() const { return _name; }
     [[nodiscard]] MangledName mangled_name() const { return _mangled_name; }
     [[nodiscard]] std::string value() const { return _value; }
+    [[nodiscard]] double value_as_double() const;
     [[nodiscard]] std::string uom() const { return _uom; }
     [[nodiscard]] std::string warn() const { return _warn; }
     [[nodiscard]] std::string crit() const { return _crit; }
@@ -73,16 +78,6 @@ private:
     std::string _min;
     std::string _max;
 };
-
-inline bool operator==(const Metric::MangledName &x,
-                       const Metric::MangledName &y) {
-    return x.string() == y.string();
-}
-
-inline bool operator!=(const Metric::MangledName &x,
-                       const Metric::MangledName &y) {
-    return !(x == y);
-}
 
 struct MetricLocation {
     std::filesystem::path path_;

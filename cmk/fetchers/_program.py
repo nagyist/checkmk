@@ -3,19 +3,19 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-import copy
 import logging
 import os
 import signal
 import subprocess
-from collections.abc import Mapping
 from contextlib import suppress
-from typing import Any, Final
+from typing import Final
 
-from cmk.utils.exceptions import MKFetcherError
-from cmk.utils.type_defs import AgentRawData
+from cmk.ccc.exceptions import MKFetcherError
 
-from cmk.fetchers import Fetcher, Mode
+from cmk.utils.agentdatatype import AgentRawData
+from cmk.utils.log import VERBOSE
+
+from ._abstract import Fetcher, Mode
 
 
 class ProgramFetcher(Fetcher[AgentRawData]):
@@ -26,10 +26,11 @@ class ProgramFetcher(Fetcher[AgentRawData]):
         stdin: str | None,
         is_cmc: bool,
     ) -> None:
-        super().__init__(logger=logging.getLogger("cmk.helper.program"))
+        super().__init__()
         self.cmdline: Final = cmdline
         self.stdin: Final = stdin
         self.is_cmc: Final = is_cmc
+        self._logger: Final = logging.getLogger("cmk.helper.program")
         self._process: subprocess.Popen | None = None
 
     def __repr__(self) -> str:
@@ -45,16 +46,14 @@ class ProgramFetcher(Fetcher[AgentRawData]):
             + ")"
         )
 
-    @classmethod
-    def _from_json(cls, serialized: Mapping[str, Any]) -> "ProgramFetcher":
-        return cls(**copy.deepcopy(dict(serialized)))
-
-    def to_json(self) -> Mapping[str, Any]:
-        return {
-            "cmdline": self.cmdline,
-            "stdin": self.stdin,
-            "is_cmc": self.is_cmc,
-        }
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ProgramFetcher):
+            return False
+        return (
+            self.cmdline == other.cmdline
+            and self.stdin == other.stdin
+            and self.is_cmc == other.is_cmc
+        )
 
     def open(self) -> None:
         self._logger.debug("Calling: %s", self.cmdline)
@@ -76,7 +75,7 @@ class ProgramFetcher(Fetcher[AgentRawData]):
             # rather than doing it in a preexec_fn. The start_new_session parameter can take
             # the place of a previously common use of preexec_fn to call os.setsid() in the
             # child.
-            self._process = subprocess.Popen(  # nosec
+            self._process = subprocess.Popen(  # nosec 602 # BNS:b00359
                 self.cmdline,
                 shell=True,
                 stdin=subprocess.PIPE if self.stdin else subprocess.DEVNULL,
@@ -89,7 +88,7 @@ class ProgramFetcher(Fetcher[AgentRawData]):
             # We can not create a separate process group when running Nagios
             # Upon reaching the service_check_timeout Nagios only kills the process
             # group of the active check.
-            self._process = subprocess.Popen(  # nosec # pylint: disable=consider-using-with
+            self._process = subprocess.Popen(  # nosec 602 # BNS:b00359
                 self.cmdline,
                 shell=True,
                 stdin=subprocess.PIPE if self.stdin else subprocess.DEVNULL,
@@ -128,8 +127,9 @@ class ProgramFetcher(Fetcher[AgentRawData]):
         self._process = None
 
     def _fetch_from_io(self, mode: Mode) -> AgentRawData:
+        self._logger.log(VERBOSE, "Get data from program")
         if self._process is None:
-            raise MKFetcherError("No process")
+            raise TypeError("no process")
         # ? do they have the default byte type, because in open() none of the "text", "encoding",
         #  "errors", "universal_newlines" were specified?
         stdout, stderr = self._process.communicate(

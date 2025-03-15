@@ -4,20 +4,20 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 import itertools
-from typing import Any
+from collections.abc import MutableMapping
+
+from cmk.utils.servicename import ServiceName
+
+from cmk.checkengine.checking import CheckPluginName
+from cmk.checkengine.discovery import AutocheckEntry
 
 from cmk.gui.watolib.services import _apply_state_change, DiscoveryState
 
-MOCK_KEY: tuple[str, str] = ("local", "1st service")
-MOCK_VALUE: tuple[str, dict[str, Any], dict[str, Any], list[str]] = (
-    "1st service",
-    {},
-    {},
-    ["test"],
-)
+MOCK_VALUE = AutocheckEntry(CheckPluginName("local"), "1st service", {}, {})
 MOCK_DESC = "1st service"
+MOCK_KEY = ServiceName(MOCK_DESC)
 
-RESULT = tuple[dict, set, set, set]
+RESULT = tuple[MutableMapping[ServiceName, AutocheckEntry], set, set, set]
 
 
 def _expected_clustered():
@@ -264,10 +264,6 @@ known_results = {
     ): _expected_clustered(),
     (
         DiscoveryState.CLUSTERED_IGNORED,
-        DiscoveryState.CLUSTERED_OLD,
-    ): _expected_clustered(),
-    (
-        DiscoveryState.CLUSTERED_IGNORED,
         DiscoveryState.CLUSTERED_IGNORED,
     ): _expected_clustered(),
     (
@@ -298,6 +294,50 @@ known_results = {
         DiscoveryState.CLUSTERED_VANISHED,
         DiscoveryState.CUSTOM_IGNORED,
     ): _expected_clustered(),
+    (DiscoveryState.MONITORED, DiscoveryState.CHANGED): _expected_monitored_standard(),
+    (DiscoveryState.CHANGED, DiscoveryState.VANISHED): _expected_monitored_standard(),
+    (DiscoveryState.CHANGED, DiscoveryState.REMOVED): _expected_monitored_standard(),
+    (DiscoveryState.CHANGED, DiscoveryState.MANUAL): _expected_monitored_standard(),
+    (DiscoveryState.CHANGED, DiscoveryState.ACTIVE): _expected_monitored_standard(),
+    (DiscoveryState.CHANGED, DiscoveryState.CUSTOM): _expected_monitored_standard(),
+    (
+        DiscoveryState.CHANGED,
+        DiscoveryState.CLUSTERED_OLD,
+    ): _expected_monitored_standard(),
+    (
+        DiscoveryState.CHANGED,
+        DiscoveryState.CLUSTERED_NEW,
+    ): _expected_monitored_standard(),
+    (
+        DiscoveryState.CHANGED,
+        DiscoveryState.CLUSTERED_VANISHED,
+    ): _expected_monitored_standard(),
+    (
+        DiscoveryState.CHANGED,
+        DiscoveryState.CLUSTERED_IGNORED,
+    ): _expected_monitored_standard(),
+    (
+        DiscoveryState.CHANGED,
+        DiscoveryState.ACTIVE_IGNORED,
+    ): _expected_monitored_standard(),
+    (
+        DiscoveryState.CHANGED,
+        DiscoveryState.CUSTOM_IGNORED,
+    ): _expected_monitored_standard(),
+    # If we want to keep the service in DiscoveryState.CHANGED the old values have to be written
+    # to the new result
+    (DiscoveryState.CHANGED, DiscoveryState.CHANGED): (
+        {MOCK_KEY: MOCK_VALUE},
+        {MOCK_DESC},
+        set(),
+        set(),
+    ),
+    (DiscoveryState.CHANGED, DiscoveryState.IGNORED): (
+        {MOCK_KEY: MOCK_VALUE},
+        set(),
+        {MOCK_DESC},
+        set(),
+    ),
 }
 
 empty_result: RESULT = (

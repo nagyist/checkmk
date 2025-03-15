@@ -3,13 +3,21 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-"""Register the builtin global setting configuration variable groups"""
+"""Register the built-in global setting configuration variable groups"""
 
 from cmk.gui.i18n import _
-from cmk.gui.plugins.watolib.utils import config_variable_group_registry, ConfigVariableGroup
+from cmk.gui.watolib.config_domain_name import ConfigVariableGroup, ConfigVariableGroupRegistry
 
 
-@config_variable_group_registry.register
+def register(config_variable_group_registry: ConfigVariableGroupRegistry) -> None:
+    config_variable_group_registry.register(ConfigVariableGroupNotifications)
+    config_variable_group_registry.register(ConfigVariableGroupUserInterface)
+    config_variable_group_registry.register(ConfigVariableGroupWATO)
+    config_variable_group_registry.register(ConfigVariableGroupSiteManagement)
+    config_variable_group_registry.register(ConfigVariableGroupSupport)
+    config_variable_group_registry.register(ConfigVariableGroupDeveloperTools)
+
+
 class ConfigVariableGroupNotifications(ConfigVariableGroup):
     def title(self) -> str:
         return _("Notifications")
@@ -18,7 +26,6 @@ class ConfigVariableGroupNotifications(ConfigVariableGroup):
         return 15
 
 
-@config_variable_group_registry.register
 class ConfigVariableGroupUserInterface(ConfigVariableGroup):
     def title(self) -> str:
         return _("User interface")
@@ -27,7 +34,6 @@ class ConfigVariableGroupUserInterface(ConfigVariableGroup):
         return 20
 
 
-@config_variable_group_registry.register
 class ConfigVariableGroupWATO(ConfigVariableGroup):
     def title(self) -> str:
         return _("Setup")
@@ -36,10 +42,33 @@ class ConfigVariableGroupWATO(ConfigVariableGroup):
         return 25
 
 
-@config_variable_group_registry.register
 class ConfigVariableGroupSiteManagement(ConfigVariableGroup):
     def title(self) -> str:
         return _("Site management")
 
     def sort_index(self) -> int:
         return 30
+
+
+class ConfigVariableGroupSupport(ConfigVariableGroup):
+    def title(self) -> str:
+        return _("Support")
+
+    def sort_index(self) -> int:
+        return 80
+
+
+class ConfigVariableGroupDeveloperTools(ConfigVariableGroup):
+    def title(self) -> str:
+        return _("Developer Tools")
+
+    def sort_index(self) -> int:
+        return 90
+
+    def warning(self) -> str | None:
+        return _(
+            "These are internal settings used by Checkmk developers. "
+            "Do not change them unless you know what you are doing. "
+            "There is a high risk that using these features will break your Checkmk site. "
+            "Any changes here will result in your Checkmk site no longer being officially supported."
+        )

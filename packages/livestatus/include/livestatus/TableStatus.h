@@ -8,22 +8,21 @@
 
 #include <string>
 
-#include "livestatus/Row.h"
 #include "livestatus/Table.h"
-#include "livestatus/global_counters.h"
+
 class ColumnOffsets;
-class MonitoringCore;
-class Query;
-class User;
+enum class Counter;
+class ICore;
 
 class TableStatus : public Table {
 public:
-    explicit TableStatus(MonitoringCore *mc);
+    explicit TableStatus(ICore *mc);
 
     [[nodiscard]] std::string name() const override;
     [[nodiscard]] std::string namePrefix() const override;
-    void answerQuery(Query &query, const User &user) override;
-    [[nodiscard]] Row getDefault() const override;
+    void answerQuery(Query &query, const User &user,
+                     const ICore &core) override;
+    [[nodiscard]] Row getDefault(const ICore &core) const override;
 
 private:
     void addCounterColumns(const std::string &name,

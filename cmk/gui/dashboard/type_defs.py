@@ -5,10 +5,8 @@
 
 from typing import Literal, TypedDict
 
-from cmk.gui.plugins.metrics.utils import GraphRenderOptions
-from cmk.gui.type_defs import FilterName, SingleInfos, VisualContext
+from cmk.gui.type_defs import FilterName, GraphRenderOptionsVS, SingleInfos, Visual, VisualContext
 from cmk.gui.valuespec import TimerangeValue
-from cmk.gui.visuals import Visual
 
 DashboardName = str
 DashletId = int
@@ -37,7 +35,7 @@ class DashletConfig(_DashletConfigMandatory, total=False):
 
 class ABCGraphDashletConfig(DashletConfig):
     timerange: TimerangeValue
-    graph_render_options: GraphRenderOptions
+    graph_render_options: GraphRenderOptionsVS
 
 
 class DashboardConfig(Visual):

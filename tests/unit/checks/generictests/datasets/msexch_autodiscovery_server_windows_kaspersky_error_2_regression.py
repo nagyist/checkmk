@@ -8,6 +8,14 @@
 
 checkname = "msexch_autodiscovery"
 
+
+mock_item_state = {
+    "": {
+        "RequestsPersec_": (0, 19086),
+    },
+}
+
+
 info = [
     [
         "Caption",
@@ -43,7 +51,7 @@ info = [
     ],
 ]
 
-discovery = {"": [(None, None)]}
+discovery = {"": [(None, {})]}
 
 checks = {
     "": [

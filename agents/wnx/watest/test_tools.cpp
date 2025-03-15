@@ -3,7 +3,7 @@
 
 #include "pch.h"
 
-#include "test_tools.h"
+#include "watest/test_tools.h"
 
 #include <shellapi.h>
 
@@ -11,16 +11,16 @@
 #include <random>
 #include <string>
 
-#include "algorithm"  // for remove_if
-#include "cfg.h"
-#include "cfg_details.h"
+#include "algorithm"            // for remove_if
 #include "corecrt_terminate.h"  // for terminate
-#include "firewall.h"
 #include "fmt/format.h"
 #include "fmt/xchar.h"
-#include "install_api.h"  // for terminate
-#include "on_start.h"
 #include "tools/_misc.h"
+#include "wnx/cfg.h"
+#include "wnx/cfg_details.h"
+#include "wnx/firewall.h"
+#include "wnx/install_api.h"  // for terminate
+#include "wnx/on_start.h"
 #include "yaml-cpp/node/node.h"  // for Node
 
 namespace fs = std::filesystem;
@@ -31,14 +31,13 @@ namespace tst {
 
 void AllowReadWriteAccess(const fs::path &path,
                           std::vector<std::wstring> &commands) {
-    const std::vector<std::wstring> command_templates = {
-        L"icacls \"{}\" /inheritance:d /c",  // disable inheritance
-        L"icacls \"{}\" /grant:r *S-1-5-32-545:(OI)(CI)(RX) /c"};  // read/exec
-
-    for (const auto &t : command_templates) {
-        auto cmd = fmt::format(t, path.wstring());
-        commands.emplace_back(cmd);
-    }
+    // disable inheritance
+    commands.emplace_back(
+        fmt::format(L"icacls \"{}\" /inheritance:d /c", path.wstring()));
+    // read/exec
+    commands.emplace_back(
+        fmt::format(L"icacls \"{}\" /grant:r *S-1-5-32-545:(OI)(CI)(RX) /c",
+                    path.wstring()));
     XLOG::l.i("Protect file from User write '{}'", path);
 }
 
@@ -150,6 +149,10 @@ fs::path MakePathToCapTestFiles(const std::wstring &root) {
     fs::path r{root};
     r = r / kSolutionTestFilesFolderName / kSolutionCapTestFilesFolderName;
     return r.lexically_normal();
+}
+
+std::string GetUnitTestName() {
+    return ::testing::UnitTest::GetInstance()->current_test_info()->name();
 }
 
 void SafeCleanTempDir() {
@@ -382,7 +385,7 @@ bool TempCfgFs::loadContent(std::string_view content) {
 void TempCfgFs::allowUserAccess() const {
     std::vector<std::wstring> commands;
     tst::AllowReadWriteAccess(base_, commands);
-    wtools::ExecuteCommandsSync(L"all", commands);
+    wtools::ExecuteCommands(L"all", commands, wtools::ExecuteMode::sync);
 }
 
 [[nodiscard]] bool TempCfgFs::createFile(const fs::path &filepath,

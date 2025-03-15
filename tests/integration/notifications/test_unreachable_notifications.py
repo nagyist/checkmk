@@ -3,18 +3,25 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+import logging
 import subprocess
 import time
 from collections.abc import Iterator
 
 import pytest
 
-from tests.testlib import wait_until, WatchLog
+from tests.testlib.common.utils import wait_until
 from tests.testlib.site import Site
+
+from cmk.utils.rulesets.definition import RuleGroup
+
+from .watch_log import WatchLog
 
 STATE_UP = 0
 STATE_DOWN = 1
 STATE_UNREACHABLE = 2
+
+logger = logging.getLogger(__name__)
 
 
 def get_test_id(unreachable_enabled):
@@ -35,16 +42,16 @@ def unreachable_enabled_fixture(
 
     rule_id = None
     try:
-        print("Applying test config")
+        logger.info("Applying test config")
 
-        site.openapi.create_host(
+        site.openapi.hosts.create(
             "notify-test-parent",
             attributes={
                 "ipaddress": "127.0.0.1",
             },
         )
 
-        site.openapi.create_host(
+        site.openapi.hosts.create(
             "notify-test-child",
             attributes={
                 "ipaddress": "127.0.0.1",
@@ -57,10 +64,12 @@ def unreachable_enabled_fixture(
         else:
             notification_options = "d,r,f,s"
 
-        for rule_spec in site.openapi.get_rules("extra_host_conf:notification_options"):
-            site.openapi.delete_rule(rule_spec["id"])
-        rule_id = site.openapi.create_rule(
-            ruleset_name="extra_host_conf:notification_options",
+        for rule_spec in site.openapi.rules.get_all(
+            RuleGroup.ExtraHostConf("notification_options")
+        ):
+            site.openapi.rules.delete(rule_spec["id"])
+        rule_id = site.openapi.rules.create(
+            ruleset_name=RuleGroup.ExtraHostConf("notification_options"),
             value=notification_options,
         )
 
@@ -71,13 +80,13 @@ def unreachable_enabled_fixture(
         #
         # Cleanup code
         #
-        print("Cleaning up default config")
+        logger.info("Cleaning up default config")
 
         if rule_id is not None:
-            site.openapi.delete_rule(rule_id)
+            site.openapi.rules.delete(rule_id)
 
-        site.openapi.delete_host("notify-test-child")
-        site.openapi.delete_host("notify-test-parent")
+        site.openapi.hosts.delete("notify-test-child")
+        site.openapi.hosts.delete("notify-test-parent")
 
         site.activate_changes_and_wait_for_core_reload()
 

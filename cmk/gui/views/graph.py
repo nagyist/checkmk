@@ -5,23 +5,42 @@
 
 import copy
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Literal
+from uuid import uuid4
 
-from cmk.utils.type_defs import UserId
+from cmk.utils.user import UserId
 
 from cmk.gui.config import active_config
-from cmk.gui.http import request, response
+from cmk.gui.graphing._from_api import graphs_from_api, metrics_from_api, RegisteredMetric
+from cmk.gui.graphing._graph_render_config import (
+    GraphRenderConfig,
+    GraphRenderOptions,
+)
+from cmk.gui.graphing._graph_templates import get_template_graph_specification
+from cmk.gui.graphing._html_render import (
+    make_graph_data_range,
+    render_graphs_from_specification_html,
+)
+from cmk.gui.graphing._valuespecs import vs_graph_render_options
+from cmk.gui.http import Request, Response, response
 from cmk.gui.i18n import _, _l
-from cmk.gui.plugins.metrics import html_render
-from cmk.gui.plugins.metrics.utils import CombinedGraphMetricSpec
-from cmk.gui.plugins.metrics.valuespecs import vs_graph_render_options
+from cmk.gui.logged_in import LoggedInUser
+from cmk.gui.painter.v0 import Cell, Painter
+from cmk.gui.painter_options import (
+    get_graph_timerange_from_painter_options,
+    PainterOption,
+    PainterOptionRegistry,
+    PainterOptions,
+)
+from cmk.gui.theme.current_theme import theme
 from cmk.gui.type_defs import (
     ColumnName,
     ColumnSpec,
-    CombinedGraphSpec,
+    PainterParameters,
     Row,
-    TemplateGraphSpec,
+    ViewName,
+    ViewSpec,
     VisualLinkSpec,
 )
 from cmk.gui.utils.html import HTML
@@ -37,23 +56,27 @@ from cmk.gui.valuespec import (
 )
 from cmk.gui.view_utils import CellSpec, CSVExportError, JSONExportError, PythonExportError
 
-from .painter.v0.base import Cell, Painter2
-from .painter_options import (
-    get_graph_timerange_from_painter_options,
-    painter_option_registry,
-    PainterOption,
-    PainterOptions,
-)
-from .store import multisite_builtin_views
+from cmk.graphing.v1 import graphs as graphs_api
 
-multisite_builtin_views.update(
-    {
-        "service_graphs": {
+
+def register(
+    painter_option_registry: PainterOptionRegistry,
+    multisite_builtin_views: dict[ViewName, ViewSpec],
+) -> None:
+    painter_option_registry.register(PainterOptionGraphRenderOptions)
+    painter_option_registry.register(PainterOptionPNPTimerange)
+
+    multisite_builtin_views.update(_GRAPH_VIEWS)
+
+
+_GRAPH_VIEWS = {
+    "service_graphs": ViewSpec(
+        {
             "browser_reload": 30,
             "column_headers": "off",
             "datasource": "services",
             "description": _l(
-                "Shows all graphs including timerange selections of a collection of services."
+                "Shows all graphs including time range selections of a collection of services."
             ),
             "group_painters": [
                 ColumnSpec(
@@ -92,13 +115,16 @@ multisite_builtin_views.update(
             "sort_index": 99,
             "is_show_more": False,
             "packaged": False,
-        },
-        "host_graphs": {
+            "megamenu_search_terms": [],
+        }
+    ),
+    "host_graphs": ViewSpec(
+        {
             "browser_reload": 30,
             "column_headers": "off",
             "datasource": "hosts",
             "description": _l(
-                "Shows host graphs including timerange selections of a collection of hosts."
+                "Shows host graphs including time range selections of a collection of hosts."
             ),
             "group_painters": [
                 ColumnSpec(
@@ -131,31 +157,25 @@ multisite_builtin_views.update(
             "sort_index": 99,
             "is_show_more": False,
             "packaged": False,
-        },
-    }
-)
+            "megamenu_search_terms": [],
+        }
+    ),
+}
 
 
-def paint_time_graph_cmk(  # type: ignore[no-untyped-def]
-    row,
-    cell,
-    resolve_combined_single_metric_spec: Callable[
-        [CombinedGraphSpec], Sequence[CombinedGraphMetricSpec]
-    ],
+def paint_time_graph_cmk(
+    row: Row,
+    cell: Cell,
+    registered_metrics: Mapping[str, RegisteredMetric],
+    registered_graphs: Mapping[str, graphs_api.Graph | graphs_api.Bidirectional],
     *,
-    override_graph_render_options=None,
-):
-    graph_identification: tuple[Literal["template"], TemplateGraphSpec] = (
-        "template",
-        TemplateGraphSpec(
-            {
-                "site": row["site"],
-                "host_name": row["host_name"],
-                "service_description": row.get("service_description", "_HOST_"),
-            }
-        ),
-    )
-
+    user: LoggedInUser,
+    request: Request,
+    response: Response,
+    painter_options: PainterOptions,
+    show_time_range_previews: bool | None = None,
+    require_historic_metrics: bool = True,
+) -> tuple[Literal[""], HTML | str]:
     # Load the graph render options from
     # a) the painter parameters configured in the view
     # b) the painter options set per user and view
@@ -163,15 +183,19 @@ def paint_time_graph_cmk(  # type: ignore[no-untyped-def]
     painter_params = cell.painter_parameters()
     painter_params = _migrate_old_graph_render_options(painter_params)
 
-    graph_render_options = painter_params["graph_render_options"]
+    graph_render_options = painter_params["graph_render_options"].copy()
+    if show_time_range_previews is not None:
+        graph_render_options["show_time_range_previews"] = show_time_range_previews
 
-    if override_graph_render_options is not None:
-        graph_render_options.update(override_graph_render_options)
-
-    painter_options = PainterOptions.get_instance()
     options = painter_options.get_without_default("graph_render_options")
     if options is not None:
         graph_render_options.update(options)
+
+    graph_render_config = GraphRenderConfig.from_user_context_and_options(
+        user,
+        theme.get(),
+        GraphRenderOptions.from_graph_render_options_vs(graph_render_options),
+    )
 
     now = int(time.time())
     if "set_default_time_range" in painter_params:
@@ -185,11 +209,14 @@ def paint_time_graph_cmk(  # type: ignore[no-untyped-def]
     if painter_option_pnp_timerange is not None:
         time_range = get_graph_timerange_from_painter_options()
 
-    graph_data_range = html_render.make_graph_data_range(time_range, graph_render_options)
+    graph_data_range = make_graph_data_range(
+        time_range,
+        graph_render_config.size[1],
+    )
 
     if is_mobile(request, response):
-        graph_render_options.update(
-            {
+        graph_render_config = graph_render_config.model_copy(
+            update={
                 "interaction": False,
                 "show_controls": False,
                 "show_pin": False,
@@ -208,32 +235,30 @@ def paint_time_graph_cmk(  # type: ignore[no-untyped-def]
         available_metrics = row["service_metrics"]
         perf_data = row["service_perf_data"]
 
-    if not available_metrics and perf_data:
+    if not available_metrics and perf_data and require_historic_metrics:
         return "", _(
             "No historic metrics recorded but performance data is available. "
             "Maybe performance data processing is disabled."
         )
 
-    return "", html_render.render_graphs_from_specification_html(
-        graph_identification,
+    return "", render_graphs_from_specification_html(
+        get_template_graph_specification(
+            site_id=row["site"],
+            host_name=row["host_name"],
+            service_name=row.get("service_description", "_HOST_"),
+        ),
         graph_data_range,
-        graph_render_options,
-        resolve_combined_single_metric_spec,
-    )
-
-
-def paint_cmk_graphs_with_timeranges(  # type: ignore[no-untyped-def]
-    row,
-    cell,
-    resolve_combined_single_metric_spec: Callable[
-        [CombinedGraphSpec], Sequence[CombinedGraphMetricSpec]
-    ],
-):
-    return paint_time_graph_cmk(
-        row,
-        cell,
-        resolve_combined_single_metric_spec,
-        override_graph_render_options={"show_time_range_previews": True},
+        graph_render_config,
+        registered_metrics,
+        registered_graphs,
+        # Ideally, we would use 2-dim. coordinates: (row_idx, col_idx).
+        # Unfortunately, we have no access to this information here. Regarding the rows, we could
+        # use (site, host, service) as identifier, but for the columns, there does not seem to be
+        # any unique information. The view rendering is designed st. individuals cells are rendered
+        # completely independently of each other, based solely on the livestatus data and on the
+        # painter settings (which makes sense). The caching in graph.ts breaks this assumption. So
+        # for now, we randomize. See also CMK-13840.
+        graph_display_id=str(uuid4()),
     )
 
 
@@ -260,7 +285,7 @@ def cmk_time_graph_params():
     )
 
 
-def _migrate_old_graph_render_options(value):
+def _migrate_old_graph_render_options(value: PainterParameters | None) -> PainterParameters:
     if value is None:
         value = {}
 
@@ -268,20 +293,20 @@ def _migrate_old_graph_render_options(value):
     if "graph_render_options" not in value:
         value = copy.deepcopy(value)
         value["graph_render_options"] = {
-            "show_legend": value.pop("show_legend", True),
-            "show_controls": value.pop("show_controls", True),
-            "show_time_range_previews": value.pop("show_time_range_previews", True),
+            "show_legend": value.pop("show_legend", True),  # type: ignore[typeddict-item]
+            "show_controls": value.pop("show_controls", True),  # type: ignore[typeddict-item]
+            "show_time_range_previews": value.pop("show_time_range_previews", True),  # type: ignore[typeddict-item]
         }
     return value
 
 
-class PainterServiceGraphs(Painter2):
+class PainterServiceGraphs(Painter):
     @property
     def ident(self) -> str:
         return "service_graphs"
 
     def title(self, cell):
-        return _("Service graphs with timerange previews")
+        return _("Service graphs with time range previews")
 
     @property
     def columns(self) -> Sequence[ColumnName]:
@@ -306,12 +331,16 @@ class PainterServiceGraphs(Painter2):
         return cmk_time_graph_params()
 
     def render(self, row: Row, cell: Cell) -> CellSpec:
-        resolve_combined_single_metric_spec = type(self).resolve_combined_single_metric_spec
-        assert resolve_combined_single_metric_spec is not None
-        return paint_cmk_graphs_with_timeranges(
+        return paint_time_graph_cmk(
             row,
             cell,
-            resolve_combined_single_metric_spec,
+            metrics_from_api,
+            graphs_from_api,
+            user=self.user,
+            request=self.request,
+            response=response,
+            painter_options=self._painter_options,
+            show_time_range_previews=True,
         )
 
     def export_for_python(self, row: Row, cell: Cell) -> object:
@@ -324,13 +353,13 @@ class PainterServiceGraphs(Painter2):
         raise JSONExportError()
 
 
-class PainterHostGraphs(Painter2):
+class PainterHostGraphs(Painter):
     @property
     def ident(self) -> str:
         return "host_graphs"
 
     def title(self, cell):
-        return _("Host Graphs with Timerange Previews")
+        return _("Host Graphs with Time Range Previews")
 
     @property
     def columns(self) -> Sequence[ColumnName]:
@@ -349,12 +378,19 @@ class PainterHostGraphs(Painter2):
         return cmk_time_graph_params()
 
     def render(self, row: Row, cell: Cell) -> CellSpec:
-        resolve_combined_single_metric_spec = type(self).resolve_combined_single_metric_spec
-        assert resolve_combined_single_metric_spec is not None
-        return paint_cmk_graphs_with_timeranges(
+        return paint_time_graph_cmk(
             row,
             cell,
-            resolve_combined_single_metric_spec,
+            metrics_from_api,
+            graphs_from_api,
+            user=self.user,
+            request=self.request,
+            response=response,
+            painter_options=self._painter_options,
+            show_time_range_previews=True,
+            # for PainterHostGraphs used to paint service graphs (view "Service graphs of host"),
+            # also render the graphs if there are no historic metrics available (but perf data is)
+            require_historic_metrics="service_description" not in row,
         )
 
     def export_for_python(self, row: Row, cell: Cell) -> object:
@@ -367,7 +403,6 @@ class PainterHostGraphs(Painter2):
         raise JSONExportError()
 
 
-@painter_option_registry.register
 class PainterOptionGraphRenderOptions(PainterOption):
     @property
     def ident(self) -> str:
@@ -378,7 +413,6 @@ class PainterOptionGraphRenderOptions(PainterOption):
         return vs_graph_render_options()
 
 
-@painter_option_registry.register
 class PainterOptionPNPTimerange(PainterOption):
     @property
     def ident(self) -> str:
@@ -393,7 +427,7 @@ class PainterOptionPNPTimerange(PainterOption):
         )
 
 
-class PainterSvcPnpgraph(Painter2):
+class PainterSvcPnpgraph(Painter):
     @property
     def ident(self) -> str:
         return "svc_pnpgraph"
@@ -424,9 +458,16 @@ class PainterSvcPnpgraph(Painter2):
         return cmk_time_graph_params()
 
     def render(self, row: Row, cell: Cell) -> CellSpec:
-        resolve_combined_single_metric_spec = type(self).resolve_combined_single_metric_spec
-        assert resolve_combined_single_metric_spec is not None
-        return paint_time_graph_cmk(row, cell, resolve_combined_single_metric_spec)
+        return paint_time_graph_cmk(
+            row,
+            cell,
+            metrics_from_api,
+            graphs_from_api,
+            user=self.user,
+            request=self.request,
+            response=response,
+            painter_options=self._painter_options,
+        )
 
     def export_for_python(self, row: Row, cell: Cell) -> object:
         raise PythonExportError()
@@ -438,7 +479,7 @@ class PainterSvcPnpgraph(Painter2):
         raise JSONExportError()
 
 
-class PainterHostPnpgraph(Painter2):
+class PainterHostPnpgraph(Painter):
     @property
     def ident(self) -> str:
         return "host_pnpgraph"
@@ -466,9 +507,16 @@ class PainterHostPnpgraph(Painter2):
         return cmk_time_graph_params()
 
     def render(self, row: Row, cell: Cell) -> CellSpec:
-        resolve_combined_single_metric_spec = type(self).resolve_combined_single_metric_spec
-        assert resolve_combined_single_metric_spec is not None
-        return paint_time_graph_cmk(row, cell, resolve_combined_single_metric_spec)
+        return paint_time_graph_cmk(
+            row,
+            cell,
+            metrics_from_api,
+            graphs_from_api,
+            user=self.user,
+            request=self.request,
+            response=response,
+            painter_options=self._painter_options,
+        )
 
     def export_for_python(self, row: Row, cell: Cell) -> object:
         raise PythonExportError()
@@ -480,7 +528,7 @@ class PainterHostPnpgraph(Painter2):
         raise JSONExportError()
 
 
-def cmk_graph_url(row, what):
+def cmk_graph_url(row: Row, what: str, *, request: Request) -> str:
     site_id = row["site"]
 
     urivars = [

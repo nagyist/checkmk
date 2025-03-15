@@ -10,18 +10,18 @@ from typing import NewType
 
 from marshmallow import ValidationError
 
-import cmk.utils.store as store
-
-import cmk.gui.hooks as hooks
-import cmk.gui.plugins.userdb.utils as userdb_utils
-import cmk.gui.userdb as userdb
-from cmk.gui.config import active_config
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.i18n import _
 from cmk.gui.permissions import permission_registry
-from cmk.gui.type_defs import UserRole, Users
-from cmk.gui.utils.transaction_manager import transactions
-from cmk.gui.watolib.utils import multisite_dir
+from cmk.gui.type_defs import Users
+from cmk.gui.userdb import (
+    is_two_factor_login_enabled,
+    load_roles,
+    load_users,
+    save_users,
+    UserRole,
+    UserRolesConfigFile,
+)
 
 RoleID = NewType("RoleID", str)
 
@@ -47,17 +47,18 @@ def clone_role(
     cloned_user_role = UserRole(
         name=new_role_id,
         basedon=role_to_clone.basedon or role_to_clone.name,
+        two_factor=role_to_clone.two_factor,
         alias=new_alias,
         permissions=role_to_clone.permissions,
     )
     all_roles[RoleID(new_role_id)] = cloned_user_role
-    save_all_roles(all_roles)
+    UserRolesConfigFile().save({role.name: role.to_dict() for role in all_roles.values()})
 
     return cloned_user_role
 
 
 def get_all_roles() -> dict[RoleID, UserRole]:
-    stored_roles: dict[str, dict] = userdb_utils.load_roles()
+    stored_roles: dict[str, dict] = load_roles()
     return {
         RoleID(roleid): UserRole(name=roleid, **params) for roleid, params in stored_roles.items()
     }
@@ -80,11 +81,11 @@ def delete_role(role_id: RoleID) -> None:
     all_roles: dict[RoleID, UserRole] = get_all_roles()
     role_to_delete: UserRole = get_role(role_id)
 
-    if transactions.transaction_valid() and role_to_delete.builtin:
-        raise MKUserError(None, _("You cannot delete the builtin roles!"))
+    if role_to_delete.builtin:
+        raise MKUserError(None, _("You cannot delete the built-in roles!"))
 
     # Check if currently being used by a user
-    users: Users = userdb.load_users()
+    users: Users = load_users()
     for user in users.values():
         if role_id in user["roles"]:
             raise MKUserError(
@@ -96,31 +97,17 @@ def delete_role(role_id: RoleID) -> None:
     rename_user_role(role_id, None)  # Remove from existing users
 
     del all_roles[role_id]
-    save_all_roles(all_roles)
-
-
-def save_all_roles(all_roles: dict[RoleID, UserRole]) -> None:
-    roles_as_dicts: dict[str, dict] = {role.name: role.to_dict() for role in all_roles.values()}
-    active_config.roles.update(roles_as_dicts)
-    store.mkdir(multisite_dir())
-    store.save_to_mk_file(
-        multisite_dir() + "roles.mk",
-        "roles",
-        roles_as_dicts,
-        pprint_value=active_config.wato_pprint_config,
-    )
-
-    hooks.call("roles-saved", roles_as_dicts)
+    UserRolesConfigFile().save({role.name: role.to_dict() for role in all_roles.values()})
 
 
 def rename_user_role(role_id: RoleID, new_role_id: RoleID | None) -> None:
-    users = userdb.load_users(lock=True)
+    users = load_users(lock=True)
     for user in users.values():
         if role_id in user["roles"]:
             user["roles"].remove(role_id)
             if new_role_id:
                 user["roles"].append(new_role_id)
-    userdb.save_users(users, datetime.now())
+    save_users(users, datetime.now())
 
 
 def validate_new_alias(old_alias: str, new_alias: str) -> None:
@@ -137,7 +124,7 @@ def validate_new_roleid(old_roleid: str, new_roleid: str) -> None:
 
     if old_roleid != new_roleid:
         if existing_role.builtin:
-            raise ValidationError(_("The ID of a builtin user role cannot be changed"))
+            raise ValidationError(_("The ID of a built-in user role cannot be changed"))
 
         if new_roleid in get_all_roles():
             raise ValidationError(_("The ID is already used by another role"))
@@ -174,4 +161,12 @@ def update_role(role: UserRole, old_roleid: RoleID, new_roleid: RoleID) -> None:
     all_roles: dict[RoleID, UserRole] = get_all_roles()
     del all_roles[old_roleid]
     all_roles[new_roleid] = role
-    save_all_roles(all_roles)
+    UserRolesConfigFile().save({role.name: role.to_dict() for role in all_roles.values()})
+
+
+def logout_users_with_role(role_id: RoleID) -> None:
+    users = load_users(lock=True)
+    for user_id, user in users.items():
+        if role_id in user["roles"] and not is_two_factor_login_enabled(user_id):
+            user["serial"] = user.get("serial", 0) + 1
+    save_users(users, datetime.now())

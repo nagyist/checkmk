@@ -9,16 +9,15 @@
 #include <string>
 
 #include "livestatus/Table.h"
-class MonitoringCore;
-class Query;
-class User;
+class ICore;
 
 class TableCrashReports : public Table {
 public:
-    explicit TableCrashReports(MonitoringCore *mc);
+    explicit TableCrashReports(ICore *mc);
     [[nodiscard]] std::string name() const final;
     [[nodiscard]] std::string namePrefix() const final;
-    void answerQuery(Query &query, const User &user) override;
+    void answerQuery(Query &query, const User &user,
+                     const ICore &core) override;
 };
 
 #endif  // TableCrashReports_h

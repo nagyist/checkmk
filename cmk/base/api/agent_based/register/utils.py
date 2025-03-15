@@ -2,50 +2,32 @@
 # Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
-import enum
+
 import inspect
-import pathlib
-import sys
-from collections.abc import Callable, Mapping, Sequence
-from typing import Final, get_args, Literal, NoReturn
+from collections import defaultdict
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from typing import Final, get_args, Literal, NoReturn, Union
 
-from cmk.utils.paths import agent_based_plugins_dir
-from cmk.utils.type_defs import ParsedSectionName, RuleSetName
-from cmk.utils.version import Edition
+from cmk.utils.check_utils import ParametersTypeAlias
+from cmk.utils.rulesets import RuleSetName
+from cmk.utils.sectionname import SectionName
 
-from cmk.checkers.checking import CheckPluginName
-from cmk.checkers.inventory import InventoryPluginName
+from cmk.checkengine.checking import CheckPluginName
+from cmk.checkengine.inventory import InventoryPlugin, InventoryPluginName
+from cmk.checkengine.sectionparser import ParsedSectionName
 
-from cmk.base.api.agent_based.checking_classes import CheckPlugin
-from cmk.base.api.agent_based.type_defs import ParametersTypeAlias
+from cmk.base.api.agent_based.plugin_classes import (
+    AgentBasedPlugins,
+    CheckPlugin,
+    SectionPlugin,
+    SNMPSectionPlugin,
+)
+
+from cmk.agent_based.v1.register import RuleSetType
 
 TypeLabel = Literal["check", "cluster_check", "discovery", "host_label", "inventory"]
 
-ITEM_VARIABLE = "%s"
-
-_NONE_TYPE = type(None)
-
-_ALLOWED_EDITION_FOLDERS: Final = {e.short for e in Edition}
-
-
-def get_validated_plugin_module_name() -> str:
-    """Find out which module registered the plugin and make sure its in the right place"""
-    # We used this before, but it was a performance killer. The method below is a lot faster.
-    # calling_from = inspect.stack()[2].filename
-    calling_from = sys._getframe(2).f_code.co_filename
-
-    path = pathlib.Path(calling_from)
-
-    # watch out: this has to work in the git repo!
-    allowed_path_segment = agent_based_plugins_dir.parts[-3:]
-    if path.parent.parts[-len(allowed_path_segment) :] == allowed_path_segment:
-        return path.stem
-
-    if path.parent.parts[-len(allowed_path_segment) - 1 : -1] == allowed_path_segment:
-        if (edition := path.parent.parts[-1]) in _ALLOWED_EDITION_FOLDERS:
-            return f"{edition}.{path.stem}"
-
-    raise ImportError("do not register from %r" % path)
+ITEM_VARIABLE: Final = "%s"
 
 
 def create_subscribed_sections(
@@ -81,7 +63,7 @@ def validate_function_arguments(
     if len(sections) == 1:
         expected_params.append("section")
     else:
-        expected_params.extend("section_%s" % s for s in sections)
+        expected_params.extend(f"section_{s}" for s in sections)
 
     parameters = inspect.signature(function).parameters
     present_params = list(parameters)
@@ -106,7 +88,7 @@ def _raise_appropriate_type_error(
     type_label: TypeLabel,
     has_item: bool,
 ) -> NoReturn:
-    # We know we must raise. Dispatch for a better error message:
+    """Raise with appropriate error message:"""
 
     if set(expected_params) == set(present_params):  # not len()!
         exp_str = ", ".join(expected_params)
@@ -131,54 +113,48 @@ def _raise_appropriate_type_error(
     )
 
 
+# Note: The concrete union type parameters below don't matter, we are just interested in the type
+# constructors of the new & old-skool unions.
+_UNION_TYPES: Final = (type(int | str), type(Union[int, str]))
+
+
+# Poor man's pattern matching on generic types ahead! Note that we see Optional as a union at
+# runtime, so no special handling is needed for it.
+def _is_optional(annotation: object) -> bool:
+    return issubclass(type(annotation), _UNION_TYPES) and type(None) in get_args(annotation)
+
+
+# Check if the given parameter has a type of the form 'Mapping[str, T | None]' for any T.
+def _is_valid_cluster_section_parameter(p: inspect.Parameter) -> bool:
+    return (
+        any(map(str(p.annotation).startswith, ("collections.abc.Mapping[", "typing.Mapping[")))
+        and (len(args := get_args(p.annotation)) == 2)
+        and issubclass(args[0], str)
+        and _is_optional(args[1])
+    )
+
+
 def _validate_optional_section_annotation(
     *,
     parameters: Mapping[str, inspect.Parameter],
     type_label: TypeLabel,
 ) -> None:
-    """Validate that the section annotation is correct, if present.
+    section_parameters = [p for n, p in parameters.items() if n.startswith("section")]
 
-    We know almost nothing about the type of the section argument(s). Check the few things we know:
-
-        * If we have more than one section, all of them must be `Optional`.
-
-    """
-    section_args = [p for n, p in parameters.items() if n.startswith("section")]
-    if all(p.annotation == p.empty for p in section_args):
-        return  # no typing used in plugin
+    def validate_with(pred: Callable[[inspect.Parameter], bool], msg: str) -> None:
+        if not all(p.annotation == p.empty or pred(p) for p in section_parameters):
+            raise TypeError(f"Wrong type annotation: {msg}")
 
     if type_label == "cluster_check":
-        desired = " cluster sections must be of type `Mapping[str, Optional[<NodeSection>]]`"
-        if not all(
-            str(p.annotation).startswith("typing.Mapping[str, ")
-            and _NONE_TYPE in get_args(get_args(p.annotation)[1])
-            for p in section_args
-        ):
-            raise TypeError(f"Wrong type annotation: {desired}")
-        return
-
-    if len(section_args) <= 1:
-        return  # we know nothing in this case
-
-    if any(_NONE_TYPE not in get_args(p.annotation) for p in section_args):
-        raise TypeError("Wrong type annotation: multiple sections must be `Optional`")
-
-    return
-
-
-def _value_type(annotation: inspect.Parameter) -> bytes:
-    return get_args(annotation)[1]
-
-
-class RuleSetType(enum.Enum):
-    """Indicate the type of the rule set
-
-    Discovery and host label functions may either use all rules of a rule set matching
-    the current host, or the merged rules.
-    """
-
-    MERGED = enum.auto()
-    ALL = enum.auto()
+        validate_with(
+            _is_valid_cluster_section_parameter,
+            "cluster sections must be of type `Mapping[str, <NodeSection> | None]`",
+        )
+    elif len(section_parameters) > 1:
+        validate_with(
+            lambda p: _is_optional(p.annotation),
+            "multiple sections must be of type `<NodeSection> | None`",
+        )
 
 
 def validate_ruleset_type(ruleset_type: RuleSetType) -> None:
@@ -201,37 +177,52 @@ def validate_default_parameters(
         raise TypeError(f"default {params_type} parameters must be dict")
 
     if ruleset_name is None and params_type != "check":
-        raise TypeError("missing ruleset name for default %s parameters" % (params_type))
+        raise TypeError(f"missing ruleset name for default {params_type} parameters")
 
 
-def validate_check_ruleset_item_consistency(
-    check_plugin: CheckPlugin,
-    check_plugins_by_ruleset_name: dict[RuleSetName | None, list[CheckPlugin]],
-) -> None:
-    """Validate check plugins sharing a check_ruleset_name have either all or none an item.
+def filter_relevant_raw_sections(
+    *,
+    consumers: Iterable[CheckPlugin | InventoryPlugin],
+    sections: Iterable[SectionPlugin],
+) -> Mapping[SectionName, SectionPlugin]:
+    """Return the raw sections potentially relevant for the given check or inventory plugins"""
+    parsed_section_names = {
+        section_name for plugin in consumers for section_name in plugin.sections
+    }
 
-    Mixed checkgroups lead to strange exceptions when processing the check parameters.
-    So it is much better to catch these errors in a central place with a clear error message.
+    return {
+        section.name: section
+        for section in sections
+        if section.parsed_section_name in parsed_section_names
+    }
+
+
+def sections_needing_redetection(
+    sections: Iterable[SNMPSectionPlugin],
+) -> set[SectionName]:
+    """Return the names of sections that need to be redetected
+
+    Sections that are not the only producers of their parsed
+    sections need to be re-detected during checking.
     """
-    if check_plugin.check_ruleset_name is None:
-        return
+    sections_by_parsed_name = defaultdict(set)
+    for section in sections:
+        sections_by_parsed_name[section.parsed_section_name].add(section.name)
+    return {
+        section_name
+        for section_names in sections_by_parsed_name.values()
+        if len(section_names) > 1
+        for section_name in section_names
+    }
 
-    present_check_plugins = check_plugins_by_ruleset_name[check_plugin.check_ruleset_name]
-    if not present_check_plugins:
-        return
 
-    # Trying to detect whether or not the check has an item. But this mechanism is not
-    # 100% reliable since Checkmk appends an item to the service_description when "%s"
-    # is not in the checks service_description template.
-    # Maybe we need to define a new rule which enforces the developer to use the %s in
-    # the service_description. At least for grouped checks.
-    item_present = ITEM_VARIABLE in check_plugin.service_name
-    item_expected = ITEM_VARIABLE in present_check_plugins[0].service_name
-
-    if item_present is not item_expected:
-        present_plugins = ", ".join(str(p.name) for p in present_check_plugins)
-        raise ValueError(
-            f"Check ruleset {check_plugin.check_ruleset_name} has checks with and without item! "
-            "At least one of the checks in this group needs to be changed "
-            f"(offending plugin: {check_plugin.name}, present_plugins: {present_plugins})."
+def extract_known_discovery_rulesets(plugins: AgentBasedPlugins) -> Collection[RuleSetName]:
+    return {
+        r
+        for r in (
+            *(p.discovery_ruleset_name for p in plugins.check_plugins.values()),
+            *(p.host_label_ruleset_name for p in plugins.agent_sections.values()),
+            *(p.host_label_ruleset_name for p in plugins.snmp_sections.values()),
         )
+        if r is not None
+    }

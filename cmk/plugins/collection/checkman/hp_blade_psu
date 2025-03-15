@@ -1,0 +1,23 @@
+title: HPE BladeSystem Enclosures: Power Supplies
+agents: snmp
+catalog: hw/server/hpe
+license: GPLv2
+distribution: check_mk
+description:
+ This check monitors the health of the PSUs in HPE BladeSysten enclosures.
+
+ It uses the state reported by SNMP and prints the current power usage and
+ serial number reported of each PSU.
+
+ Each PSU which is present while the Checkmk service discovery will result in an
+ own service. If the PSU is not available anymore this service will be shown
+ as CRITICAL service.
+
+ The current power usage will also be sent as performance information to
+ Nagios.
+
+item:
+ Number of the PSU
+
+discovery:
+ One service is created for each PSU with the state "present".

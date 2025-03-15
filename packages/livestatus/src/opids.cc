@@ -5,47 +5,52 @@
 
 #include "livestatus/opids.h"
 
-#include <algorithm>
-#include <functional>  // IWYU pragma: keep
+#include <functional>
+#include <ostream>
+#include <ranges>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
 
 #include "livestatus/RegExp.h"
 
+using namespace std::string_view_literals;
+
 namespace {
-const std::unordered_map<std::string, RelationalOperator> fl_from_string = {
-    {"=", RelationalOperator::equal},
-    {"!=", RelationalOperator::not_equal},
-    {"~", RelationalOperator::matches},
-    {"!~", RelationalOperator::doesnt_match},
-    {"=~", RelationalOperator::equal_icase},
-    {"!=~", RelationalOperator::not_equal_icase},
-    {"~~", RelationalOperator::matches_icase},
-    {"!~~", RelationalOperator::doesnt_match_icase},
-    {"<", RelationalOperator::less},
-    {"!<", RelationalOperator::greater_or_equal},
-    {">=", RelationalOperator::greater_or_equal},
-    {"!>=", RelationalOperator::less},
-    {">", RelationalOperator::greater},
-    {"!>", RelationalOperator::less_or_equal},
-    {"<=", RelationalOperator::less_or_equal},
-    {"!<=", RelationalOperator::greater}};
+// NOLINTNEXTLINE(cert-err58-cpp)
+const std::unordered_map<std::string_view, RelationalOperator> fl_from_string =
+    {{"="sv, RelationalOperator::equal},
+     {"!="sv, RelationalOperator::not_equal},
+     {"~"sv, RelationalOperator::matches},
+     {"!~"sv, RelationalOperator::doesnt_match},
+     {"=~"sv, RelationalOperator::equal_icase},
+     {"!=~"sv, RelationalOperator::not_equal_icase},
+     {"~~"sv, RelationalOperator::matches_icase},
+     {"!~~"sv, RelationalOperator::doesnt_match_icase},
+     {"<"sv, RelationalOperator::less},
+     {"!<"sv, RelationalOperator::greater_or_equal},
+     {">="sv, RelationalOperator::greater_or_equal},
+     {"!>="sv, RelationalOperator::less},
+     {">"sv, RelationalOperator::greater},
+     {"!>"sv, RelationalOperator::less_or_equal},
+     {"<="sv, RelationalOperator::less_or_equal},
+     {"!<="sv, RelationalOperator::greater}};
 }  // namespace
 
 std::ostream &operator<<(std::ostream &os, const RelationalOperator &relOp) {
     // Slightly inefficient, but this doesn't matter for our purposes. We could
     // use Boost.Bimap or use 2 maps if really necessary.
-    auto it = std::find_if(
-        fl_from_string.cbegin(), fl_from_string.cend(),
-        [&](const auto &strAndOp) { return strAndOp.second == relOp; });
+    auto it = std::ranges::find_if(fl_from_string, [&](const auto &strAndOp) {
+        return strAndOp.second == relOp;
+    });
     return it == fl_from_string.cend() ? os : (os << it->first);
 }
 
-RelationalOperator relationalOperatorForName(const std::string &name) {
+RelationalOperator relationalOperatorForName(std::string_view name) {
     auto it = fl_from_string.find(name);
     if (it == fl_from_string.end()) {
-        throw std::runtime_error("invalid operator '" + name + "'");
+        throw std::runtime_error("invalid operator '" + std::string{name} +
+                                 "'");
     }
     return it->second;
 }

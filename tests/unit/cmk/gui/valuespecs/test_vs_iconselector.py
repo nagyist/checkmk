@@ -5,11 +5,9 @@
 
 
 import re
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 import cmk.gui.valuespec as vs
-from cmk.gui.exceptions import MKUserError
 
 from .utils import expect_validate_failure, expect_validate_success
 
@@ -24,23 +22,22 @@ ICON_NONE: vs.IconSelectorModel = {"icon": None, "emblem": None}  # type: ignore
 
 
 class TestValueSpecFloat:
-    def test_validate(self) -> None:
+    @patch(
+        "cmk.gui.valuespec.definitions.IconSelector.available_icons",
+        return_value=["empty", "crash", "graph"],
+    )
+    @patch(
+        "cmk.gui.valuespec.definitions.IconSelector.available_emblems",
+        return_value=["add"],
+    )
+    def test_validate(self, _mock_icons: MagicMock, _mock_emblems: MagicMock) -> None:
         # ## value may be a string, or a dictionary.
         # ## first test string...
         expect_validate_failure(vs.IconSelector(), "asd", match="The selected icon does not exist.")
 
         # TODO: validate_value allows None, ...
         vs.IconSelector().validate_value(None, "")
-        # ... but validate_datatype not:
-        with pytest.raises(
-            MKUserError,
-            match=re.escape("The type is <class 'NoneType'>, but should be str or dict"),
-        ):
-            vs.IconSelector().validate_datatype(None, "")
-
-        # TODO: this seems a bit missleading. we don't allow empty, yet empty is still allowed?
-        # does not raise an error, because None is internally transformed to the "empty" icon
-        vs.IconSelector(allow_empty=False).validate_value(None, "")
+        vs.IconSelector().validate_datatype(None, "")
 
         # ## ...then test dictionary:
         expect_validate_failure(

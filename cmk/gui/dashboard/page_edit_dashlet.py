@@ -3,10 +3,10 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
 from collections.abc import Callable
 
-import cmk.gui.visuals as visuals
-from cmk.gui import forms
+from cmk.gui import forms, visuals
 from cmk.gui.breadcrumb import (
     Breadcrumb,
     BreadcrumbItem,
@@ -23,7 +23,6 @@ from cmk.gui.main_menu import mega_menu_registry
 from cmk.gui.page_menu import make_simple_form_page_menu, PageMenu
 from cmk.gui.pages import Page, PageResult
 from cmk.gui.pagetypes import PagetypeTopics
-from cmk.gui.plugins.visuals.utils import visual_info_registry
 from cmk.gui.type_defs import SingleInfos
 from cmk.gui.utils.transaction_manager import transactions
 from cmk.gui.valuespec import (
@@ -35,9 +34,10 @@ from cmk.gui.valuespec import (
     Transform,
     ValueSpec,
 )
+from cmk.gui.visuals.info import visual_info_registry
 
 from .dashlet import Dashlet, dashlet_registry, DashletConfig, DashletId
-from .store import get_permitted_dashboards, save_all_dashboards
+from .store import get_permitted_dashboards, save_and_replicate_all_dashboards
 from .title_macros import title_help_text_for_macros
 from .type_defs import DashboardConfig
 
@@ -60,7 +60,7 @@ class EditDashletPage(Page):
         except KeyError:
             raise MKUserError("name", _("The requested dashboard does not exist."))
 
-    def page(self) -> PageResult:  # pylint: disable=useless-return,too-many-branches
+    def page(self) -> PageResult:
         if self._ident is None:
             type_name = request.get_str_input_mandatory("type")
             mode = "add"
@@ -124,12 +124,15 @@ class EditDashletPage(Page):
 
         def dashlet_info_handler(dashlet_spec: DashletConfig) -> SingleInfos:
             assert isinstance(self._ident, int)
+            assert user.id is not None
             dashlet_type = dashlet_registry[dashlet_spec["type"]]
-            dashlet = dashlet_type(self._board, self._dashboard, self._ident, dashlet_spec)
+            dashlet = dashlet_type(self._board, user.id, self._dashboard, self._ident, dashlet_spec)
             return dashlet.infos()
 
         context_specs = visuals.get_context_specs(
-            dashlet_spec["single_infos"], dashlet_info_handler(dashlet_spec)
+            dashlet_spec["single_infos"],
+            dashlet_info_handler(dashlet_spec),
+            dashlet_type.ignored_context_choices(),
         )
 
         vs_type: ValueSpec | None = None
@@ -157,9 +160,9 @@ class EditDashletPage(Page):
         if isinstance(vs_type, Dictionary):
             settings_elements = {el[0] for el in vs_general._get_elements()}
             properties_elements = {el[0] for el in vs_type._get_elements()}
-            assert settings_elements.isdisjoint(
-                properties_elements
-            ), "Dashboard element settings and properties have a shared option name"
+            assert settings_elements.isdisjoint(properties_elements), (
+                "Dashboard element settings and properties have a shared option name"
+            )
 
         if request.var("_save") and transactions.transaction_valid():
             try:
@@ -184,7 +187,7 @@ class EditDashletPage(Page):
                     type_properties = vs_type.from_html_vars("type")
                     vs_type.validate_value(type_properties, "type")
                     # We have to trust from_html_vars and validate_value for now
-                    new_dashlet_spec.update(type_properties)  # type: ignore[typeddict-item]
+                    new_dashlet_spec.update(type_properties)
 
                 elif handle_input_func:
                     # The returned dashlet must be equal to the parameter! It is not replaced/re-added
@@ -199,27 +202,26 @@ class EditDashletPage(Page):
                 else:
                     self._dashboard["dashlets"][self._ident] = new_dashlet_spec
 
-                save_all_dashboards()
+                save_and_replicate_all_dashboards()
                 html.footer()
                 raise HTTPRedirect(request.get_url_input("next", request.get_url_input("back")))
 
             except MKUserError as e:
                 html.user_error(e)
 
-        html.begin_form("dashlet", method="POST")
-        vs_general.render_input("general", dict(dashlet_spec))
-        if context_specs:
-            visuals.render_context_specs(dashlet_spec["context"], context_specs)
+        with html.form_context("dashlet", method="POST"):
+            vs_general.render_input("general", dict(dashlet_spec))
+            if context_specs:
+                visuals.render_context_specs(dashlet_spec["context"], context_specs)
 
-        if vs_type:
-            vs_type.render_input("type", dict(dashlet_spec))
-        elif render_input_func:
-            render_input_func(dashlet_spec)
+            if vs_type:
+                vs_type.render_input("type", dict(dashlet_spec))
+            elif render_input_func:
+                render_input_func(dashlet_spec)
 
-        forms.end()
-        html.show_localization_hint()
-        html.hidden_fields()
-        html.end_form()
+            forms.end()
+            html.show_localization_hint()
+            html.hidden_fields()
 
         html.footer()
         return None
@@ -276,7 +278,7 @@ def dashlet_vs_general_settings(
                         (
                             _(
                                 "Most elements have a hard coded static title and some are aware of their "
-                                "content and set the title dynamically, like the view snapin, which "
+                                "content and set the title dynamically, like the view snap-in, which "
                                 "displays the title of the view. If you like to use any other title, set it "
                                 "here."
                             ),

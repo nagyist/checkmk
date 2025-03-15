@@ -1,0 +1,107 @@
+@use "sass:color";
+@charset "UTF-8";
+// Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+// This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+// conditions defined in the file COPYING, which is part of this source code package.
+
+/* Styles used in the logwatch pages */
+
+#logwatch {
+  margin-top: 6px;
+
+  table.section {
+    width: 100%;
+    border-collapse: collapse;
+    background-color: $color-table-background;
+    padding: 3px;
+    margin-bottom: 11px;
+  }
+
+  td.WARN,
+  td.CRIT,
+  td.OK {
+    width: 40px;
+    padding: 2px 5px;
+    margin-left: 5px;
+    font-weight: $font-weight-bold;
+    text-align: center;
+    border-radius: $theme-border-radius;
+  }
+
+  td.WARN {
+    background-color: $warning;
+    color: $font-color-black;
+  }
+
+  td.CRIT {
+    color: $font-color-white;
+    background-color: $color-state-2-background;
+  }
+
+  td.OK {
+    background-color: none;
+    color: $font-color-green;
+  }
+
+  td.date {
+    padding-left: 6px;
+    font-weight: $font-weight-default;
+    font-size: $font-size-small;
+  }
+
+  td.lines {
+    color: $font-color-light-bg;
+    padding: 1.6px 0 4px 12px;
+    margin: 0;
+    text-indent: -8px;
+    border: none;
+
+    img {
+      margin-right: 2px;
+    }
+  }
+
+  tr:nth-child(odd) {
+    &.context {
+      background-color: $odd-tr-bg-color;
+
+      td.lines {
+        color: $font-color;
+      }
+    }
+
+    &.OK {
+      background-color: $color-state-success-background;
+    }
+
+    &.WARN {
+      background-color: $color-state-1-background;
+    }
+
+    &.CRIT {
+      background-color: $color-state-2-background;
+    }
+  }
+
+  tr:nth-child(even) {
+    &.context {
+      background-color: $even-tr-bg-color;
+
+      td.lines {
+        color: $font-color;
+      }
+    }
+
+    &.OK {
+      background-color: color.adjust($color-state-success-background, $lightness: 10%);
+    }
+
+    &.WARN {
+      background-color: color.adjust($color-state-1-background, $lightness: 10%);
+    }
+
+    &.CRIT {
+      background-color: color.adjust($color-state-2-background, $lightness: 10%);
+    }
+  }
+}

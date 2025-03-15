@@ -5,15 +5,16 @@
 
 #include "livestatus/InputBuffer.h"
 
+#include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
-#include <cstring>
+#include <compare>
 #include <ostream>
 #include <string_view>
 #include <utility>
-// IWYU pragma: no_include <type_traits>
 
 #include "livestatus/ChronoUtils.h"
 #include "livestatus/Logger.h"
@@ -72,6 +73,7 @@ InputBuffer::InputBuffer(int fd, std::function<bool()> should_terminate,
     , _logger(logger) {}
 
 // read in data enough for one complete request (and maybe more).
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 InputBuffer::Result InputBuffer::readRequest() {
     // Remember when we started waiting for a request. This is needed for the
     // idle_timeout. A connection may not be idle longer than that value.
@@ -164,8 +166,9 @@ InputBuffer::Result InputBuffer::readRequest() {
                     _read_index;  // distance to beginning of buffer
                 const size_t size =
                     _write_index - _read_index;  // amount of data to shift
-                memmove(_readahead_buffer.data(),
-                        &_readahead_buffer[_read_index], size);
+                std::move(&_readahead_buffer[_read_index],
+                          &_readahead_buffer[_read_index + size],
+                          _readahead_buffer.data());
                 _read_index = 0;  // unread data is now at the beginning
                 _write_index -= shift_by;  // write pointer shifted to the left
                 r -= shift_by;  // current scan position also shift left
@@ -194,16 +197,19 @@ InputBuffer::Result InputBuffer::readRequest() {
 
             }  // non-empty line: belongs to current request
             size_t length = r - _read_index;
-            for (size_t end = r; end > _read_index &&
-                                 (isspace(_readahead_buffer[--end]) != 0);) {
+            for (size_t end = r;
+                 end > _read_index &&
+                 // NOLINTNEXTLINE(bugprone-inc-dec-in-conditions)
+                 (isspace(_readahead_buffer[--end]) != 0);) {
                 length--;
             }
             if (length > 0) {
-                std::string_view s(&_readahead_buffer[_read_index], length);
+                const std::string_view s(&_readahead_buffer[_read_index],
+                                         length);
                 if (!mk::is_utf8(s)) {
                     return Result::invalid_utf8;
                 }
-                _request_lines.emplace_back(s);
+                _request_lines.emplace(s);
 
             } else {
                 Informational(_logger)
@@ -245,10 +251,16 @@ InputBuffer::Result InputBuffer::readData() {
     return Result::should_terminate;
 }
 
-bool InputBuffer::empty() const { return _request_lines.empty(); }
-
 std::string InputBuffer::nextLine() {
     std::string s = _request_lines.front();
-    _request_lines.pop_front();
+    _request_lines.pop();
     return s;
+}
+
+std::vector<std::string> InputBuffer::getLines() {
+    std::vector<std::string> lines;
+    while (!_request_lines.empty()) {
+        lines.push_back(nextLine());
+    }
+    return lines;
 }

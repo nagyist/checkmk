@@ -10,17 +10,15 @@
 
 #include "livestatus/Table.h"
 class ColumnOffsets;
-class MonitoringCore;
-class Query;
-class User;
 
 class TableCommands : public Table {
 public:
-    explicit TableCommands(MonitoringCore *mc);
+    TableCommands();
 
     [[nodiscard]] std::string name() const override;
     [[nodiscard]] std::string namePrefix() const override;
-    void answerQuery(Query &query, const User &user) override;
+    void answerQuery(Query &query, const User &user,
+                     const ICore &core) override;
 
     static void addColumns(Table *table, const std::string &prefix,
                            const ColumnOffsets &offsets);

@@ -14,13 +14,14 @@ from cmk.gui.htmllib.html import html
 from cmk.gui.http import request, response
 from cmk.gui.i18n import _, _u, localize
 from cmk.gui.logged_in import user
-from cmk.gui.pages import page_registry
-from cmk.gui.plugins.userdb.utils import get_user_attributes_by_topic, UserAttribute
+from cmk.gui.pages import PageRegistry
 from cmk.gui.type_defs import UserSpec
+from cmk.gui.userdb import get_user_attributes, get_user_attributes_by_topic, UserAttribute
 from cmk.gui.utils.flashed_messages import flash
 from cmk.gui.utils.language_cookie import set_language_cookie
 from cmk.gui.valuespec import ValueSpec
 from cmk.gui.wato.pages.users import select_language
+from cmk.gui.watolib.users import get_enabled_remote_sites_for_logged_in_user
 
 from .abstract_page import ABCUserProfilePage
 
@@ -31,7 +32,10 @@ def _get_input(valuespec: ValueSpec, varprefix: str) -> Any:
     return value
 
 
-@page_registry.register_page("user_profile")
+def register(page_registry: PageRegistry) -> None:
+    page_registry.register_page("user_profile")(UserProfile)
+
+
 class UserProfile(ABCUserProfilePage):
     def _page_title(self) -> str:
         return _("Edit profile")
@@ -62,7 +66,7 @@ class UserProfile(ABCUserProfilePage):
 
         # Custom attributes
         if user.may("general.edit_user_attributes"):
-            for name, attr in userdb.get_user_attributes():
+            for name, attr in get_user_attributes():
                 if not attr.user_editable():
                     continue
 
@@ -82,7 +86,7 @@ class UserProfile(ABCUserProfilePage):
         # In distributed setups with remote sites where the user can login, start the
         # user profile replication now which will redirect the user to the destination
         # page after completion. Otherwise directly open up the destination page.
-        if user.authorized_login_sites():
+        if get_enabled_remote_sites_for_logged_in_user(user):
             back_url = "user_profile_replicate.py?back=user_profile.py"
         else:
             back_url = "user_profile.py"
@@ -104,29 +108,28 @@ class UserProfile(ABCUserProfilePage):
             html.footer()
             return
 
-        html.begin_form("profile", method="POST")
-        html.prevent_password_auto_completion()
-        html.open_div(class_="wato")
-        forms.header(_("Personal settings"))
+        with html.form_context("profile", method="POST"):
+            html.prevent_password_auto_completion()
+            html.open_div(class_="wato")
+            forms.header(_("Personal settings"))
 
-        forms.section(_("Username"), simple=True)
-        html.write_text(user_spec.get("user_id", user.id))
+            forms.section(_("Username"), simple=True)
+            html.write_text_permissive(user_spec.get("user_id", user.id))
 
-        forms.section(_("Full name"), simple=True)
-        html.write_text(user_spec.get("alias", ""))
+            forms.section(_("Full name"), simple=True)
+            html.write_text_permissive(user_spec.get("alias", ""))
 
-        select_language(user_spec)
+            select_language(user_spec)
 
-        if user.may("general.edit_user_attributes"):
-            custom_user_attr_topics = get_user_attributes_by_topic()
-            _show_custom_user_attr(user_spec, custom_user_attr_topics.get("personal", []))
-            forms.header(_("User interface settings"))
-            _show_custom_user_attr(user_spec, custom_user_attr_topics.get("interface", []))
+            if user.may("general.edit_user_attributes"):
+                custom_user_attr_topics = get_user_attributes_by_topic()
+                _show_custom_user_attr(user_spec, custom_user_attr_topics.get("personal", []))
+                forms.header(_("User interface settings"))
+                _show_custom_user_attr(user_spec, custom_user_attr_topics.get("interface", []))
 
-        forms.end()
-        html.close_div()
-        html.hidden_fields()
-        html.end_form()
+            forms.end()
+            html.close_div()
+            html.hidden_fields()
         html.footer()
 
 
@@ -148,4 +151,4 @@ def _show_custom_user_attr(
                     h = _u(h)
                 html.help(h)
             else:
-                html.write_text(vs.value_to_html(value))
+                html.write_text_permissive(vs.value_to_html(value))

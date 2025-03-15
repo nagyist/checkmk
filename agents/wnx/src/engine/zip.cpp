@@ -6,7 +6,7 @@
 
 #include "stdafx.h"
 
-#include "zip.h"
+#include "wnx/zip.h"
 
 #include <fmt/format.h>
 #include <fmt/xchar.h>
@@ -18,15 +18,20 @@
 
 #include "common/cfg_info.h"
 #include "common/wtools.h"
-#include "logger.h"
 #include "tools/_process.h"
+#include "wnx/logger.h"
 namespace fs = std::filesystem;
+
+template <typename R>
+concept HasRelease = requires(R *r) {
+    { r->Release() };
+};
 
 namespace cma::tools::zip {
 // usually this pointer comes from Windows API
-template <typename T>
+template <HasRelease R>
 struct ResourceReleaser {
-    void operator()(T *r) noexcept {
+    void operator()(R *r) noexcept {
         if (r) r->Release();
     }
 };
@@ -36,7 +41,7 @@ struct ResourceReleaser {
 ReleasedResource<FolderItems> fi(::WindowsApiToGetFi());
 #endif
 //
-template <typename T>
+template <HasRelease T>
 using ReleasedResource = std::unique_ptr<T, ResourceReleaser<T>>;
 
 static void InitVariant(VARIANT &var, BSTR bstr) {

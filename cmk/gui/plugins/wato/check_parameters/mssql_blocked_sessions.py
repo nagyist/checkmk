@@ -436,20 +436,18 @@ def _parameter_valuespec_mssql_blocked_sessions():
                 Tuple(
                     title=_("Levels for wait"),
                     help=_(
-                        "The threshholds for wait_duration_ms. Will "
+                        "The thresholds for wait_duration_ms. Will "
                         "overwrite the default state set above."
                     ),
                     elements=[
                         Float(
                             title=_("Warning at"),
                             unit=_("seconds"),
-                            display_format="%.3f",
                             default_value=0,
                         ),
                         Float(
                             title=_("Critical at"),
                             unit=_("seconds"),
-                            display_format="%.3f",
                             default_value=0,
                         ),
                     ],

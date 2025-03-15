@@ -17,7 +17,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <ratio>
+#include <compare>
 #include <thread>
 
 #include "livestatus/Logger.h"
@@ -79,6 +79,7 @@ std::optional<SocketPair> SocketPair::make(Mode mode, Direction direction,
         case Mode::blocking:
             break;
         case Mode::local_non_blocking:
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
             if (::fcntl(sp.local(), F_SETFL, O_NONBLOCK) == -1) {
                 return fail("cannot make socket non-blocking", logger, sp);
             }
@@ -140,6 +141,7 @@ void setThreadName(std::string name) {
 std::string getThreadName() { return thread_name; }
 
 file_lock::file_lock(const std::filesystem::path &name)
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
     : fd_{::open(name.c_str(), O_RDWR)} {
     if (fd_ == -1) {
         throw generic_error("could not open lock file");
@@ -155,10 +157,14 @@ file_lock::~file_lock() {
 
 bool file_lock::fcntl_impl(short l_type, int cmd, const char *msg,
                            bool accecpt_timeout) const {
-    struct ::flock fl {
-        .l_type = l_type, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0,
+    struct ::flock fl{
+        .l_type = l_type,
+        .l_whence = SEEK_SET,
+        .l_start = 0,
+        .l_len = 0,
         .l_pid = 0,
     };
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
     if (::fcntl(fd_, cmd, &fl) != -1) {
         return true;
     }
@@ -176,7 +182,7 @@ bool file_lock::try_lock_until_impl(const steady_clock::time_point &time,
         fcntl_impl(l_type, F_SETLKW, msg);
         return true;
     }
-    do {
+    while (true) {
         if (fcntl_impl(l_type, F_SETLK, msg, true)) {
             return true;
         }
@@ -184,7 +190,7 @@ bool file_lock::try_lock_until_impl(const steady_clock::time_point &time,
             return false;
         }
         std::this_thread::sleep_for(10ms);
-    } while (true);
+    }
 }
 
 ssize_t writeWithTimeoutWhile(int fd, std::string_view buffer,
@@ -204,6 +210,7 @@ ssize_t writeWithTimeoutWhile(int fd, std::string_view buffer,
             return -1;
         }
     }
+    // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
     return size;
 }
 

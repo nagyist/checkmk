@@ -7,10 +7,10 @@ from collections.abc import Sequence
 
 import pytest
 
-from tests.testlib import Check
+from cmk.agent_based.v1.type_defs import StringTable
+from cmk.agent_based.v2 import IgnoreResultsError
 
-from cmk.base.api.agent_based.type_defs import StringTable
-from cmk.base.check_api import MKCounterWrapped
+from .checktestlib import Check
 
 pytestmark = pytest.mark.checks
 
@@ -30,7 +30,7 @@ _broken_info = [
 )
 def test_oracle_jobs_discovery_error(info: StringTable) -> None:
     check = Check("oracle_jobs")
-    assert list(check.run_discovery(info)) == []
+    assert not list(check.run_discovery(info))
 
 
 @pytest.mark.parametrize(
@@ -41,7 +41,7 @@ def test_oracle_jobs_discovery_error(info: StringTable) -> None:
 )
 def test_oracle_jobs_check_error(info: StringTable) -> None:
     check = Check("oracle_jobs")
-    with pytest.raises(MKCounterWrapped):
+    with pytest.raises(IgnoreResultsError):
         check.run_check("DB19.SYS.JOB1", {}, info)
 
 

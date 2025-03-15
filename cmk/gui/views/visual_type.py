@@ -3,27 +3,35 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 
 from livestatus import SiteId
 
-from cmk.utils.structured_data import DeltaStructuredDataNode, SDPath, StructuredDataNode
-from cmk.utils.type_defs import HostName
+from cmk.utils.hostaddress import HostName
+from cmk.utils.structured_data import ImmutableDeltaTree, ImmutableTree, SDPath
 
+from cmk.gui.config import active_config
 from cmk.gui.ctx_stack import g
 from cmk.gui.exceptions import MKUserError
+from cmk.gui.htmllib.html import html
 from cmk.gui.i18n import _
 from cmk.gui.inventory import (
     get_status_data_via_livestatus,
     load_filtered_and_merged_tree,
     load_latest_delta_tree,
-    LoadStructuredDataError,
 )
 from cmk.gui.page_menu import PageMenuEntry
-from cmk.gui.plugins.visuals.utils import VisualType
-from cmk.gui.type_defs import HTTPVariables, PermittedViewSpecs, VisualContext
+from cmk.gui.type_defs import (
+    HTTPVariables,
+    PermittedViewSpecs,
+    Rows,
+    SingleInfos,
+    Visual,
+    VisualContext,
+)
 from cmk.gui.valuespec import Hostname
 from cmk.gui.views.store import get_permitted_views
+from cmk.gui.visuals.type import VisualType
 
 
 class VisualTypeViews(VisualType):
@@ -72,13 +80,19 @@ class VisualTypeViews(VisualType):
     def permitted_visuals(self) -> PermittedViewSpecs:
         return get_permitted_views()
 
-    def link_from(  # type: ignore[no-untyped-def]
-        self, linking_view, linking_view_rows, visual, context_vars: HTTPVariables
+    def link_from(
+        self,
+        linking_view_single_infos: SingleInfos,
+        linking_view_rows: Rows,
+        visual: Visual,
+        context_vars: HTTPVariables,
     ) -> bool:
-        """This has been implemented for HW/SW inventory views which are often useless when a host
+        """This has been implemented for HW/SW Inventory views which are often useless when a host
         has no such information available. For example the "Oracle Tablespaces" inventory view is
         useless on hosts that don't host Oracle databases."""
-        result = super().link_from(linking_view, linking_view_rows, visual, context_vars)
+        result = super().link_from(
+            linking_view_single_infos, linking_view_rows, visual, context_vars
+        )
         if result is False:
             return False
 
@@ -99,7 +113,7 @@ class VisualTypeViews(VisualType):
 
         # TODO: host is not correctly validated by visuals. Do it here for the moment.
         try:
-            Hostname().validate_value(hostname, None)
+            Hostname().validate_value(hostname, "")
         except MKUserError:
             return False
 
@@ -110,12 +124,12 @@ class VisualTypeViews(VisualType):
         return _has_inventory_tree(
             hostname,
             SiteId(str(site_id)),
-            link_from.get("has_inventory_tree", []),
+            link_from.get("has_inventory_tree"),
             is_history=False,
         ) or _has_inventory_tree(
             hostname,
             SiteId(str(site_id)),
-            link_from.get("has_inventory_tree_history", []),
+            link_from.get("has_inventory_tree_history"),
             is_history=True,
         )
 
@@ -123,44 +137,37 @@ class VisualTypeViews(VisualType):
 def _has_inventory_tree(
     hostname: HostName,
     site_id: SiteId,
-    paths: Sequence[SDPath],
+    path: SDPath | None,
     is_history: bool,
 ) -> bool:
-    if not paths:
+    if path is None:
         return False
 
     # FIXME In order to decide whether this view is enabled
     # do we really need to load the whole tree?
     try:
-        struct_tree = _get_struct_tree(is_history, hostname, site_id)
-    except LoadStructuredDataError:
+        inventory_tree = _get_inventory_tree(is_history, hostname, site_id)
+    except Exception as e:
+        if active_config.debug:
+            html.show_warning("%s" % e)
         return False
 
-    if not struct_tree:
-        return False
-
-    if struct_tree.is_empty():
-        return False
-
-    return any(
-        (node := struct_tree.get_node(path)) is not None and not node.is_empty() for path in paths
-    )
+    return bool(inventory_tree.get_tree(path))
 
 
-def _get_struct_tree(
+def _get_inventory_tree(
     is_history: bool, hostname: HostName, site_id: SiteId
-) -> StructuredDataNode | DeltaStructuredDataNode | None:
-    struct_tree_cache = g.setdefault("struct_tree_cache", {})
+) -> ImmutableTree | ImmutableDeltaTree:
+    tree_cache = g.setdefault("inventory_tree_cache", {})
+
     cache_id = (is_history, hostname, site_id)
-    if cache_id in struct_tree_cache:
-        return struct_tree_cache[cache_id]
+    if cache_id in tree_cache:
+        return tree_cache[cache_id]
 
-    struct_tree: StructuredDataNode | DeltaStructuredDataNode | None
-    if is_history:
-        struct_tree = load_latest_delta_tree(hostname)
-    else:
-        row = get_status_data_via_livestatus(site_id, hostname)
-        struct_tree = load_filtered_and_merged_tree(row)
-
-    struct_tree_cache[cache_id] = struct_tree
-    return struct_tree
+    tree: ImmutableTree | ImmutableDeltaTree = (
+        load_latest_delta_tree(hostname)
+        if is_history
+        else load_filtered_and_merged_tree(get_status_data_via_livestatus(site_id, hostname))
+    )
+    tree_cache[cache_id] = tree
+    return tree

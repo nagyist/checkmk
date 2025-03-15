@@ -13,67 +13,111 @@ import gzip
 import io
 import pprint
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, TypedDict
+from typing import Generic, Literal, NewType, Self, TypedDict, TypeVar
 
-from cmk.utils import store
-from cmk.utils.type_defs import HostName
+from cmk.ccc import store
+
+from cmk.utils.hostaddress import HostName
 
 # TODO Cleanup path in utils, base, gui, find ONE place (type defs or similar)
-# TODO
-# - is_empty -> __bool__
-# - is_equal -> __eq__/__ne__
-# - merge_with -> __add__
-# - count_entries -> __len__?
-# TODO Improve/clarify adding Attributes/Table while deserialization/filtering/merging/...
+# TODO filter table rows?
+# TODO Check filter logic:
+#   - choices = ["all", "nothing", ["k1", ...]]
+#   - How to handle?
+# TODO Improve _make_filter_func:
+# For contact groups (via make_filter)
+#   - ('choices', ['some', 'keys'])
+#   - 'nothing' -> _use_nothing
+#   - None -> _use_all
+# For retention intervals (directly)
+#   - ('choices', ['some', 'keys'])
+#   - MISSING (see mk/base/agent_based/inventory.py::_get_intervals_from_config) -> _use_nothing
+#   - 'all' -> _use_all
+# TODO Centralize different stores and loaders of tree files:
+#   - inventory/HOSTNAME, inventory/HOSTNAME.gz, inventory/.last
+#   - inventory_archive/HOSTNAME/TIMESTAMP,
+#   - inventory_delta_cache/HOSTNAME/TIMESTAMP_{TIMESTAMP,None}
+#   - status_data/HOSTNAME, status_data/HOSTNAME.gz
 
-# TODO improve this
-SDRawTree = dict
-SDRawDeltaTree = dict
-
-SDNodeName = str
+SDNodeName = NewType("SDNodeName", str)
 SDPath = tuple[SDNodeName, ...]
 
-SDKey = str
-SDKeys = list[SDKey]
-# TODO be more specific (None, str, float, int, DeltaValue:Tuple of previous)
-SDValue = Any  # needs only to support __eq__
-
-SDPairs = dict[SDKey, SDValue]
-# TODO merge with cmk.base.api.agent_based.inventory_classes.py::AttrDict
-SDPairsFromPlugins = Mapping[SDKey, SDValue]
-LegacyPairs = dict[SDKey, SDValue]
-
-# TODO SDRows and LegacyRows are the same for now, but SDRows will change in the future
-# adapt werk 12389 if inner table structure changes from list[SDRow] to dict[SDRowIdent, SDRow]
-SDKeyColumns = list[SDKey]
+SDKey = NewType("SDKey", str)
+SDValue = int | float | str | bool | None
 SDRowIdent = tuple[SDValue, ...]
-SDRow = dict[SDKey, SDValue]
-SDRows = dict[SDRowIdent, SDRow]
-LegacyRows = list[SDRow]
-
-# Used for de/serialization and retentions
-ATTRIBUTES_KEY = "Attributes"
-TABLE_KEY = "Table"
-
-_PAIRS_KEY = "Pairs"
-_KEY_COLUMNS_KEY = "KeyColumns"
-_ROWS_KEY = "Rows"
-_NODES_KEY = "Nodes"
-_RETENTIONS_KEY = "Retentions"
-
-SDEncodeAs = Callable[[SDValue], tuple[SDValue | None, SDValue | None]]
-SDDeltaCounter = Counter[Literal["new", "changed", "removed"]]
-SDFilterFunc = Callable[[SDKey], bool]
 
 
-class SDFilter(NamedTuple):
-    path: SDPath
-    filter_nodes: SDFilterFunc
-    filter_attributes: SDFilterFunc
-    filter_columns: SDFilterFunc
+class SDRawAttributes(TypedDict, total=False):
+    Pairs: Mapping[SDKey, SDValue]
+    Retentions: Mapping[SDKey, tuple[int, int, int, Literal["previous", "current"]]]
+
+
+class SDBareAttributes(TypedDict):
+    Pairs: Mapping[SDKey, SDValue]
+    Retentions: Mapping[SDKey, tuple[int, int, int, Literal["previous", "current"]]]
+
+
+class SDRawTable(TypedDict, total=False):
+    KeyColumns: Sequence[SDKey]
+    Rows: Sequence[Mapping[SDKey, SDValue]]
+    Retentions: Mapping[
+        SDRowIdent, Mapping[SDKey, tuple[int, int, int, Literal["previous", "current"]]]
+    ]
+
+
+class SDBareTable(TypedDict):
+    KeyColumns: Sequence[SDKey]
+    RowsByIdent: Mapping[SDRowIdent, Mapping[SDKey, SDValue]]
+    Retentions: Mapping[
+        SDRowIdent, Mapping[SDKey, tuple[int, int, int, Literal["previous", "current"]]]
+    ]
+
+
+class SDRawTree(TypedDict):
+    Attributes: SDRawAttributes
+    Table: SDRawTable
+    Nodes: Mapping[SDNodeName, SDRawTree]
+
+
+class SDBareTree(TypedDict):
+    Path: SDPath
+    Attributes: SDBareAttributes
+    Table: SDBareTable
+    Nodes: Mapping[SDNodeName, SDBareTree]
+
+
+class SDRawDeltaAttributes(TypedDict, total=False):
+    Pairs: Mapping[SDKey, tuple[SDValue, SDValue]]
+
+
+class SDBareDeltaAttributes(TypedDict):
+    Pairs: Mapping[SDKey, tuple[SDValue, SDValue]]
+
+
+class SDRawDeltaTable(TypedDict, total=False):
+    KeyColumns: Sequence[SDKey]
+    Rows: Sequence[Mapping[SDKey, tuple[SDValue, SDValue]]]
+
+
+class SDBareDeltaTable(TypedDict, total=False):
+    KeyColumns: Sequence[SDKey]
+    Rows: Sequence[Mapping[SDKey, tuple[SDValue, SDValue]]]
+
+
+class SDRawDeltaTree(TypedDict):
+    Attributes: SDRawDeltaAttributes
+    Table: SDRawDeltaTable
+    Nodes: Mapping[SDNodeName, SDRawDeltaTree]
+
+
+class SDBareDeltaTree(TypedDict):
+    Path: SDPath
+    Attributes: SDBareDeltaAttributes
+    Table: SDBareDeltaTable
+    Nodes: Mapping[SDNodeName, SDBareDeltaTree]
 
 
 class _RawIntervalFromConfigMandatory(TypedDict):
@@ -81,37 +125,33 @@ class _RawIntervalFromConfigMandatory(TypedDict):
     visible_raw_path: str
 
 
-class _RawIntervalFromConfig(_RawIntervalFromConfigMandatory, total=False):
+class RawIntervalFromConfig(_RawIntervalFromConfigMandatory, total=False):
     attributes: Literal["all"] | tuple[str, list[str]]
     columns: Literal["all"] | tuple[str, list[str]]
 
 
-RawIntervalsFromConfig = Sequence[_RawIntervalFromConfig]
-
-
-class RetentionIntervals(NamedTuple):
+@dataclass(frozen=True)
+class RetentionInterval:
     cached_at: int
     cache_interval: int
     retention_interval: int
+    source: Literal["previous", "current"]
 
-    @property
-    def valid_until(self) -> int:
-        return self.cached_at + self.cache_interval
+    @classmethod
+    def from_previous(cls, previous: RetentionInterval) -> RetentionInterval:
+        return cls(
+            previous.cached_at, previous.cache_interval, previous.retention_interval, "previous"
+        )
+
+    @classmethod
+    def from_config(
+        cls, cached_at: int, cache_interval: int, retention_interval: int
+    ) -> RetentionInterval:
+        return cls(cached_at, cache_interval, retention_interval, "current")
 
     @property
     def keep_until(self) -> int:
         return self.cached_at + self.cache_interval + self.retention_interval
-
-    def serialize(self) -> tuple[int, int, int]:
-        return self.cached_at, self.cache_interval, self.retention_interval
-
-    @classmethod
-    def deserialize(cls, raw_intervals: tuple[int, int, int]) -> RetentionIntervals:
-        return cls(*raw_intervals)
-
-
-RawRetentionIntervalsByKeys = dict[SDKey, tuple[int, int, int]]
-RetentionIntervalsByKeys = dict[SDKey, RetentionIntervals]
 
 
 @dataclass(frozen=True)
@@ -122,37 +162,1480 @@ class UpdateResult:
     def save_tree(self) -> bool:
         return bool(self.reasons_by_path)
 
-    @classmethod
-    def from_results(cls, results: Iterable[UpdateResult]) -> UpdateResult:
-        update_result = cls()
-        for result in results:
-            for path, reasons in result.reasons_by_path.items():
-                update_result.reasons_by_path.setdefault(path, []).extend(reasons)
-        return update_result
-
-    def add_attr_reason(self, path: SDPath, name: str, iterable: Iterable[str]) -> None:
+    def add_attr_reason(self, path: SDPath, title: str, iterable: Iterable[str]) -> None:
         self.reasons_by_path.setdefault(path, []).append(
-            f"[Attributes] Added {name}: {', '.join(iterable)}"
+            f"[Attributes] {title}: {', '.join(sorted(iterable))}"
         )
 
     def add_row_reason(
-        self, path: SDPath, ident: SDRowIdent, name: str, iterable: Iterable[str]
+        self, path: SDPath, ident: SDRowIdent, title: str, iterable: Iterable[str]
     ) -> None:
         self.reasons_by_path.setdefault(path, []).append(
-            f"[Table] '{', '.join(ident)}': Added {name}: {', '.join(iterable)}"
+            f"[Table] '{', '.join(map(str, ident))}': {title}: {', '.join(sorted(iterable))}"
         )
 
-    def __repr__(self) -> str:
+    def __str__(self) -> str:
         if not self.reasons_by_path:
             return "No tree update.\n"
 
         lines = ["Updated inventory tree:"]
         for path, reasons in self.reasons_by_path.items():
             lines.append(f"  Path '{' > '.join(path)}':")
-            lines.extend(f"    {r}" for r in reasons)
+            lines.extend(f"    {r}" for r in sorted(reasons))
         return "\n".join(lines) + "\n"
 
 
+def parse_visible_raw_path(raw_path: str) -> SDPath:
+    return tuple(SDNodeName(part) for part in raw_path.split(".") if part)
+
+
+#   .--helpers-------------------------------------------------------------.
+#   |                  _          _                                        |
+#   |                 | |__   ___| |_ __   ___ _ __ ___                    |
+#   |                 | '_ \ / _ \ | '_ \ / _ \ '__/ __|                   |
+#   |                 | | | |  __/ | |_) |  __/ |  \__ \                   |
+#   |                 |_| |_|\___|_| .__/ \___|_|  |___/                   |
+#   |                              |_|                                     |
+#   '----------------------------------------------------------------------'
+
+
+def _make_row_ident(key_columns: Sequence[SDKey], row: Mapping[SDKey, SDValue]) -> SDRowIdent:
+    return tuple(row[k] for k in key_columns if k in row)
+
+
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True, kw_only=True)
+class _DictKeys(Generic[_T]):
+    only_left: set[_T]
+    both: set[_T]
+    only_right: set[_T]
+
+    @classmethod
+    def compare(cls, *, left: set[_T], right: set[_T]) -> Self:
+        """
+        Returns the set relationships of the keys between two dictionaries:
+        - relative complement of right in left
+        - intersection of both
+        - relative complement of left in right
+        """
+        return cls(
+            only_left=left - right,
+            both=left.intersection(right),
+            only_right=right - left,
+        )
+
+
+# .
+#   .--filters-------------------------------------------------------------.
+#   |                       __ _ _ _                                       |
+#   |                      / _(_) | |_ ___ _ __ ___                        |
+#   |                     | |_| | | __/ _ \ '__/ __|                       |
+#   |                     |  _| | | ||  __/ |  \__ \                       |
+#   |                     |_| |_|_|\__\___|_|  |___/                       |
+#   |                                                                      |
+#   '----------------------------------------------------------------------'
+
+
+@dataclass(frozen=True)
+class SDFilterChoice:
+    path: SDPath
+    pairs: Literal["nothing", "all"] | Sequence[SDKey]
+    columns: Literal["nothing", "all"] | Sequence[SDKey]
+    nodes: Literal["nothing", "all"] | Sequence[SDNodeName]
+
+
+@dataclass(frozen=True)
+class _SDRetentionFilterChoice:
+    choice: Literal["nothing", "all"] | Sequence[SDKey]
+    cache_info: tuple[int, int]
+
+
+@dataclass(frozen=True, kw_only=True)
+class SDRetentionFilterChoices:
+    path: SDPath
+    interval: int
+    _pairs: list[_SDRetentionFilterChoice] = field(default_factory=list)
+    _columns: list[_SDRetentionFilterChoice] = field(default_factory=list)
+
+    @property
+    def pairs(self) -> Sequence[_SDRetentionFilterChoice]:
+        return self._pairs
+
+    @property
+    def columns(self) -> Sequence[_SDRetentionFilterChoice]:
+        return self._columns
+
+    def add_pairs_choice(
+        self, choice: Literal["nothing", "all"] | Sequence[SDKey], cache_info: tuple[int, int]
+    ) -> None:
+        self._pairs.append(_SDRetentionFilterChoice(choice, cache_info))
+
+    def add_columns_choice(
+        self, choice: Literal["nothing", "all"] | Sequence[SDKey], cache_info: tuple[int, int]
+    ) -> None:
+        self._columns.append(_SDRetentionFilterChoice(choice, cache_info))
+
+
+_CT = TypeVar("_CT", SDKey, SDNodeName)
+
+
+def _make_filter_func(choice: Literal["nothing", "all"] | Sequence[_CT]) -> Callable[[_CT], bool]:
+    match choice:
+        case "nothing":
+            return lambda k: False
+        case "all":
+            return lambda k: True
+        case _:
+            return lambda k: k in choice
+
+
+def _consolidate_filter_funcs(
+    choices: Sequence[Literal["nothing", "all"] | Sequence[_CT]],
+) -> Callable[[_CT], bool]:
+    return lambda kn: any(_make_filter_func(c)(kn) for c in choices)
+
+
+_VT_co = TypeVar("_VT_co", covariant=True)
+
+
+def _get_filtered_dict(
+    mapping: Mapping[SDKey, _VT_co], filter_func: Callable[[SDKey], bool]
+) -> Mapping[SDKey, _VT_co]:
+    return {k: v for k, v in mapping.items() if filter_func(k)}
+
+
+@dataclass(frozen=True, kw_only=True)
+class _FilterTree:
+    _filter_choices_by_name: dict[SDNodeName, _FilterTree] = field(default_factory=dict)
+    _filter_choices_pairs: list[Literal["nothing", "all"] | Sequence[SDKey]] = field(
+        default_factory=list
+    )
+    _filter_choices_columns: list[Literal["nothing", "all"] | Sequence[SDKey]] = field(
+        default_factory=list
+    )
+    _filter_choices_nodes: list[Literal["nothing", "all"] | Sequence[SDNodeName]] = field(
+        default_factory=list
+    )
+
+    @property
+    def filters_by_name(self) -> Mapping[SDNodeName, _FilterTree]:
+        return self._filter_choices_by_name
+
+    def filter_pairs(self, pairs: Mapping[SDKey, _VT_co]) -> Mapping[SDKey, _VT_co]:
+        return (
+            _get_filtered_dict(pairs, _consolidate_filter_funcs(self._filter_choices_pairs))
+            if self._filter_choices_pairs
+            else pairs
+        )
+
+    def filter_row(self, row: Mapping[SDKey, _VT_co]) -> Mapping[SDKey, _VT_co]:
+        return (
+            _get_filtered_dict(row, _consolidate_filter_funcs(self._filter_choices_columns))
+            if self._filter_choices_columns
+            else row
+        )
+
+    def filter_node_names(self, node_names: set[SDNodeName]) -> set[SDNodeName]:
+        filter_nodes = _consolidate_filter_funcs(self._filter_choices_nodes)
+        return {n for n in node_names if filter_nodes(n)}.union(self.filters_by_name)
+
+    def append(self, path: SDPath, filter_choice: SDFilterChoice) -> None:
+        if path:
+            self._filter_choices_by_name.setdefault(path[0], _FilterTree()).append(
+                path[1:], filter_choice
+            )
+            return
+        self._filter_choices_pairs.append(filter_choice.pairs)
+        self._filter_choices_columns.append(filter_choice.columns)
+        self._filter_choices_nodes.append(filter_choice.nodes)
+
+
+def _make_filter_tree(filters: Iterable[SDFilterChoice]) -> _FilterTree:
+    filter_tree = _FilterTree()
+    for f in filters:
+        filter_tree.append(f.path, f)
+    return filter_tree
+
+
+def _make_retentions_filter_func(
+    *,
+    filter_func: Callable[[SDKey], bool],
+    intervals_by_key: Mapping[SDKey, RetentionInterval] | None,
+    now: int,
+) -> Callable[[SDKey], bool]:
+    return lambda k: bool(
+        filter_func(k)
+        and intervals_by_key
+        and (interval := intervals_by_key.get(k))
+        and now <= interval.keep_until
+    )
+
+
+# .
+#   .--serialization-------------------------------------------------------.
+#   |                      _       _ _          _   _                      |
+#   |        ___  ___ _ __(_) __ _| (_)______ _| |_(_) ___  _ __           |
+#   |       / __|/ _ \ '__| |/ _` | | |_  / _` | __| |/ _ \| '_ \          |
+#   |       \__ \  __/ |  | | (_| | | |/ / (_| | |_| | (_) | | | |         |
+#   |       |___/\___|_|  |_|\__,_|_|_/___\__,_|\__|_|\___/|_| |_|         |
+#   |                                                                      |
+#   '----------------------------------------------------------------------'
+
+
+def _serialize_retention_interval(
+    retention_interval: RetentionInterval,
+) -> tuple[int, int, int, Literal["previous", "current"]]:
+    return (
+        retention_interval.cached_at,
+        retention_interval.cache_interval,
+        retention_interval.retention_interval,
+        retention_interval.source,
+    )
+
+
+def _serialize_attributes(attributes: _MutableAttributes | ImmutableAttributes) -> SDRawAttributes:
+    raw_attributes: SDRawAttributes = {}
+    if attributes.pairs:
+        raw_attributes["Pairs"] = attributes.pairs
+    if attributes.retentions:
+        raw_attributes["Retentions"] = {
+            k: _serialize_retention_interval(v) for k, v in attributes.retentions.items()
+        }
+    return raw_attributes
+
+
+def _serialize_table(table: _MutableTable | ImmutableTable) -> SDRawTable:
+    raw_table: SDRawTable = {}
+    if table.rows_by_ident:
+        raw_table.update(
+            {
+                "KeyColumns": table.key_columns,
+                "Rows": list(table.rows_by_ident.values()),
+            }
+        )
+    if table.retentions:
+        raw_table["Retentions"] = {
+            i: {k: _serialize_retention_interval(v) for k, v in ri.items()}
+            for i, ri in table.retentions.items()
+        }
+    return raw_table
+
+
+def serialize_tree(tree: MutableTree | ImmutableTree) -> SDRawTree:
+    return {
+        "Attributes": _serialize_attributes(tree.attributes),
+        "Table": _serialize_table(tree.table),
+        "Nodes": {name: serialize_tree(node) for name, node in tree.nodes_by_name.items() if node},
+    }
+
+
+def _deserialize_legacy_attributes(raw_pairs: Mapping[SDKey, SDValue]) -> ImmutableAttributes:
+    return ImmutableAttributes(pairs=raw_pairs)
+
+
+def _deserialize_legacy_table(raw_rows: Sequence[Mapping[SDKey, SDValue]]) -> ImmutableTable:
+    key_columns = sorted({k for r in raw_rows for k in r})
+    rows_by_ident: dict[SDRowIdent, dict[SDKey, SDValue]] = {}
+    for row in raw_rows:
+        rows_by_ident.setdefault(_make_row_ident(key_columns, row), {}).update(row)
+
+    return ImmutableTable(key_columns=key_columns, rows_by_ident=rows_by_ident)
+
+
+def _deserialize_legacy_tree(
+    path: SDPath,
+    raw_tree: Mapping[str, object],
+    raw_rows: Sequence[Mapping] | None = None,
+) -> ImmutableTree:
+    raw_pairs: dict[SDKey, SDValue] = {}
+    raw_tables: dict[SDNodeName, list[dict]] = {}
+    raw_nodes: dict[SDNodeName, dict] = {}
+
+    for key, value in raw_tree.items():
+        if isinstance(value, dict):
+            if not value:
+                continue
+            raw_nodes.setdefault(SDNodeName(key), value)
+
+        elif isinstance(value, list):
+            if not value:
+                continue
+
+            if all(isinstance(v, (int, float, str, bool)) or v is None for v in value):
+                if w := ", ".join(str(v) for v in value if v):
+                    raw_pairs.setdefault(SDKey(key), w)
+                continue
+
+            if all(not isinstance(v, (list, dict)) for row in value for v in row.values()):
+                # Either we get:
+                #   [
+                #       {"column1": "value 11", "column2": "value 12",...},
+                #       {"column1": "value 11", "column2": "value 12",...},
+                #       ...
+                #   ]
+                # Or:
+                #   [
+                #       {"attr": "attr1", "table": [...], "node": {...}, "idx-node": [...]},
+                #       ...
+                #   ]
+                raw_tables.setdefault(SDNodeName(key), value)
+                continue
+
+            for idx, entry in enumerate(value):
+                raw_nodes.setdefault(SDNodeName(key), {}).setdefault(str(idx), entry)
+
+        elif isinstance(value, (int, float, str, bool)) or value is None:
+            raw_pairs.setdefault(SDKey(key), value)
+
+        else:
+            raise TypeError(value)
+
+    return ImmutableTree(
+        path=path,
+        attributes=_deserialize_legacy_attributes(raw_pairs),
+        table=_deserialize_legacy_table(raw_rows) if raw_rows else ImmutableTable(),
+        nodes_by_name={
+            **{
+                name: _deserialize_legacy_tree(
+                    path + (name,),
+                    raw_node,
+                    raw_tables.get(name),
+                )
+                for name, raw_node in raw_nodes.items()
+            },
+            **{
+                name: ImmutableTree(
+                    path=path + (name,),
+                    table=_deserialize_legacy_table(raw_rows),
+                )
+                for name in set(raw_tables) - set(raw_nodes)
+                if (raw_rows := raw_tables[name])
+            },
+        },
+    )
+
+
+def _deserialize_retention_interval(
+    raw_retention_interval: tuple[int, int, int]
+    | tuple[int, int, int, Literal["previous", "current"]],
+) -> RetentionInterval:
+    return (
+        RetentionInterval(*raw_retention_interval)
+        if len(raw_retention_interval) == 4
+        else RetentionInterval(*raw_retention_interval[:3], "current")
+    )
+
+
+def _deserialize_attributes(raw_attributes: SDRawAttributes) -> ImmutableAttributes:
+    return ImmutableAttributes(
+        pairs=raw_attributes.get("Pairs", {}),
+        retentions={
+            key: _deserialize_retention_interval(raw_retention_interval)
+            for key, raw_retention_interval in raw_attributes.get("Retentions", {}).items()
+        },
+    )
+
+
+def _deserialize_table(raw_table: SDRawTable) -> ImmutableTable:
+    rows = raw_table.get("Rows", [])
+    key_columns = raw_table.get("KeyColumns", [])
+
+    rows_by_ident: dict[SDRowIdent, dict[SDKey, SDValue]] = {}
+    for row in rows:
+        rows_by_ident.setdefault(_make_row_ident(key_columns, row), {}).update(row)
+
+    return ImmutableTable(
+        key_columns=key_columns,
+        rows_by_ident=rows_by_ident,
+        retentions={
+            ident: {
+                key: _deserialize_retention_interval(raw_retention_interval)
+                for key, raw_retention_interval in raw_intervals_by_key.items()
+            }
+            for ident, raw_intervals_by_key in raw_table.get("Retentions", {}).items()
+        },
+    )
+
+
+def _deserialize_tree(
+    *,
+    path: SDPath,
+    raw_attributes: SDRawAttributes,
+    raw_table: SDRawTable,
+    raw_nodes: Mapping[SDNodeName, SDRawTree],
+) -> ImmutableTree:
+    return ImmutableTree(
+        path=path,
+        attributes=_deserialize_attributes(raw_attributes),
+        table=_deserialize_table(raw_table),
+        nodes_by_name={
+            name: _deserialize_tree(
+                path=path + (name,),
+                raw_attributes=raw_node["Attributes"],
+                raw_table=raw_node["Table"],
+                raw_nodes=raw_node["Nodes"],
+            )
+            for name, raw_node in raw_nodes.items()
+        },
+    )
+
+
+def deserialize_tree(raw_tree: object) -> ImmutableTree:
+    if not isinstance(raw_tree, dict):
+        raise TypeError(raw_tree)
+    try:
+        raw_attributes = raw_tree["Attributes"]
+        raw_table = raw_tree["Table"]
+        raw_nodes = raw_tree["Nodes"]
+    except KeyError:
+        return _deserialize_legacy_tree(path=(), raw_tree=raw_tree)
+    return _deserialize_tree(
+        path=(),
+        raw_attributes=raw_attributes,
+        raw_table=raw_table,
+        raw_nodes=raw_nodes,
+    )
+
+
+def _serialize_delta_value(delta_value: SDDeltaValue) -> tuple[SDValue, SDValue]:
+    return (delta_value.old, delta_value.new)
+
+
+def _serialize_delta_attributes(delta_attributes: ImmutableDeltaAttributes) -> SDRawDeltaAttributes:
+    return (
+        {"Pairs": {k: _serialize_delta_value(v) for k, v in delta_attributes.pairs.items()}}
+        if delta_attributes.pairs
+        else {}
+    )
+
+
+def _serialize_delta_table(delta_table: ImmutableDeltaTable) -> SDRawDeltaTable:
+    return (
+        {
+            "KeyColumns": delta_table.key_columns,
+            "Rows": [
+                {k: _serialize_delta_value(v) for k, v in r.items()} for r in delta_table.rows
+            ],
+        }
+        if delta_table.rows
+        else {}
+    )
+
+
+def serialize_delta_tree(delta_tree: ImmutableDeltaTree) -> SDRawDeltaTree:
+    return {
+        "Attributes": _serialize_delta_attributes(delta_tree.attributes),
+        "Table": _serialize_delta_table(delta_tree.table),
+        "Nodes": {
+            edge: serialize_delta_tree(node)
+            for edge, node in delta_tree.nodes_by_name.items()
+            if node
+        },
+    }
+
+
+def _deserialize_delta_value(raw_delta_value: tuple[SDValue, SDValue]) -> SDDeltaValue:
+    return SDDeltaValue(raw_delta_value[0], raw_delta_value[1])
+
+
+def _deserialize_delta_attributes(raw_attributes: SDRawDeltaAttributes) -> ImmutableDeltaAttributes:
+    return ImmutableDeltaAttributes(
+        pairs={k: _deserialize_delta_value(v) for k, v in raw_attributes.get("Pairs", {}).items()}
+    )
+
+
+def _deserialize_delta_table(raw_table: SDRawDeltaTable) -> ImmutableDeltaTable:
+    return ImmutableDeltaTable(
+        key_columns=raw_table.get("KeyColumns", []),
+        rows=[
+            {k: _deserialize_delta_value(v) for k, v in r.items()}
+            for r in raw_table.get("Rows", [])
+        ],
+    )
+
+
+def _deserialize_delta_tree(*, path: SDPath, raw_tree: SDRawDeltaTree) -> ImmutableDeltaTree:
+    return ImmutableDeltaTree(
+        path=path,
+        attributes=_deserialize_delta_attributes(raw_attributes=raw_tree["Attributes"]),
+        table=_deserialize_delta_table(raw_table=raw_tree["Table"]),
+        nodes_by_name={
+            raw_node_name: _deserialize_delta_tree(
+                path=path + (raw_node_name,),
+                raw_tree=raw_node,
+            )
+            for raw_node_name, raw_node in raw_tree["Nodes"].items()
+        },
+    )
+
+
+def deserialize_delta_tree(raw_tree: SDRawDeltaTree) -> ImmutableDeltaTree:
+    return _deserialize_delta_tree(path=(), raw_tree=raw_tree)
+
+
+# .
+#   .--mutable tree--------------------------------------------------------.
+#   |                      _        _     _        _                       |
+#   |      _ __ ___  _   _| |_ __ _| |__ | | ___  | |_ _ __ ___  ___       |
+#   |     | '_ ` _ \| | | | __/ _` | '_ \| |/ _ \ | __| '__/ _ \/ _ \      |
+#   |     | | | | | | |_| | || (_| | |_) | |  __/ | |_| | |  __/  __/      |
+#   |     |_| |_| |_|\__,_|\__\__,_|_.__/|_|\___|  \__|_|  \___|\___|      |
+#   |                                                                      |
+#   '----------------------------------------------------------------------'
+
+
+@dataclass(kw_only=True)
+class _MutableAttributes:
+    pairs: dict[SDKey, SDValue] = field(default_factory=dict)
+    retentions: Mapping[SDKey, RetentionInterval] = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        # The attribute 'pairs' is decisive. Other attributes like 'retentions' have no impact
+        # if there are no pairs.
+        return len(self.pairs)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, (_MutableAttributes, ImmutableAttributes)):
+            return NotImplemented
+        return self.pairs == other.pairs
+
+    def add(self, pairs: Mapping[SDKey, SDValue]) -> None:
+        self.pairs.update(pairs)
+
+    def update(
+        self,
+        now: int,
+        previous: ImmutableAttributes,
+        path: SDPath,
+        interval: int,
+        choice: _SDRetentionFilterChoice,
+        update_result: UpdateResult,
+    ) -> None:
+        filter_func = _make_filter_func(choice.choice)
+        retention_interval = RetentionInterval.from_config(*choice.cache_info, interval)
+        compared_keys = _DictKeys.compare(
+            left=set(
+                _get_filtered_dict(
+                    previous.pairs,
+                    _make_retentions_filter_func(
+                        filter_func=filter_func,
+                        intervals_by_key=previous.retentions,
+                        now=now,
+                    ),
+                )
+            ),
+            right=set(_get_filtered_dict(self.pairs, filter_func)),
+        )
+
+        pairs: dict[SDKey, SDValue] = {}
+        retentions: dict[SDKey, RetentionInterval] = {}
+        for key in compared_keys.only_left:
+            pairs.setdefault(key, previous.pairs[key])
+            retentions[key] = RetentionInterval.from_previous(previous.retentions[key])
+
+        for key in compared_keys.both.union(compared_keys.only_right):
+            retentions[key] = retention_interval
+
+        if pairs:
+            self.add(pairs)
+            update_result.add_attr_reason(path, "Added pairs", pairs)
+
+        if retentions:
+            self.retentions = retentions
+            update_result.add_attr_reason(
+                path, "Keep until", [f"{k} ({v.keep_until})" for k, v in retentions.items()]
+            )
+
+    @property
+    def bare(self) -> SDBareAttributes:
+        # Useful for debugging; no restrictions
+        return {
+            "Pairs": self.pairs,
+            "Retentions": {k: _serialize_retention_interval(v) for k, v in self.retentions.items()},
+        }
+
+
+@dataclass(kw_only=True)
+class _MutableTable:
+    key_columns: Sequence[SDKey] = field(default_factory=list)
+    rows_by_ident: dict[SDRowIdent, dict[SDKey, SDValue]] = field(default_factory=dict)
+    retentions: Mapping[SDRowIdent, Mapping[SDKey, RetentionInterval]] = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        # The attribute 'rows' is decisive. Other attributes like 'key_columns' or 'retentions'
+        # have no impact if there are no rows.
+        return sum(map(len, self.rows_by_ident.values()))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, (_MutableTable, ImmutableTable)):
+            return NotImplemented
+
+        compared_row_idents = _DictKeys.compare(
+            left=set(self.rows_by_ident),
+            right=set(other.rows_by_ident),
+        )
+
+        if compared_row_idents.only_left:
+            return False
+
+        if compared_row_idents.only_right:
+            return False
+
+        return all(
+            self.rows_by_ident[i] == other.rows_by_ident[i] for i in compared_row_idents.both
+        )
+
+    def _add_key_columns(self, key_columns: Iterable[SDKey]) -> None:
+        self.key_columns = sorted(set(self.key_columns).union(key_columns))
+
+    def _add_row(self, ident: SDRowIdent, row: Mapping[SDKey, SDValue]) -> None:
+        if row:
+            self.rows_by_ident.setdefault(ident, {}).update(row)
+
+    def add(self, key_columns: Iterable[SDKey], rows: Sequence[Mapping[SDKey, SDValue]]) -> None:
+        self._add_key_columns(key_columns)
+        for row in rows:
+            self._add_row(_make_row_ident(self.key_columns, row), row)
+
+    def update(
+        self,
+        now: int,
+        previous: ImmutableTable,
+        path: SDPath,
+        interval: int,
+        choice: _SDRetentionFilterChoice,
+        update_result: UpdateResult,
+    ) -> None:
+        filter_func = _make_filter_func(choice.choice)
+        retention_interval = RetentionInterval.from_config(*choice.cache_info, interval)
+        self._add_key_columns(previous.key_columns)
+        previous_filtered_rows = {
+            ident: filtered_row
+            for ident, row in previous.rows_by_ident.items()
+            if (
+                filtered_row := _get_filtered_dict(
+                    row,
+                    _make_retentions_filter_func(
+                        filter_func=filter_func,
+                        intervals_by_key=previous.retentions.get(ident),
+                        now=now,
+                    ),
+                )
+            )
+        }
+        current_filtered_rows = {
+            ident: filtered_row
+            for ident, row in self.rows_by_ident.items()
+            if (filtered_row := _get_filtered_dict(row, filter_func))
+        }
+        compared_row_idents = _DictKeys.compare(
+            left=set(previous_filtered_rows),
+            right=set(current_filtered_rows),
+        )
+
+        retentions: dict[SDRowIdent, dict[SDKey, RetentionInterval]] = {}
+        for ident in compared_row_idents.only_left:
+            previous_row: dict[SDKey, SDValue] = {}
+            for key, value in previous_filtered_rows[ident].items():
+                previous_row.setdefault(key, value)
+                retentions.setdefault(ident, {})[key] = RetentionInterval.from_previous(
+                    previous.retentions[ident][key]
+                )
+
+            if previous_row:
+                # Update row with key column entries
+                previous_row |= {k: previous.rows_by_ident[ident][k] for k in previous.key_columns}
+                self._add_row(ident, previous_row)
+                update_result.add_row_reason(path, ident, "Added row", previous_row)
+
+        for ident in compared_row_idents.both:
+            compared_keys = _DictKeys.compare(
+                left=set(previous_filtered_rows[ident]),
+                right=set(current_filtered_rows[ident]),
+            )
+            row: dict[SDKey, SDValue] = {}
+            for key in compared_keys.only_left:
+                row.setdefault(key, previous.rows_by_ident[ident][key])
+                retentions.setdefault(ident, {})[key] = RetentionInterval.from_previous(
+                    previous.retentions[ident][key]
+                )
+
+            for key in compared_keys.both.union(compared_keys.only_right):
+                retentions.setdefault(ident, {})[key] = retention_interval
+
+            if row:
+                # Update row with key column entries
+                row.update(
+                    {
+                        **{k: previous.rows_by_ident[ident][k] for k in previous.key_columns},
+                        **{k: self.rows_by_ident[ident][k] for k in self.key_columns},
+                    }
+                )
+                self._add_row(ident, row)
+                update_result.add_row_reason(path, ident, "Added row", row)
+
+        for ident in compared_row_idents.only_right:
+            for key in current_filtered_rows[ident]:
+                retentions.setdefault(ident, {})[key] = retention_interval
+
+        if retentions:
+            self.retentions = retentions
+            for ident, intervals_by_key in retentions.items():
+                update_result.add_row_reason(
+                    path,
+                    ident,
+                    "Keep until",
+                    [f"{k} ({v.keep_until})" for k, v in intervals_by_key.items()],
+                )
+
+    @property
+    def bare(self) -> SDBareTable:
+        # Useful for debugging; no restrictions
+        return {
+            "KeyColumns": self.key_columns,
+            "RowsByIdent": self.rows_by_ident,
+            "Retentions": {
+                i: {k: _serialize_retention_interval(v) for k, v in ri.items()}
+                for i, ri in self.retentions.items()
+            },
+        }
+
+
+@dataclass(frozen=True, kw_only=True)
+class MutableTree:
+    path: SDPath = ()
+    attributes: _MutableAttributes = field(default_factory=lambda: _MutableAttributes())
+    table: _MutableTable = field(default_factory=lambda: _MutableTable())
+    nodes_by_name: dict[SDNodeName, MutableTree] = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        return sum(
+            [len(self.attributes), len(self.table)]
+            + [len(node) for node in self.nodes_by_name.values()]
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, (MutableTree, ImmutableTree)):
+            return NotImplemented
+
+        if self.attributes != other.attributes or self.table != other.table:
+            return False
+
+        compared_node_names = _DictKeys.compare(
+            left=set(self.nodes_by_name),
+            right=set(other.nodes_by_name),
+        )
+
+        if any(self.nodes_by_name[n] for n in compared_node_names.only_left):
+            return False
+
+        if any(other.nodes_by_name[n] for n in compared_node_names.only_right):
+            return False
+
+        return all(
+            self.nodes_by_name[n] == other.nodes_by_name[n] for n in compared_node_names.both
+        )
+
+    def add(
+        self,
+        *,
+        path: SDPath,
+        pairs: Sequence[Mapping[SDKey, SDValue]] | None = None,
+        key_columns: Sequence[SDKey] | None = None,
+        rows: Sequence[Mapping[SDKey, SDValue]] | None = None,
+    ) -> None:
+        node = self.setdefault_node(path)
+        if pairs:
+            for p in pairs:
+                node.attributes.add(p)
+        if key_columns and rows:
+            node.table.add(key_columns, rows)
+
+    def update(
+        self,
+        *,
+        now: int,
+        previous_tree: ImmutableTree,
+        choices: SDRetentionFilterChoices,
+        update_result: UpdateResult,
+    ) -> None:
+        node = self.setdefault_node(choices.path)
+        previous_node = previous_tree.get_tree(choices.path)
+        for choice in choices.pairs:
+            node.attributes.update(
+                now,
+                previous_node.attributes,
+                choices.path,
+                choices.interval,
+                choice,
+                update_result,
+            )
+        for choice in choices.columns:
+            node.table.update(
+                now,
+                previous_node.table,
+                choices.path,
+                choices.interval,
+                choice,
+                update_result,
+            )
+
+    def setdefault_node(self, path: SDPath) -> MutableTree:
+        if not path:
+            return self
+
+        name = path[0]
+        node = self.nodes_by_name.setdefault(name, MutableTree(path=self.path + (name,)))
+        return node.setdefault_node(path[1:])
+
+    def get_attribute(self, path: SDPath, key: SDKey) -> SDValue:
+        return self.get_tree(path).attributes.pairs.get(key)
+
+    def get_tree(self, path: SDPath) -> MutableTree:
+        if not path:
+            return self
+        return (
+            MutableTree()
+            if (node := self.nodes_by_name.get(path[0])) is None
+            else node.get_tree(path[1:])
+        )
+
+    def has_table(self, path: SDPath) -> bool:
+        return len(self.get_tree(path).table) > 0
+
+    @property
+    def bare(self) -> SDBareTree:
+        # Useful for debugging; no restrictions
+        return {
+            "Path": self.path,
+            "Attributes": self.attributes.bare,
+            "Table": self.table.bare,
+            "Nodes": {name: node.bare for name, node in self.nodes_by_name.items()},
+        }
+
+    def __str__(self) -> str:
+        return f"{self.__class__.__name__}({pprint.pformat(self.bare)})"
+
+
+# .
+#   .--immutable tree------------------------------------------------------.
+#   |          _                           _        _     _                |
+#   |         (_)_ __ ___  _ __ ___  _   _| |_ __ _| |__ | | ___           |
+#   |         | | '_ ` _ \| '_ ` _ \| | | | __/ _` | '_ \| |/ _ \          |
+#   |         | | | | | | | | | | | | |_| | || (_| | |_) | |  __/          |
+#   |         |_|_| |_| |_|_| |_| |_|\__,_|\__\__,_|_.__/|_|\___|          |
+#   |                                                                      |
+#   |                          _                                           |
+#   |                         | |_ _ __ ___  ___                           |
+#   |                         | __| '__/ _ \/ _ \                          |
+#   |                         | |_| | |  __/  __/                          |
+#   |                          \__|_|  \___|\___|                          |
+#   |                                                                      |
+#   '----------------------------------------------------------------------'
+
+
+def _filter_attributes(
+    attributes: ImmutableAttributes, filter_tree: _FilterTree
+) -> ImmutableAttributes:
+    return ImmutableAttributes(
+        pairs=filter_tree.filter_pairs(attributes.pairs),
+        retentions=attributes.retentions,
+    )
+
+
+def _filter_table(table: ImmutableTable, filter_tree: _FilterTree) -> ImmutableTable:
+    return ImmutableTable(
+        key_columns=table.key_columns,
+        rows_by_ident={
+            ident: filtered_row
+            for ident, row in table.rows_by_ident.items()
+            if (filtered_row := filter_tree.filter_row(row))
+        },
+        retentions=table.retentions,
+    )
+
+
+def _filter_tree(tree: ImmutableTree, filter_tree: _FilterTree) -> ImmutableTree:
+    return ImmutableTree(
+        path=tree.path,
+        attributes=_filter_attributes(tree.attributes, filter_tree),
+        table=_filter_table(tree.table, filter_tree),
+        nodes_by_name={
+            name: filtered_node
+            for name in filter_tree.filter_node_names(set(tree.nodes_by_name))
+            if (
+                filtered_node := _filter_tree(
+                    tree.nodes_by_name.get(name, ImmutableTree(path=tree.path + (name,))),
+                    filter_tree.filters_by_name.get(name, _FilterTree()),
+                )
+            )
+        },
+    )
+
+
+def _merge_attributes(left: ImmutableAttributes, right: ImmutableAttributes) -> ImmutableAttributes:
+    return ImmutableAttributes(
+        pairs={**left.pairs, **right.pairs},
+        retentions={**left.retentions, **right.retentions},
+    )
+
+
+def _merge_tables_by_same_or_empty_key_columns(
+    key_columns: Sequence[SDKey], left: ImmutableTable, right: ImmutableTable
+) -> ImmutableTable:
+    compared_row_idents = _DictKeys.compare(
+        left=set(left.rows_by_ident),
+        right=set(right.rows_by_ident),
+    )
+
+    rows_by_ident: dict[SDRowIdent, Mapping[SDKey, SDValue]] = {}
+    for ident in compared_row_idents.only_left:
+        rows_by_ident.setdefault(ident, left.rows_by_ident[ident])
+
+    for ident in compared_row_idents.both:
+        rows_by_ident.setdefault(
+            ident,
+            {
+                **left.rows_by_ident[ident],
+                **right.rows_by_ident[ident],
+            },
+        )
+
+    for ident in compared_row_idents.only_right:
+        rows_by_ident.setdefault(ident, right.rows_by_ident[ident])
+
+    return ImmutableTable(
+        key_columns=key_columns,
+        rows_by_ident=rows_by_ident,
+        retentions={**left.retentions, **right.retentions},
+    )
+
+
+def _merge_tables(left: ImmutableTable, right: ImmutableTable) -> ImmutableTable:
+    if left.key_columns and not right.key_columns:
+        return _merge_tables_by_same_or_empty_key_columns(left.key_columns, left, right)
+
+    if not left.key_columns and right.key_columns:
+        return _merge_tables_by_same_or_empty_key_columns(right.key_columns, left, right)
+
+    if left.key_columns == right.key_columns:
+        return _merge_tables_by_same_or_empty_key_columns(left.key_columns, left, right)
+
+    # Re-calculate row identifiers for legacy tables or inventory and status tables
+    key_columns = sorted(set(left.key_columns).intersection(right.key_columns))
+    rows_by_ident: dict[SDRowIdent, dict[SDKey, SDValue]] = {}
+    for row in list(left.rows_by_ident.values()) + list(right.rows_by_ident.values()):
+        rows_by_ident.setdefault(_make_row_ident(key_columns, row), {}).update(row)
+
+    return ImmutableTable(
+        key_columns=key_columns,
+        rows_by_ident=rows_by_ident,
+        retentions={**left.retentions, **right.retentions},
+    )
+
+
+def _merge_nodes(left: ImmutableTree, right: ImmutableTree) -> ImmutableTree:
+    compared_node_names = _DictKeys.compare(
+        left=set(left.nodes_by_name),
+        right=set(right.nodes_by_name),
+    )
+
+    nodes_by_name: dict[SDNodeName, ImmutableTree] = {}
+    for name in compared_node_names.only_left:
+        nodes_by_name[name] = left.nodes_by_name[name]
+
+    for name in compared_node_names.both:
+        nodes_by_name[name] = _merge_nodes(
+            left=left.nodes_by_name[name], right=right.nodes_by_name[name]
+        )
+
+    for name in compared_node_names.only_right:
+        nodes_by_name[name] = right.nodes_by_name[name]
+
+    return ImmutableTree(
+        path=left.path,
+        attributes=_merge_attributes(left.attributes, right.attributes),
+        table=_merge_tables(left.table, right.table),
+        nodes_by_name=nodes_by_name,
+    )
+
+
+@dataclass(frozen=True)
+class SDDeltaValue:
+    old: SDValue
+    new: SDValue
+
+
+def _encode_as_new(value: SDValue) -> SDDeltaValue:
+    return SDDeltaValue(None, value)
+
+
+def _encode_as_removed(value: SDValue) -> SDDeltaValue:
+    return SDDeltaValue(value, None)
+
+
+@dataclass(frozen=True, kw_only=True)
+class _DeltaDict:
+    result: Mapping[SDKey, SDDeltaValue]
+    has_changes: bool
+
+    @classmethod
+    def compare(
+        cls, *, left: Mapping[SDKey, SDValue], right: Mapping[SDKey, SDValue], keep_identical: bool
+    ) -> Self:
+        """
+        Format of compared entries:
+          new:          {k: (None, new_value), ...}
+          changed:      {k: (old_value, new_value), ...}
+          removed:      {k: (old_value, None), ...}
+          identical:    {k: (value, value), ...}
+        """
+        compared_keys = _DictKeys.compare(left=set(left), right=set(right))
+        compared_dict: dict[SDKey, SDDeltaValue] = {}
+
+        has_changes = False
+        for key in compared_keys.both:
+            if (left_value := left[key]) != (right_value := right[key]):
+                compared_dict.setdefault(key, SDDeltaValue(left_value, right_value))
+                has_changes = True
+            elif keep_identical:
+                compared_dict.setdefault(key, SDDeltaValue(left_value, left_value))
+
+        compared_dict |= {k: _encode_as_removed(right[k]) for k in compared_keys.only_right}
+        compared_dict |= {k: _encode_as_new(left[k]) for k in compared_keys.only_left}
+
+        return cls(
+            result=compared_dict,
+            has_changes=bool(has_changes or compared_keys.only_right or compared_keys.only_left),
+        )
+
+
+def _compare_attributes(
+    left: ImmutableAttributes, right: ImmutableAttributes
+) -> ImmutableDeltaAttributes:
+    return ImmutableDeltaAttributes(
+        pairs=_DeltaDict.compare(
+            left=left.pairs,
+            right=right.pairs,
+            keep_identical=False,
+        ).result,
+    )
+
+
+def _compare_tables(left: ImmutableTable, right: ImmutableTable) -> ImmutableDeltaTable:
+    compared_row_idents = _DictKeys.compare(
+        left=set(left.rows_by_ident),
+        right=set(right.rows_by_ident),
+    )
+
+    rows: list[Mapping[SDKey, SDDeltaValue]] = []
+
+    for ident in compared_row_idents.only_left:
+        rows.append({k: _encode_as_new(v) for k, v in left.rows_by_ident[ident].items()})
+
+    for ident in compared_row_idents.both:
+        # Note: Rows which have at least one change also provide all table fields.
+        # Example:
+        # If the version of a package (below "Software > Packages") has changed from 1.0 to 2.0
+        # then it would be very annoying if the rest of the row is not shown.
+        if (
+            compared_dict_result := _DeltaDict.compare(
+                left=left.rows_by_ident[ident],
+                right=right.rows_by_ident[ident],
+                keep_identical=True,
+            )
+        ).has_changes:
+            rows.append(compared_dict_result.result)
+
+    for ident in compared_row_idents.only_right:
+        rows.append({k: _encode_as_removed(v) for k, v in right.rows_by_ident[ident].items()})
+
+    return ImmutableDeltaTable(
+        key_columns=sorted(set(left.key_columns).union(right.key_columns)),
+        rows=rows,
+    )
+
+
+def _compare_trees(left: ImmutableTree, right: ImmutableTree) -> ImmutableDeltaTree:
+    nodes: dict[SDNodeName, ImmutableDeltaTree] = {}
+
+    compared_node_names = _DictKeys.compare(
+        left=set(left.nodes_by_name),
+        right=set(right.nodes_by_name),
+    )
+
+    for name in compared_node_names.only_left:
+        if child_left := left.nodes_by_name[name]:
+            nodes[name] = ImmutableDeltaTree.from_tree(
+                tree=child_left,
+                encode_as=_encode_as_new,
+            )
+
+    for name in compared_node_names.both:
+        if (child_left := left.nodes_by_name[name]) == (child_right := right.nodes_by_name[name]):
+            continue
+
+        if (node := _compare_trees(child_left, child_right)).get_stats():
+            nodes[name] = node
+
+    for name in compared_node_names.only_right:
+        if child_right := right.nodes_by_name[name]:
+            nodes[name] = ImmutableDeltaTree.from_tree(
+                tree=child_right,
+                encode_as=_encode_as_removed,
+            )
+
+    return ImmutableDeltaTree(
+        path=left.path,
+        attributes=_compare_attributes(left.attributes, right.attributes),
+        table=_compare_tables(left.table, right.table),
+        nodes_by_name=nodes,
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class ImmutableAttributes:
+    pairs: Mapping[SDKey, SDValue] = field(default_factory=dict)
+    retentions: Mapping[SDKey, RetentionInterval] = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        # The attribute 'pairs' is decisive. Other attributes like 'retentions' have no impact
+        # if there are no pairs.
+        return len(self.pairs)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, (_MutableAttributes, ImmutableAttributes)):
+            return NotImplemented
+        return self.pairs == other.pairs
+
+    @property
+    def bare(self) -> SDBareAttributes:
+        # Useful for debugging; no restrictions
+        return {
+            "Pairs": self.pairs,
+            "Retentions": {k: _serialize_retention_interval(v) for k, v in self.retentions.items()},
+        }
+
+
+@dataclass(frozen=True, kw_only=True)
+class ImmutableTable:
+    key_columns: Sequence[SDKey] = field(default_factory=list)
+    rows_by_ident: Mapping[SDRowIdent, Mapping[SDKey, SDValue]] = field(default_factory=dict)
+    retentions: Mapping[SDRowIdent, Mapping[SDKey, RetentionInterval]] = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        # The attribute 'rows' is decisive. Other attributes like 'key_columns' or 'retentions'
+        # have no impact if there are no rows.
+        return sum(map(len, self.rows_by_ident.values()))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, (_MutableTable, ImmutableTable)):
+            return NotImplemented
+
+        compared_row_idents = _DictKeys.compare(
+            left=set(self.rows_by_ident),
+            right=set(other.rows_by_ident),
+        )
+
+        if compared_row_idents.only_left:
+            return False
+
+        if compared_row_idents.only_right:
+            return False
+
+        return all(
+            self.rows_by_ident[i] == other.rows_by_ident[i] for i in compared_row_idents.both
+        )
+
+    @property
+    def rows(self) -> Sequence[Mapping[SDKey, SDValue]]:
+        return list(self.rows_by_ident.values())
+
+    @property
+    def rows_with_retentions(
+        self,
+    ) -> Sequence[Mapping[SDKey, tuple[SDValue, RetentionInterval | None]]]:
+        return [
+            {key: (value, self.retentions.get(ident, {}).get(key)) for key, value in row.items()}
+            for ident, row in self.rows_by_ident.items()
+        ]
+
+    @property
+    def bare(self) -> SDBareTable:
+        # Useful for debugging; no restrictions
+        return {
+            "KeyColumns": self.key_columns,
+            "RowsByIdent": self.rows_by_ident,
+            "Retentions": {
+                i: {k: _serialize_retention_interval(v) for k, v in ri.items()}
+                for i, ri in self.retentions.items()
+            },
+        }
+
+
+@dataclass(frozen=True, kw_only=True)
+class ImmutableTree:
+    path: SDPath = ()
+    attributes: ImmutableAttributes = ImmutableAttributes()
+    table: ImmutableTable = ImmutableTable()
+    nodes_by_name: Mapping[SDNodeName, ImmutableTree] = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        return sum(
+            [len(self.attributes), len(self.table)]
+            + [len(node) for node in self.nodes_by_name.values()]
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, (MutableTree, ImmutableTree)):
+            return NotImplemented
+
+        if self.attributes != other.attributes or self.table != other.table:
+            return False
+
+        compared_node_names = _DictKeys.compare(
+            left=set(self.nodes_by_name),
+            right=set(other.nodes_by_name),
+        )
+
+        if any(self.nodes_by_name[n] for n in compared_node_names.only_left):
+            return False
+
+        if any(other.nodes_by_name[n] for n in compared_node_names.only_right):
+            return False
+
+        return all(
+            self.nodes_by_name[n] == other.nodes_by_name[n] for n in compared_node_names.both
+        )
+
+    def filter(self, filters: Iterable[SDFilterChoice]) -> ImmutableTree:
+        return _filter_tree(self, _make_filter_tree(filters))
+
+    def merge(self, right: ImmutableTree) -> ImmutableTree:
+        return _merge_nodes(self, right)
+
+    def difference(self, right: ImmutableTree) -> ImmutableDeltaTree:
+        return _compare_trees(self, right)
+
+    def get_attribute(self, path: SDPath, key: SDKey) -> SDValue:
+        return self.get_tree(path).attributes.pairs.get(key)
+
+    def get_rows(self, path: SDPath) -> Sequence[Mapping[SDKey, SDValue]]:
+        return self.get_tree(path).table.rows
+
+    def get_tree(self, path: SDPath) -> ImmutableTree:
+        if not path:
+            return self
+        return (
+            ImmutableTree()
+            if (node := self.nodes_by_name.get(path[0])) is None
+            else node.get_tree(path[1:])
+        )
+
+    @property
+    def bare(self) -> SDBareTree:
+        # Useful for debugging; no restrictions
+        return {
+            "Path": self.path,
+            "Attributes": self.attributes.bare,
+            "Table": self.table.bare,
+            "Nodes": {name: node.bare for name, node in self.nodes_by_name.items()},
+        }
+
+    def __str__(self) -> str:
+        return f"{self.__class__.__name__}({pprint.pformat(self.bare)})"
+
+
+# .
+#   .--immutable delta tree------------------------------------------------.
+#   |          _                           _        _     _                |
+#   |         (_)_ __ ___  _ __ ___  _   _| |_ __ _| |__ | | ___           |
+#   |         | | '_ ` _ \| '_ ` _ \| | | | __/ _` | '_ \| |/ _ \          |
+#   |         | | | | | | | | | | | | |_| | || (_| | |_) | |  __/          |
+#   |         |_|_| |_| |_|_| |_| |_|\__,_|\__\__,_|_.__/|_|\___|          |
+#   |                                                                      |
+#   |                  _      _ _          _                               |
+#   |               __| | ___| | |_ __ _  | |_ _ __ ___  ___               |
+#   |              / _` |/ _ \ | __/ _` | | __| '__/ _ \/ _ \              |
+#   |             | (_| |  __/ | || (_| | | |_| | |  __/  __/              |
+#   |              \__,_|\___|_|\__\__,_|  \__|_|  \___|\___|              |
+#   |                                                                      |
+#   '----------------------------------------------------------------------'
+
+
+def _filter_delta_attributes(
+    attributes: ImmutableDeltaAttributes, filter_tree: _FilterTree
+) -> ImmutableDeltaAttributes:
+    return ImmutableDeltaAttributes(pairs=filter_tree.filter_pairs(attributes.pairs))
+
+
+def _filter_delta_table(
+    table: ImmutableDeltaTable, filter_tree: _FilterTree
+) -> ImmutableDeltaTable:
+    return ImmutableDeltaTable(
+        key_columns=table.key_columns,
+        rows=[filtered_row for row in table.rows if (filtered_row := filter_tree.filter_row(row))],
+    )
+
+
+def _filter_delta_tree(tree: ImmutableDeltaTree, filter_tree: _FilterTree) -> ImmutableDeltaTree:
+    return ImmutableDeltaTree(
+        path=tree.path,
+        attributes=_filter_delta_attributes(tree.attributes, filter_tree),
+        table=_filter_delta_table(tree.table, filter_tree),
+        nodes_by_name={
+            name: filtered_node
+            for name in filter_tree.filter_node_names(set(tree.nodes_by_name))
+            if (
+                filtered_node := _filter_delta_tree(
+                    tree.nodes_by_name.get(name, ImmutableDeltaTree(path=tree.path + (name,))),
+                    filter_tree.filters_by_name.get(name, _FilterTree()),
+                )
+            )
+        },
+    )
+
+
+_SDEncodeAs = Callable[[SDValue], SDDeltaValue]
+SDDeltaCounter = Counter[Literal["new", "changed", "removed"]]
+
+
+def _compute_delta_stats(dict_: Mapping[SDKey, SDDeltaValue]) -> SDDeltaCounter:
+    counter: SDDeltaCounter = Counter()
+    for delta_value in dict_.values():
+        match [delta_value.old is None, delta_value.new is None]:
+            case [True, False]:
+                counter["new"] += 1
+            case [False, True]:
+                counter["removed"] += 1
+            case [False, False] if delta_value.old != delta_value.new:
+                counter["changed"] += 1
+    return counter
+
+
+@dataclass(frozen=True, kw_only=True)
+class ImmutableDeltaAttributes:
+    pairs: Mapping[SDKey, SDDeltaValue] = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    @classmethod
+    def from_attributes(
+        cls, *, attributes: ImmutableAttributes, encode_as: _SDEncodeAs
+    ) -> ImmutableDeltaAttributes:
+        return cls(pairs={key: encode_as(value) for key, value in attributes.pairs.items()})
+
+    def get_stats(self) -> SDDeltaCounter:
+        return _compute_delta_stats(self.pairs)
+
+    @property
+    def bare(self) -> SDBareDeltaAttributes:
+        # Useful for debugging; no restrictions
+        return {"Pairs": {k: _serialize_delta_value(v) for k, v in self.pairs.items()}}
+
+
+@dataclass(frozen=True, kw_only=True)
+class ImmutableDeltaTable:
+    key_columns: Sequence[SDKey] = field(default_factory=list)
+    rows: Sequence[Mapping[SDKey, SDDeltaValue]] = field(default_factory=list)
+
+    def __len__(self) -> int:
+        return sum(map(len, self.rows))
+
+    @classmethod
+    def from_table(cls, *, table: ImmutableTable, encode_as: _SDEncodeAs) -> ImmutableDeltaTable:
+        return cls(
+            key_columns=table.key_columns,
+            rows=[{key: encode_as(value) for key, value in row.items()} for row in table.rows],
+        )
+
+    def get_stats(self) -> SDDeltaCounter:
+        counter: SDDeltaCounter = Counter()
+        for row in self.rows:
+            counter.update(_compute_delta_stats(row))
+        return counter
+
+    @property
+    def bare(self) -> SDBareDeltaTable:
+        # Useful for debugging; no restrictions
+        return {
+            "KeyColumns": self.key_columns,
+            "Rows": [{k: _serialize_delta_value(v) for k, v in r.items()} for r in self.rows],
+        }
+
+
+@dataclass(frozen=True, kw_only=True)
+class ImmutableDeltaTree:
+    path: SDPath = ()
+    attributes: ImmutableDeltaAttributes = ImmutableDeltaAttributes()
+    table: ImmutableDeltaTable = ImmutableDeltaTable()
+    nodes_by_name: Mapping[SDNodeName, ImmutableDeltaTree] = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        return sum(
+            [
+                len(self.attributes),
+                len(self.table),
+            ]
+            + [len(node) for node in self.nodes_by_name.values()]
+        )
+
+    @classmethod
+    def from_tree(cls, *, tree: ImmutableTree, encode_as: _SDEncodeAs) -> ImmutableDeltaTree:
+        return cls(
+            path=tree.path,
+            attributes=ImmutableDeltaAttributes.from_attributes(
+                attributes=tree.attributes,
+                encode_as=encode_as,
+            ),
+            table=ImmutableDeltaTable.from_table(
+                table=tree.table,
+                encode_as=encode_as,
+            ),
+            nodes_by_name={
+                name: cls.from_tree(
+                    tree=child,
+                    encode_as=encode_as,
+                )
+                for name, child in tree.nodes_by_name.items()
+            },
+        )
+
+    def get_tree(self, path: SDPath) -> ImmutableDeltaTree:
+        if not path:
+            return self
+        node = self.nodes_by_name.get(path[0])
+        return ImmutableDeltaTree() if node is None else node.get_tree(path[1:])
+
+    def filter(self, filters: Iterable[SDFilterChoice]) -> ImmutableDeltaTree:
+        return _filter_delta_tree(self, _make_filter_tree(filters))
+
+    def get_stats(self) -> SDDeltaCounter:
+        counter: SDDeltaCounter = Counter()
+        counter.update(self.attributes.get_stats())
+        counter.update(self.table.get_stats())
+        for node in self.nodes_by_name.values():
+            counter.update(node.get_stats())
+        return counter
+
+    @property
+    def bare(self) -> SDBareDeltaTree:
+        # Useful for debugging; no restrictions
+        return {
+            "Path": self.path,
+            "Attributes": self.attributes.bare,
+            "Table": self.table.bare,
+            "Nodes": {edge: node.bare for edge, node in self.nodes_by_name.items()},
+        }
+
+    def __str__(self) -> str:
+        return f"{self.__class__.__name__}({pprint.pformat(self.bare)})"
+
+
+# .
 #   .--IO------------------------------------------------------------------.
 #   |                              ___ ___                                 |
 #   |                             |_ _/ _ \                                |
@@ -163,17 +1646,77 @@ class UpdateResult:
 #   '----------------------------------------------------------------------'
 
 
-# TODO Centralize different stores and loaders of tree files:
-#   - inventory/HOSTNAME, inventory/HOSTNAME.gz, inventory/.last
-#   - inventory_archive/HOSTNAME/TIMESTAMP,
-#   - inventory_delta_cache/HOSTNAME/TIMESTAMP_{TIMESTAMP,None}
-#   - status_data/HOSTNAME, status_data/HOSTNAME.gz
-
-
-def load_tree(filepath: Path) -> StructuredDataNode:
+def load_tree(filepath: Path) -> ImmutableTree:
     if raw_tree := store.load_object_from_file(filepath, default=None):
-        return StructuredDataNode.deserialize(raw_tree)
-    return StructuredDataNode()
+        return deserialize_tree(raw_tree)
+    return ImmutableTree()
+
+
+class SDMeta(TypedDict):
+    version: Literal["1"]
+    do_archive: bool
+
+
+def make_meta(*, do_archive: bool) -> SDMeta:
+    return SDMeta(version="1", do_archive=do_archive)
+
+
+class SDMetaAndRawTree(TypedDict):
+    meta: SDMeta
+    raw_tree: SDRawTree
+
+
+def _parse_raw_meta(raw_meta: object) -> SDMeta:
+    if not isinstance(raw_meta, dict):
+        raise TypeError(raw_meta)
+    if not isinstance(version := raw_meta.get("version"), str):
+        raise TypeError(version)
+    if not isinstance(do_archive := raw_meta.get("do_archive"), bool):
+        raise TypeError(do_archive)
+    match version:
+        case "1":
+            return SDMeta(version=version, do_archive=do_archive)
+        case _:
+            raise ValueError(version)
+
+
+def _parse_raw_tree(raw_tree: object) -> SDRawTree:
+    if not isinstance(raw_tree, dict):
+        raise TypeError(raw_tree)
+    return SDRawTree(
+        Attributes=raw_tree.get("Attributes", {}),
+        Table=raw_tree.get("Table", {}),
+        Nodes=raw_tree.get("Nodes", {}),
+    )
+
+
+def parse_from_unzipped(raw: object) -> SDMetaAndRawTree:
+    # Note: Since Checkmk 2.1 we explicitly extract "Attributes", "Table" or "Nodes" while
+    # deserialization. This means that "meta_*" are not taken into account and we stay
+    # compatible.
+    if not isinstance(raw, dict):
+        raise TypeError(raw)
+    if set(raw) == {"meta", "raw_tree"}:
+        # Handle future versions
+        return SDMetaAndRawTree(
+            meta=_parse_raw_meta(raw.get("meta")),
+            raw_tree=_parse_raw_tree(raw.get("raw_tree")),
+        )
+    return SDMetaAndRawTree(
+        meta=SDMeta(
+            version="1",
+            do_archive=raw.get("meta_do_archive", True),
+        ),
+        raw_tree=SDRawTree(
+            Attributes=raw.get("Attributes", {}),
+            Table=raw.get("Table", {}),
+            Nodes=raw.get("Nodes", {}),
+        ),
+    )
+
+
+def _make_meta_and_raw_tree(meta: SDMeta, raw_tree: SDRawTree) -> SDMetaAndRawTree:
+    return SDMetaAndRawTree(meta=meta, raw_tree=raw_tree)
 
 
 class TreeStore:
@@ -181,20 +1724,22 @@ class TreeStore:
         self._tree_dir = Path(tree_dir)
         self._last_filepath = Path(tree_dir) / ".last"
 
-    def load(self, *, host_name: HostName) -> StructuredDataNode:
+    def load(self, *, host_name: HostName) -> ImmutableTree:
         return load_tree(self._tree_file(host_name))
 
-    def save(self, *, host_name: HostName, tree: StructuredDataNode, pretty: bool = False) -> None:
+    def save(
+        self, *, host_name: HostName, tree: MutableTree, meta: SDMeta, pretty: bool = False
+    ) -> None:
         self._tree_dir.mkdir(parents=True, exist_ok=True)
 
         tree_file = self._tree_file(host_name)
 
-        output = tree.serialize()
-        store.save_object_to_file(tree_file, output, pretty=pretty)
+        raw_tree = serialize_tree(tree)
+        store.save_object_to_file(tree_file, raw_tree, pretty=pretty)
 
         buf = io.BytesIO()
         with gzip.GzipFile(fileobj=buf, mode="wb") as f:
-            f.write((repr(output) + "\n").encode("utf-8"))
+            f.write((repr(_make_meta_and_raw_tree(meta, raw_tree)) + "\n").encode("utf-8"))
         store.save_bytes_to_file(self._gz_file(host_name), buf.getvalue())
 
         # Inform Livestatus about the latest inventory update
@@ -216,7 +1761,7 @@ class TreeOrArchiveStore(TreeStore):
         super().__init__(tree_dir)
         self._archive_dir = Path(archive)
 
-    def load_previous(self, *, host_name: HostName) -> StructuredDataNode:
+    def load_previous(self, *, host_name: HostName) -> ImmutableTree:
         if (tree_file := self._tree_file(host_name=host_name)).exists():
             return load_tree(tree_file)
 
@@ -225,7 +1770,7 @@ class TreeOrArchiveStore(TreeStore):
                 self._archive_host_dir(host_name).iterdir(), key=lambda tp: int(tp.name)
             )
         except (FileNotFoundError, ValueError):
-            return StructuredDataNode()
+            return ImmutableTree()
 
         return load_tree(latest_archive_tree_file)
 
@@ -239,1167 +1784,3 @@ class TreeOrArchiveStore(TreeStore):
         target_dir.mkdir(parents=True, exist_ok=True)
         tree_file.rename(target_dir / str(int(tree_file.stat().st_mtime)))
         self._gz_file(host_name).unlink(missing_ok=True)
-
-
-# .
-#   .--filters-------------------------------------------------------------.
-#   |                       __ _ _ _                                       |
-#   |                      / _(_) | |_ ___ _ __ ___                        |
-#   |                     | |_| | | __/ _ \ '__/ __|                       |
-#   |                     |  _| | | ||  __/ |  \__ \                       |
-#   |                     |_| |_|_|\__\___|_|  |___/                       |
-#   |                                                                      |
-#   '----------------------------------------------------------------------'
-
-# TODO filter table rows?
-
-
-def _use_all(_key: str) -> Literal[True]:
-    return True
-
-
-def _use_nothing(_key: str) -> Literal[False]:
-    return False
-
-
-def _make_choices_filter(choices: Sequence[str | int]) -> SDFilterFunc:
-    return lambda key: key in choices
-
-
-def make_filter(entry: tuple[SDPath, SDKeys | None] | dict) -> SDFilter:
-    if isinstance(entry, tuple):
-        path, keys = entry
-        return (
-            SDFilter(
-                path=path,
-                filter_nodes=_use_all,
-                filter_attributes=_use_all,
-                filter_columns=_use_all,
-            )
-            if keys is None
-            else SDFilter(
-                path=path,
-                filter_nodes=_use_nothing,
-                filter_attributes=_make_choices_filter(keys) if keys else _use_all,
-                filter_columns=_make_choices_filter(keys) if keys else _use_all,
-            )
-        )
-
-    return SDFilter(
-        path=parse_visible_raw_path(entry["visible_raw_path"]),
-        filter_attributes=make_filter_from_choice(entry.get("attributes")),
-        filter_columns=make_filter_from_choice(entry.get("columns")),
-        filter_nodes=make_filter_from_choice(entry.get("nodes")),
-    )
-
-
-def make_filter_from_choice(
-    choice: tuple[str, Sequence[str]] | Literal["nothing"] | Literal["all"] | None
-) -> SDFilterFunc:
-    # TODO Improve:
-    # For contact groups (via make_filter)
-    #   - ('choices', ['some', 'keys'])
-    #   - 'nothing' -> _use_nothing
-    #   - None -> _use_all
-    # For retention intervals (directly)
-    #   - ('choices', ['some', 'keys'])
-    #   - MISSING (see mk/base/agent_based/inventory.py::_get_intervals_from_config) -> _use_nothing
-    #   - 'all' -> _use_all
-    if isinstance(choice, tuple):
-        return _make_choices_filter(choice[-1])
-    if choice == "nothing":
-        return _use_nothing
-    return _use_all
-
-
-# .
-#   .--tree----------------------------------------------------------------.
-#   |                          _                                           |
-#   |                         | |_ _ __ ___  ___                           |
-#   |                         | __| '__/ _ \/ _ \                          |
-#   |                         | |_| | |  __/  __/                          |
-#   |                          \__|_|  \___|\___|                          |
-#   |                                                                      |
-#   '----------------------------------------------------------------------'
-
-
-class StructuredDataNode:
-    def __init__(self, *, name: SDNodeName = "", path: SDPath | None = None) -> None:
-        # Only root node has no name or path
-        self.name = name
-        self.path = path if path else tuple()
-        self.attributes = Attributes(path=path)
-        self.table = Table(path=path)
-        self._nodes: dict[SDNodeName, StructuredDataNode] = {}
-
-    def set_path(self, path: SDPath) -> None:
-        self.path = path
-        self.attributes.set_path(path)
-        self.table.set_path(path)
-
-    @property
-    def nodes(self) -> Iterator[StructuredDataNode]:
-        yield from self._nodes.values()
-
-    #   ---common methods-------------------------------------------------------
-
-    def is_empty(self) -> bool:
-        if not (self.attributes.is_empty() and self.table.is_empty()):
-            return False
-
-        for node in self._nodes.values():
-            if not node.is_empty():
-                return False
-        return True
-
-    def is_equal(self, other: object) -> bool:
-        if not isinstance(other, StructuredDataNode):
-            raise TypeError(f"Cannot compare {type(self)} with {type(other)}")
-
-        if not (self.attributes.is_equal(other.attributes) and self.table.is_equal(other.table)):
-            return False
-
-        compared_keys = _compare_dict_keys(old_dict=other._nodes, new_dict=self._nodes)
-        if compared_keys.only_old or compared_keys.only_new:
-            return False
-
-        for key in compared_keys.both:
-            if not self._nodes[key].is_equal(other._nodes[key]):
-                return False
-        return True
-
-    def count_entries(self) -> int:
-        return sum(
-            [
-                self.attributes.count_entries(),
-                self.table.count_entries(),
-            ]
-            + [node.count_entries() for node in self._nodes.values()]
-        )
-
-    def merge_with(self, other: object) -> StructuredDataNode:
-        if not isinstance(other, StructuredDataNode):
-            raise TypeError(f"Cannot compare {type(self)} with {type(other)}")
-
-        node = StructuredDataNode(name=self.name, path=self.path)
-
-        node.add_attributes(self.attributes.merge_with(other.attributes))
-        node.add_table(self.table.merge_with(other.table))
-
-        compared_keys = _compare_dict_keys(old_dict=other._nodes, new_dict=self._nodes)
-
-        for key in compared_keys.only_old:
-            node.add_node(other._nodes[key])
-
-        for key in compared_keys.both:
-            node.add_node(self._nodes[key].merge_with(other._nodes[key]))
-
-        for key in compared_keys.only_new:
-            node.add_node(self._nodes[key])
-
-        return node
-
-    #   ---node methods---------------------------------------------------------
-
-    def setdefault_node(self, path: SDPath) -> StructuredDataNode:
-        if not path:
-            return self
-
-        name = path[0]
-        node = self._nodes.setdefault(name, StructuredDataNode(name=name, path=self.path + (name,)))
-        return node.setdefault_node(path[1:])
-
-    def add_node(self, node: StructuredDataNode) -> StructuredDataNode:
-        if not node.name:
-            raise ValueError("Root cannot be added.")
-
-        path = self.path + (node.name,)
-        if node.name in self._nodes:
-            the_node = self._nodes[node.name]
-            the_node.set_path(path)
-        else:
-            dflt_node = StructuredDataNode(name=node.name, path=path)
-            the_node = self._nodes.setdefault(node.name, dflt_node)
-
-        the_node.add_attributes(node.attributes)
-        the_node.add_table(node.table)
-
-        for sub_node in node._nodes.values():
-            the_node.add_node(sub_node)
-
-        return the_node
-
-    def add_attributes(self, attributes: Attributes) -> None:
-        self.attributes.set_retentions(attributes.retentions)
-        self.attributes.add_pairs(attributes.pairs)
-
-    def add_table(self, table: Table) -> None:
-        self.table.set_retentions(table.retentions)
-        self.table.add_key_columns(table.key_columns)
-        for ident, row in table._rows.items():
-            self.table.add_row(ident, row)
-
-    def get_node(self, path: SDPath) -> StructuredDataNode | None:
-        if not path:
-            return self
-        return None if (node := self._nodes.get(path[0])) is None else node.get_node(path[1:])
-
-    def get_table(self, path: SDPath) -> Table | None:
-        return None if (node := self.get_node(path)) is None else node.table
-
-    def get_attributes(self, path: SDPath) -> Attributes | None:
-        return None if (node := self.get_node(path)) is None else node.attributes
-
-    #   ---representation-------------------------------------------------------
-
-    def __repr__(self) -> str:
-        # Only used for repr/debug purposes
-        return f"{self.__class__.__name__}({pprint.pformat(self.serialize())})"
-
-    #   ---de/serializing-------------------------------------------------------
-
-    def serialize(self) -> SDRawTree:
-        return {
-            ATTRIBUTES_KEY: self.attributes.serialize(),
-            TABLE_KEY: self.table.serialize(),
-            _NODES_KEY: {name: node.serialize() for name, node in self._nodes.items()},
-        }
-
-    @classmethod
-    def deserialize(cls, raw_tree: SDRawTree) -> StructuredDataNode:
-        if all(key in raw_tree for key in (ATTRIBUTES_KEY, TABLE_KEY, _NODES_KEY)):
-            return cls._deserialize(name="", path=tuple(), raw_tree=raw_tree)
-        return cls._deserialize_legacy(name="", path=tuple(), raw_tree=raw_tree)
-
-    @classmethod
-    def _deserialize(
-        cls,
-        *,
-        name: SDNodeName,
-        path: SDPath,
-        raw_tree: SDRawTree,
-    ) -> StructuredDataNode:
-        node = cls(name=name, path=path)
-
-        node.add_attributes(Attributes.deserialize(path=path, raw_pairs=raw_tree[ATTRIBUTES_KEY]))
-        node.add_table(Table.deserialize(path=path, raw_rows=raw_tree[TABLE_KEY]))
-
-        for raw_name, raw_node in raw_tree[_NODES_KEY].items():
-            node.add_node(
-                cls._deserialize(
-                    name=raw_name,
-                    path=path + (raw_name,),
-                    raw_tree=raw_node,
-                )
-            )
-
-        return node
-
-    @classmethod
-    def _deserialize_legacy(
-        cls,
-        *,
-        name: SDNodeName,
-        path: SDPath,
-        raw_tree: SDRawTree,
-    ) -> StructuredDataNode:
-        node = cls(name=name, path=path)
-        raw_pairs: SDPairs = {}
-
-        for key, value in raw_tree.items():
-            the_path = path + (key,)
-            if isinstance(value, dict):
-                if not value:
-                    continue
-                node.add_node(cls._deserialize_legacy(name=key, path=the_path, raw_tree=value))
-
-            elif isinstance(value, list):
-                if not value:
-                    continue
-
-                inst = node.setdefault_node((key,))
-                if node._is_table(value):
-                    inst.add_table(Table._deserialize_legacy(path=the_path, legacy_rows=value))
-                    continue
-
-                for idx, entry in enumerate(value):
-                    inst.add_node(
-                        cls._deserialize_legacy(
-                            name=str(idx),
-                            path=the_path + (str(idx),),
-                            raw_tree=entry,
-                        )
-                    )
-
-            else:
-                raw_pairs.setdefault(key, value)
-
-        node.add_attributes(Attributes._deserialize_legacy(path=path, legacy_pairs=raw_pairs))
-        return node
-
-    @staticmethod
-    def _is_table(entries: list) -> bool:
-        # Either we get:
-        #   [
-        #       {"column1": "value 11", "column2": "value 12",...},
-        #       {"column1": "value 11", "column2": "value 12",...},
-        #       ...
-        #   ]
-        # Or:
-        #   [
-        #       {"attr": "attr1", "table": [...], "node": {...}, "idx-node": [...]},
-        #       ...
-        #   ]
-        return all(not isinstance(v, (list, dict)) for row in entries for v in row.values())
-
-    #   ---delta----------------------------------------------------------------
-
-    def compare_with(self, other: object) -> DeltaStructuredDataNode:
-        if not isinstance(other, StructuredDataNode):
-            raise TypeError(f"Cannot compare {type(self)} with {type(other)}")
-
-        delta_nodes: dict[SDNodeName, DeltaStructuredDataNode] = {}
-
-        compared_keys = _compare_dict_keys(old_dict=other._nodes, new_dict=self._nodes)
-
-        for key in compared_keys.only_new:
-            node = self._nodes[key]
-            if node.count_entries():
-                delta_nodes[key] = DeltaStructuredDataNode.make_from_node(
-                    node=node,
-                    encode_as=_new_delta_tree_node,
-                )
-
-        for key in compared_keys.both:
-            node = self._nodes[key]
-            other_node = other._nodes[key]
-            if node.is_equal(other_node):
-                continue
-
-            delta_node_result = node.compare_with(other_node)
-            if delta_node_result.count_entries():
-                delta_nodes[key] = delta_node_result
-
-        for key in compared_keys.only_old:
-            other_node = other._nodes[key]
-            if other_node.count_entries():
-                delta_nodes[key] = DeltaStructuredDataNode.make_from_node(
-                    node=other_node,
-                    encode_as=_removed_delta_tree_node,
-                )
-
-        return DeltaStructuredDataNode(
-            name=self.name,
-            path=self.path,
-            attributes=self.attributes.compare_with(other.attributes),
-            table=self.table.compare_with(other.table),
-            _nodes=delta_nodes,
-        )
-
-    #   ---filtering------------------------------------------------------------
-
-    def get_filtered_node(self, filters: list[SDFilter]) -> StructuredDataNode:
-        filtered = StructuredDataNode(name=self.name, path=self.path)
-
-        for f in filters:
-            # First check if node exists
-            node = self.get_node(f.path)
-            if node is None:
-                continue
-
-            filtered_node = filtered.setdefault_node(f.path)
-
-            filtered_node.add_attributes(
-                node.attributes.get_filtered_attributes(f.filter_attributes)
-            )
-            filtered_node.add_table(node.table.get_filtered_table(f.filter_columns))
-
-            for name, sub_node in node._nodes.items():
-                # From GUI::permitted_paths: We always get a list of strs.
-                if f.filter_nodes(str(name)):
-                    filtered_node.add_node(sub_node)
-
-        return filtered
-
-
-# TODO Table: {IDENT: Attributes}?
-
-TableRetentions = dict[SDRowIdent, RetentionIntervalsByKeys]
-
-
-class Table:
-    def __init__(
-        self,
-        *,
-        path: SDPath | None = None,
-        key_columns: SDKeyColumns | None = None,
-        retentions: TableRetentions | None = None,
-    ) -> None:
-        self.path = path if path else tuple()
-        self.key_columns = key_columns if key_columns else []
-        self.retentions = retentions if retentions else {}
-        self._rows: SDRows = {}
-
-    def set_path(self, path: SDPath) -> None:
-        self.path = path
-
-    def add_key_columns(self, key_columns: SDKeyColumns) -> None:
-        if not self.key_columns:
-            self.key_columns = key_columns
-
-    @property
-    def rows(self) -> list[SDRow]:
-        return list(self._rows.values())
-
-    #   ---common methods-------------------------------------------------------
-
-    def is_empty(self) -> bool:
-        return not self._rows
-
-    def is_equal(self, other: object) -> bool:
-        if not isinstance(other, Table):
-            raise TypeError(f"Cannot compare {type(self)} with {type(other)}")
-
-        compared_keys = _compare_dict_keys(old_dict=other._rows, new_dict=self._rows)
-        if compared_keys.only_old or compared_keys.only_new:
-            return False
-
-        for key in compared_keys.both:
-            if self._rows[key] != other._rows[key]:
-                return False
-        return True
-
-    def count_entries(self) -> int:
-        return sum(map(len, self._rows.values()))
-
-    def merge_with(self, other: object) -> Table:
-        if not isinstance(other, Table):
-            raise TypeError(f"Cannot compare {type(self)} with {type(other)}")
-
-        if self.key_columns == other.key_columns:
-            return self._merge_with(other)
-        return self._merge_with_legacy(other)
-
-    def _merge_with(self, other: Table) -> Table:
-        table = Table(
-            path=self.path,
-            key_columns=self.key_columns,
-            retentions={
-                **self.retentions,
-                **other.retentions,
-            },
-        )
-
-        compared_keys = _compare_dict_keys(old_dict=other._rows, new_dict=self._rows)
-
-        for key in compared_keys.only_old:
-            table.add_row(key, other._rows[key])
-
-        for key in compared_keys.both:
-            table.add_row(key, {**self._rows[key], **other._rows[key]})
-
-        for key in compared_keys.only_new:
-            table.add_row(key, self._rows[key])
-
-        return table
-
-    def _merge_with_legacy(self, other: Table) -> Table:
-        table = Table(
-            path=self.path,
-            key_columns=sorted(set(self.key_columns).intersection(other.key_columns)),
-            retentions={
-                **self.retentions,
-                **other.retentions,
-            },
-        )
-
-        # Re-calculates row identifiers
-        table.add_rows(list(self._rows.values()))
-        table.add_rows(list(other._rows.values()))
-
-        return table
-
-    #   ---table methods--------------------------------------------------------
-
-    def add_rows(self, rows: Iterable[SDRow]) -> None:
-        for row in rows:
-            self.add_row(self._make_row_ident(row), row)
-
-    def _make_row_ident(self, row: SDRow) -> SDRowIdent:
-        return tuple(row[k] for k in self.key_columns if k in row)
-
-    def add_row(self, ident: SDRowIdent, row: SDRow) -> None:
-        if not self.key_columns:
-            raise ValueError("Cannot add row due to missing key_columns")
-
-        if not row:
-            return
-
-        self._rows.setdefault(ident, {}).update(row)
-
-    def get_row(self, row: SDRow) -> SDRow:
-        ident = self._make_row_ident(row)
-        if ident in self.retentions:
-            return {k: row[k] for k in self.retentions[ident] if k in row}
-        return row
-
-    #   ---retentions-----------------------------------------------------------
-
-    def update_from_previous(  # pylint: disable=too-many-branches
-        self,
-        now: int,
-        other: object,
-        filter_func: SDFilterFunc,
-        inv_intervals: RetentionIntervals,
-    ) -> UpdateResult:
-        if not isinstance(other, Table):
-            raise TypeError(f"Cannot update {type(self)} from {type(other)}")
-
-        self.add_key_columns(other.key_columns)
-
-        old_filtered_rows = {
-            ident: filtered_row
-            for ident, row in other._rows.items()
-            if (
-                filtered_row := _get_filtered_dict(
-                    row,
-                    _make_retentions_filter_func(
-                        filter_func=filter_func,
-                        intervals_by_keys=other.retentions.get(ident),
-                        now=now,
-                    ),
-                )
-            )
-        }
-        self_filtered_rows = {
-            ident: filtered_row
-            for ident, row in self._rows.items()
-            if (filtered_row := _get_filtered_dict(row, filter_func))
-        }
-        compared_filtered_idents = _compare_dict_keys(
-            old_dict=old_filtered_rows,
-            new_dict=self_filtered_rows,
-        )
-
-        retentions: TableRetentions = {}
-        update_result = UpdateResult()
-        for ident in compared_filtered_idents.only_old:
-            old_row: SDRow = {}
-            for key, value in old_filtered_rows[ident].items():
-                old_row.setdefault(key, value)
-                retentions.setdefault(ident, {})[key] = other.retentions[ident][key]
-
-            if old_row:
-                # Update row with key column entries
-                old_row.update({k: other._rows[ident][k] for k in other.key_columns})
-                self.add_row(ident, old_row)
-                update_result.add_row_reason(self.path, ident, "row", old_row)
-
-        for ident in compared_filtered_idents.both:
-            compared_filtered_keys = _compare_dict_keys(
-                old_dict=old_filtered_rows[ident],
-                new_dict=self_filtered_rows[ident],
-            )
-            row: SDRow = {}
-            for key in compared_filtered_keys.only_old:
-                row.setdefault(key, other._rows[ident][key])
-                retentions.setdefault(ident, {})[key] = other.retentions[ident][key]
-
-            for key in compared_filtered_keys.both.union(compared_filtered_keys.only_new):
-                retentions.setdefault(ident, {})[key] = inv_intervals
-
-            if row:
-                # Update row with key column entries
-                row.update(
-                    {
-                        **{k: other._rows[ident][k] for k in other.key_columns},
-                        **{k: self._rows[ident][k] for k in self.key_columns},
-                    }
-                )
-                self.add_row(ident, row)
-                update_result.add_row_reason(self.path, ident, "row", row)
-
-        for ident in compared_filtered_idents.only_new:
-            for key in self_filtered_rows[ident]:
-                retentions.setdefault(ident, {})[key] = inv_intervals
-
-        if retentions:
-            self.set_retentions(retentions)
-            for ident, intervals in retentions.items():
-                update_result.add_row_reason(self.path, ident, "intervals", intervals)
-
-        return update_result
-
-    def set_retentions(self, table_retentions: TableRetentions) -> None:
-        self.retentions = table_retentions
-
-    def get_retention_intervals(self, key: SDKey, row: SDRow) -> RetentionIntervals | None:
-        return self.retentions.get(self._make_row_ident(row), {}).get(key)
-
-    #   ---representation-------------------------------------------------------
-
-    def __repr__(self) -> str:
-        # Only used for repr/debug purposes
-        return f"{self.__class__.__name__}({pprint.pformat(self.serialize())})"
-
-    #   ---de/serializing-------------------------------------------------------
-
-    def serialize(self) -> SDRawTree:
-        raw_table = {}
-        if self._rows:
-            raw_table.update(
-                {
-                    _KEY_COLUMNS_KEY: self.key_columns,
-                    _ROWS_KEY: list(self._rows.values()),
-                }
-            )
-
-        if self.retentions:
-            raw_table[_RETENTIONS_KEY] = {
-                ident: _serialize_retentions(intervals)
-                for ident, intervals in self.retentions.items()
-            }
-        return raw_table
-
-    @classmethod
-    def deserialize(cls, *, path: SDPath, raw_rows: SDRawTree) -> Table:
-        rows = raw_rows.get(_ROWS_KEY, [])
-        if _KEY_COLUMNS_KEY in raw_rows:
-            key_columns = raw_rows[_KEY_COLUMNS_KEY]
-        else:
-            key_columns = cls._get_default_key_columns(rows)
-
-        table = cls(
-            path=path,
-            key_columns=key_columns,
-            retentions={
-                ident: _deserialize_retentions(raw_intervals)
-                for ident, raw_intervals in raw_rows.get(_RETENTIONS_KEY, {}).items()
-            },
-        )
-        table.add_rows(rows)
-        return table
-
-    @classmethod
-    def _deserialize_legacy(cls, *, path: SDPath, legacy_rows: LegacyRows) -> Table:
-        table = cls(
-            path=path,
-            key_columns=cls._get_default_key_columns(legacy_rows),
-        )
-        table.add_rows(legacy_rows)
-        return table
-
-    @staticmethod
-    def _get_default_key_columns(rows: list[SDRow]) -> SDKeyColumns:
-        return sorted({k for r in rows for k in r})
-
-    #   ---delta----------------------------------------------------------------
-
-    def compare_with(self, other: object) -> DeltaTable:
-        if not isinstance(other, Table):
-            raise TypeError(f"Cannot compare {type(self)} with {type(other)}")
-
-        key_columns = sorted(set(self.key_columns).union(other.key_columns))
-        compared_keys = _compare_dict_keys(old_dict=other._rows, new_dict=self._rows)
-
-        delta_rows: list[dict[SDKey, tuple[SDValue | None, SDValue | None]]] = []
-
-        for key in compared_keys.only_old:
-            delta_rows.append({k: _removed_delta_tree_node(v) for k, v in other._rows[key].items()})
-
-        for key in compared_keys.both:
-            # Note: Rows which have at least one change also provide all other fields.
-            # Example:
-            # If the version of a package (below "Software > Packages") has changed from 1.0 to 2.0
-            # then it would be very annoying if the rest of the row is not shown.
-            if (
-                compared_dict_result := _compare_dicts(
-                    old_dict=other._rows[key],
-                    new_dict=self._rows[key],
-                    keep_identical=True,
-                )
-            ).has_changes:
-                delta_rows.append(compared_dict_result.result_dict)
-
-        for key in compared_keys.only_new:
-            delta_rows.append({k: _new_delta_tree_node(v) for k, v in self._rows[key].items()})
-
-        return DeltaTable(
-            path=self.path,
-            key_columns=key_columns,
-            rows=delta_rows,
-        )
-
-    #   ---filtering------------------------------------------------------------
-
-    def get_filtered_table(self, filter_func: SDFilterFunc) -> Table:
-        table = Table(path=self.path, key_columns=self.key_columns, retentions=self.retentions)
-        for ident, row in self._rows.items():
-            table.add_row(ident, _get_filtered_dict(row, filter_func))
-        return table
-
-
-class Attributes:
-    def __init__(
-        self,
-        *,
-        path: SDPath | None = None,
-        retentions: RetentionIntervalsByKeys | None = None,
-    ) -> None:
-        self.path = path if path else tuple()
-        self.retentions = retentions if retentions else {}
-        self.pairs: SDPairs = {}
-
-    def set_path(self, path: SDPath) -> None:
-        self.path = path
-
-    #   ---common methods-------------------------------------------------------
-
-    def is_empty(self) -> bool:
-        return self.pairs == {}
-
-    def is_equal(self, other: object) -> bool:
-        if not isinstance(other, Attributes):
-            raise TypeError(f"Cannot compare {type(self)} with {type(other)}")
-
-        return self.pairs == other.pairs
-
-    def count_entries(self) -> int:
-        return len(self.pairs)
-
-    def merge_with(self, other: object) -> Attributes:
-        if not isinstance(other, Attributes):
-            raise TypeError(f"Cannot compare {type(self)} with {type(other)}")
-
-        attributes = Attributes(
-            path=self.path,
-            retentions={
-                **self.retentions,
-                **other.retentions,
-            },
-        )
-        attributes.add_pairs(self.pairs)
-        attributes.add_pairs(other.pairs)
-
-        return attributes
-
-    #   ---attributes methods---------------------------------------------------
-
-    def add_pairs(self, pairs: SDPairs | SDPairsFromPlugins) -> None:
-        self.pairs.update(pairs)
-
-    #   ---retentions-----------------------------------------------------------
-
-    def update_from_previous(
-        self,
-        now: int,
-        other: object,
-        filter_func: SDFilterFunc,
-        inv_intervals: RetentionIntervals,
-    ) -> UpdateResult:
-        if not isinstance(other, Attributes):
-            raise TypeError(f"Cannot update {type(self)} from {type(other)}")
-
-        compared_filtered_keys = _compare_dict_keys(
-            old_dict=_get_filtered_dict(
-                other.pairs,
-                _make_retentions_filter_func(
-                    filter_func=filter_func,
-                    intervals_by_keys=other.retentions,
-                    now=now,
-                ),
-            ),
-            new_dict=_get_filtered_dict(self.pairs, filter_func),
-        )
-
-        pairs: SDPairs = {}
-        retentions: RetentionIntervalsByKeys = {}
-        for key in compared_filtered_keys.only_old:
-            pairs.setdefault(key, other.pairs[key])
-            retentions[key] = other.retentions[key]
-
-        for key in compared_filtered_keys.both.union(compared_filtered_keys.only_new):
-            retentions[key] = inv_intervals
-
-        update_result = UpdateResult()
-        if pairs:
-            self.add_pairs(pairs)
-            update_result.add_attr_reason(self.path, "pairs", pairs)
-
-        if retentions:
-            self.set_retentions(retentions)
-            update_result.add_attr_reason(self.path, "intervals", retentions)
-
-        return update_result
-
-    def set_retentions(self, intervals_by_keys: RetentionIntervalsByKeys) -> None:
-        self.retentions = intervals_by_keys
-
-    def get_retention_intervals(self, key: SDKey) -> RetentionIntervals | None:
-        return self.retentions.get(key)
-
-    #   ---representation-------------------------------------------------------
-
-    def __repr__(self) -> str:
-        # Only used for repr/debug purposes
-        return f"{self.__class__.__name__}({pprint.pformat(self.serialize())})"
-
-    #   ---de/serializing-------------------------------------------------------
-
-    def serialize(self) -> SDRawTree:
-        raw_attributes = {}
-        if self.pairs:
-            raw_attributes[_PAIRS_KEY] = self.pairs
-
-        if self.retentions:
-            raw_attributes[_RETENTIONS_KEY] = _serialize_retentions(self.retentions)
-        return raw_attributes
-
-    @classmethod
-    def deserialize(cls, *, path: SDPath, raw_pairs: SDRawTree) -> Attributes:
-        attributes = cls(
-            path=path,
-            retentions=_deserialize_retentions(raw_pairs.get(_RETENTIONS_KEY)),
-        )
-        attributes.add_pairs(raw_pairs.get(_PAIRS_KEY, {}))
-        return attributes
-
-    @classmethod
-    def _deserialize_legacy(cls, *, path: SDPath, legacy_pairs: LegacyPairs) -> Attributes:
-        attributes = cls(path=path)
-        attributes.add_pairs(legacy_pairs)
-        return attributes
-
-    #   ---delta----------------------------------------------------------------
-
-    def compare_with(self, other: object) -> DeltaAttributes:
-        if not isinstance(other, Attributes):
-            raise TypeError(f"Cannot compare {type(self)} with {type(other)}")
-
-        return DeltaAttributes(
-            path=self.path,
-            pairs=_compare_dicts(
-                old_dict=other.pairs,
-                new_dict=self.pairs,
-                keep_identical=False,
-            ).result_dict,
-        )
-
-    #   ---filtering------------------------------------------------------------
-
-    def get_filtered_attributes(self, filter_func: SDFilterFunc) -> Attributes:
-        attributes = Attributes(path=self.path, retentions=self.retentions)
-        attributes.add_pairs(_get_filtered_dict(self.pairs, filter_func))
-        return attributes
-
-
-# .
-#   .--delta tree----------------------------------------------------------.
-#   |                  _      _ _          _                               |
-#   |               __| | ___| | |_ __ _  | |_ _ __ ___  ___               |
-#   |              / _` |/ _ \ | __/ _` | | __| '__/ _ \/ _ \              |
-#   |             | (_| |  __/ | || (_| | | |_| | |  __/  __/              |
-#   |              \__,_|\___|_|\__\__,_|  \__|_|  \___|\___|              |
-#   |                                                                      |
-#   '----------------------------------------------------------------------'
-
-
-@dataclass(frozen=True)
-class DeltaStructuredDataNode:
-    name: SDNodeName
-    path: SDPath
-    attributes: DeltaAttributes
-    table: DeltaTable
-    _nodes: dict[SDNodeName, DeltaStructuredDataNode]
-
-    @classmethod
-    def make_from_node(
-        cls, *, node: StructuredDataNode, encode_as: SDEncodeAs
-    ) -> DeltaStructuredDataNode:
-        return cls(
-            name=node.name,
-            path=node.path,
-            attributes=DeltaAttributes.make_from_attributes(
-                attributes=node.attributes,
-                encode_as=encode_as,
-            ),
-            table=DeltaTable.make_from_table(
-                table=node.table,
-                encode_as=encode_as,
-            ),
-            _nodes={
-                child.name: cls.make_from_node(
-                    node=child,
-                    encode_as=encode_as,
-                )
-                for child in node.nodes
-            },
-        )
-
-    def is_empty(self) -> bool:
-        if not (self.attributes.is_empty() and self.table.is_empty()):
-            return False
-
-        for node in self._nodes.values():
-            if not node.is_empty():
-                return False
-        return True
-
-    def get_node(self, path: SDPath) -> DeltaStructuredDataNode | None:
-        if not path:
-            return self
-        node = self._nodes.get(path[0])
-        return None if node is None else node.get_node(path[1:])
-
-    @property
-    def nodes(self) -> Iterator[DeltaStructuredDataNode]:
-        yield from self._nodes.values()
-
-    def serialize(self) -> SDRawDeltaTree:
-        return {
-            "Attributes": self.attributes.serialize(),
-            "Table": self.table.serialize(),
-            "Nodes": {node.name: node.serialize() for node in self._nodes.values()},
-        }
-
-    @classmethod
-    def deserialize(cls, raw_delta_tree: object) -> DeltaStructuredDataNode:
-        return cls._deserialize(name="", path=tuple(), raw_delta_tree=raw_delta_tree)
-
-    @classmethod
-    def _deserialize(
-        cls, *, name: SDNodeName, path: SDPath, raw_delta_tree: object
-    ) -> DeltaStructuredDataNode:
-        if not isinstance(raw_delta_tree, dict):
-            raise TypeError()
-        return cls(
-            name=name,
-            path=path,
-            attributes=DeltaAttributes.deserialize(
-                path=path,
-                raw_delta_attributes=raw_delta_tree.get("Attributes", {}),
-            ),
-            table=DeltaTable.deserialize(
-                path=path,
-                raw_delta_table=raw_delta_tree.get("Table", {}),
-            ),
-            _nodes={
-                raw_node_name: cls._deserialize(
-                    name=raw_node_name,
-                    path=path + (raw_node_name,),
-                    raw_delta_tree=raw_node,
-                )
-                for raw_node_name, raw_node in raw_delta_tree.get("Nodes", {}).items()
-            },
-        )
-
-    def count_entries(self) -> SDDeltaCounter:
-        counter: SDDeltaCounter = Counter()
-        counter.update(self.attributes.count_entries())
-        counter.update(self.table.count_entries())
-        for node in self._nodes.values():
-            counter.update(node.count_entries())
-        return counter
-
-
-@dataclass(frozen=True)
-class DeltaTable:
-    path: SDPath
-    key_columns: list[SDKey]
-    rows: list[dict[SDKey, tuple[SDValue, SDValue]]]
-
-    @classmethod
-    def make_from_table(cls, *, table: Table, encode_as: SDEncodeAs) -> DeltaTable:
-        return cls(
-            path=table.path,
-            key_columns=table.key_columns,
-            rows=[{key: encode_as(value) for key, value in row.items()} for row in table.rows],
-        )
-
-    def is_empty(self) -> bool:
-        return not self.rows
-
-    def serialize(self) -> SDRawDeltaTree:
-        return {"KeyColumns": self.key_columns, "Rows": self.rows} if self.rows else {}
-
-    @classmethod
-    def deserialize(cls, *, path: SDPath, raw_delta_table: object) -> DeltaTable:
-        if not isinstance(raw_delta_table, dict):
-            raise TypeError()
-        return cls(
-            path=path,
-            key_columns=raw_delta_table.get("KeyColumns", []),
-            rows=raw_delta_table.get("Rows", []),
-        )
-
-    def count_entries(self) -> SDDeltaCounter:
-        counter: SDDeltaCounter = Counter()
-        for row in self.rows:
-            counter.update(_count_dict_entries(row))
-        return counter
-
-
-@dataclass(frozen=True)
-class DeltaAttributes:
-    path: SDPath
-    pairs: dict[SDKey, tuple[SDValue, SDValue]]
-
-    @classmethod
-    def make_from_attributes(
-        cls, *, attributes: Attributes, encode_as: SDEncodeAs
-    ) -> DeltaAttributes:
-        return cls(
-            path=attributes.path,
-            pairs={key: encode_as(value) for key, value in attributes.pairs.items()},
-        )
-
-    def is_empty(self) -> bool:
-        return self.pairs == {}
-
-    def serialize(self) -> SDRawDeltaTree:
-        return {"Pairs": self.pairs} if self.pairs else {}
-
-    @classmethod
-    def deserialize(cls, *, path: SDPath, raw_delta_attributes: object) -> DeltaAttributes:
-        if not isinstance(raw_delta_attributes, dict):
-            raise TypeError()
-        return cls(
-            path=path,
-            pairs=raw_delta_attributes.get("Pairs", {}),
-        )
-
-    def count_entries(self) -> SDDeltaCounter:
-        return _count_dict_entries(self.pairs)
-
-
-# .
-#   .--helpers-------------------------------------------------------------.
-#   |                  _          _                                        |
-#   |                 | |__   ___| |_ __   ___ _ __ ___                    |
-#   |                 | '_ \ / _ \ | '_ \ / _ \ '__/ __|                   |
-#   |                 | | | |  __/ | |_) |  __/ |  \__ \                   |
-#   |                 |_| |_|\___|_| .__/ \___|_|  |___/                   |
-#   |                              |_|                                     |
-#   '----------------------------------------------------------------------'
-
-
-class ComparedDictResult(NamedTuple):
-    result_dict: dict[SDKey, tuple[SDValue | None, SDValue | None]]
-    has_changes: bool
-
-
-def _compare_dicts(*, old_dict: dict, new_dict: dict, keep_identical: bool) -> ComparedDictResult:
-    """
-    Format of compared entries:
-      new:          {k: (None, new_value), ...}
-      changed:      {k: (old_value, new_value), ...}
-      removed:      {k: (old_value, None), ...}
-      identical:    {k: (value, value), ...}
-    """
-    compared_keys = _compare_dict_keys(old_dict=old_dict, new_dict=new_dict)
-    compared_dict: dict[SDKey, tuple[SDValue | None, SDValue | None]] = {}
-
-    has_changes = False
-    for k in compared_keys.both:
-        if (new_value := new_dict[k]) != (old_value := old_dict[k]):
-            compared_dict.setdefault(k, _changed_delta_tree_node(old_value, new_value))
-            has_changes = True
-        elif keep_identical:
-            compared_dict.setdefault(k, _identical_delta_tree_node(old_value))
-
-    compared_dict.update({k: _new_delta_tree_node(new_dict[k]) for k in compared_keys.only_new})
-    compared_dict.update({k: _removed_delta_tree_node(old_dict[k]) for k in compared_keys.only_old})
-
-    return ComparedDictResult(
-        result_dict=compared_dict,
-        has_changes=bool(has_changes or compared_keys.only_new or compared_keys.only_old),
-    )
-
-
-class ComparedDictKeys(NamedTuple):
-    only_old: set
-    both: set
-    only_new: set
-
-
-def _compare_dict_keys(*, old_dict: dict, new_dict: dict) -> ComparedDictKeys:
-    """
-    Returns the set relationships of the keys between two dictionaries:
-    - relative complement of new_dict in old_dict
-    - intersection of both
-    - relative complement of old_dict in new_dict
-    """
-    old_keys, new_keys = set(old_dict), set(new_dict)
-    return ComparedDictKeys(
-        only_old=old_keys - new_keys,
-        both=old_keys.intersection(new_keys),
-        only_new=new_keys - old_keys,
-    )
-
-
-def _make_retentions_filter_func(
-    *,
-    filter_func: SDFilterFunc,
-    intervals_by_keys: RetentionIntervalsByKeys | None,
-    now: int,
-) -> SDFilterFunc:
-    return lambda k: bool(
-        filter_func(k)
-        and intervals_by_keys
-        and (intervals := intervals_by_keys.get(k))
-        and now <= intervals.keep_until
-    )
-
-
-def _get_filtered_dict(dict_: dict, filter_func: SDFilterFunc) -> dict:
-    return {k: v for k, v in dict_.items() if filter_func(k)}
-
-
-def _count_dict_entries(dict_: dict[SDKey, tuple[SDValue, SDValue]]) -> SDDeltaCounter:
-    counter: SDDeltaCounter = Counter()
-    for value0, value1 in dict_.values():
-        match [value0 is None, value1 is None]:
-            case [True, False]:
-                counter["new"] += 1
-            case [False, True]:
-                counter["removed"] += 1
-            case [False, False] if value0 != value1:
-                counter["changed"] += 1
-    return counter
-
-
-def _new_delta_tree_node(value: SDValue) -> tuple[None, SDValue]:
-    return (None, value)
-
-
-def _removed_delta_tree_node(value: SDValue) -> tuple[SDValue, None]:
-    return (value, None)
-
-
-def _changed_delta_tree_node(old_value: SDValue, new_value: SDValue) -> tuple[SDValue, SDValue]:
-    return (old_value, new_value)
-
-
-def _identical_delta_tree_node(value: SDValue) -> tuple[SDValue, SDValue]:
-    return (value, value)
-
-
-def parse_visible_raw_path(raw_path: str) -> SDPath:
-    return tuple(part for part in raw_path.split(".") if part)
-
-
-def _serialize_retentions(
-    intervals_by_keys: RetentionIntervalsByKeys,
-) -> RawRetentionIntervalsByKeys:
-    return {key: intervals.serialize() for key, intervals in intervals_by_keys.items()}
-
-
-def _deserialize_retentions(
-    raw_intervals_by_keys: RawRetentionIntervalsByKeys | None,
-) -> RetentionIntervalsByKeys:
-    if not raw_intervals_by_keys:
-        return {}
-    return {
-        key: RetentionIntervals.deserialize(intervals)
-        for key, intervals in raw_intervals_by_keys.items()
-    }

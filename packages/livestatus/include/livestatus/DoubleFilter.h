@@ -8,15 +8,13 @@
 
 #include <chrono>
 #include <functional>
-#include <memory>
 #include <string>
 
 #include "livestatus/ColumnFilter.h"
-#include "livestatus/Filter.h"
-#include "livestatus/opids.h"
+
 class Logger;
+enum class RelationalOperator;
 class Row;
-class User;
 
 class DoubleFilter : public ColumnFilter {
 public:

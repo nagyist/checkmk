@@ -35,8 +35,7 @@ std::unique_ptr<Renderer> Renderer::make(OutputFormat format, std::ostream &os,
 }
 
 void Renderer::output(double value) {
-    // Funny cast for older non-C++11 headers
-    if (static_cast<bool>(std::isnan(value))) {
+    if (std::isnan(value)) {
         output(Null());
     } else {
         _os << value;
@@ -46,13 +45,14 @@ void Renderer::output(double value) {
 void Renderer::output(const RowFragment &value) { _os << value._str; }
 
 void Renderer::outputUnicodeChar(char32_t value) {
-    if (value < 0x10000U) {
-        outputHex('u', 4, value);
+    const uint_least32_t number{value};
+    if (number < 0x10000U) {
+        outputHex('u', 4, number);
     } else if (useSurrogatePairs()) {
-        outputHex('u', 4, 0xd800U | (((value - 0x10000U) >> 10) & 0x3ffU));
-        outputHex('u', 4, 0xdc00U | ((value - 0x10000U) & 0x3ffU));
+        outputHex('u', 4, 0xd800U | (((number - 0x10000U) >> 10) & 0x3ffU));
+        outputHex('u', 4, 0xdc00U | ((number - 0x10000U) & 0x3ffU));
     } else {
-        outputHex('U', 8, value);
+        outputHex('U', 8, number);
     }
 }
 
@@ -121,7 +121,9 @@ void Renderer::outputUnicodeString(const char *start, const char *end,
     _os << R"(")";  // "
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void Renderer::outputUTF8(const char *start, const char *end) {
+    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-pointer-arithmetic)
     for (const char *p = start; p != end; ++p) {
         const unsigned char ch0 = *p;
         if ((ch0 & 0x80) == 0x00) {
@@ -215,6 +217,7 @@ void Renderer::outputMixed(const char *start, const char *end) {
                 return truncatedUTF8();
             }
             const unsigned char ch1 = *++p;
+            // NOLINTEND(cppcoreguidelines-pro-bounds-pointer-arithmetic)
             if ((ch1 & 0xC0) != 0x80) {
                 return invalidUTF8(ch1);
             }

@@ -9,20 +9,23 @@ of the dashboard to render is given in the HTML variable 'name'.
 
 import copy
 import json
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal
 
-import cmk.utils.version as cmk_version
-from cmk.utils.exceptions import MKException
-from cmk.utils.type_defs import UserId
+import cmk.ccc.version as cmk_version
+from cmk.ccc.exceptions import MKException
 
-import cmk.gui.crash_handler as crash_handler
-import cmk.gui.pages
-import cmk.gui.visuals as visuals
+from cmk.utils import paths
+from cmk.utils.user import UserId
+
+from cmk.gui import crash_handler, visuals
 from cmk.gui.breadcrumb import Breadcrumb
+from cmk.gui.crash_handler import GUIDetails
 from cmk.gui.exceptions import MKAuthException, MKMissingDataError, MKUserError
+from cmk.gui.graphing._utils import MKCombinedGraphLimitExceededError
+from cmk.gui.hooks import call as call_hooks
 from cmk.gui.htmllib.generator import HTMLWriter
 from cmk.gui.htmllib.header import make_header
 from cmk.gui.htmllib.html import html
@@ -41,18 +44,18 @@ from cmk.gui.page_menu import (
     PageMenuSidePopup,
     PageMenuTopic,
 )
-from cmk.gui.plugins.metrics.utils import MKCombinedGraphLimitExceededError
-from cmk.gui.plugins.visuals.utils import Filter
 from cmk.gui.type_defs import InfoName, VisualContext
-from cmk.gui.utils.html import HTML, HTMLInput
+from cmk.gui.utils.filter import check_if_non_default_filter_in_request
+from cmk.gui.utils.html import HTML
 from cmk.gui.utils.ntop import is_ntop_configured
 from cmk.gui.utils.output_funnel import output_funnel
-from cmk.gui.utils.urls import makeuri, makeuri_contextless, urlencode
-from cmk.gui.view import View
+from cmk.gui.utils.urls import makeuri, makeuri_contextless
 from cmk.gui.views.page_ajax_filters import ABCAjaxInitialFilters
-from cmk.gui.views.store import get_permitted_views
+from cmk.gui.visuals.info import visual_info_registry
 from cmk.gui.watolib.activate_changes import get_pending_changes_tooltip, has_pending_changes
+from cmk.gui.watolib.users import get_enabled_remote_sites_for_logged_in_user
 
+from ._network_topology import get_topology_context_and_filters
 from .breadcrumb import dashboard_breadcrumb
 from .builtin_dashboards import GROW, MAX
 from .dashlet import (
@@ -66,7 +69,14 @@ from .dashlet import (
     StaticTextDashlet,
     StaticTextDashletConfig,
 )
-from .store import get_permitted_dashboards, load_dashboard_with_cloning
+from .store import (
+    get_all_dashboards,
+    get_permitted_dashboards,
+    get_permitted_dashboards_by_owners,
+    load_dashboard,
+    save_all_dashboards,
+    save_and_replicate_all_dashboards,
+)
 from .type_defs import DashboardConfig, DashboardName
 
 __all__ = ["page_dashboard", "ajax_dashlet", "AjaxInitialDashboardFilters"]
@@ -86,7 +96,18 @@ def page_dashboard() -> None:
     if not name:
         name = _get_default_dashboard_name()
         request.set_var("name", name)  # make sure that URL context is always complete
-    draw_dashboard(name)
+
+    # If no owner is set, prioritize the user's own dashboard over the builtin ones
+    owner = (
+        o
+        if (o := request.get_validated_type_input(UserId, "owner")) is not None
+        else (
+            user.id
+            if user.id and user.id in get_permitted_dashboards_by_owners().get(name, [])
+            else UserId.builtin()
+        )
+    )
+    draw_dashboard(name, owner)
 
 
 def _get_default_dashboard_name() -> str:
@@ -96,7 +117,7 @@ def _get_default_dashboard_name() -> str:
 
     1. Those WITH the permission "see all hosts / service". Which are mainly administrative users.
 
-    These are starting with the main overview dashboard which either shows a site drill down snapin
+    These are starting with the main overview dashboard which either shows a site drill down snap-in
     (in case multiple sites are configured) or the hosts of their site (in case there is only a
     single site configured).
 
@@ -105,13 +126,13 @@ def _get_default_dashboard_name() -> str:
     They will see the dashboard that has been built for operators and is built to show only the host
     and service problems that are relevant for the user.
     """
-    if cmk_version.is_raw_edition():
+    if cmk_version.edition(paths.omd_root) is cmk_version.Edition.CRE:
         return "main"  # problems = main in raw edition
     return "main" if user.may("general.see_all") and user.may("dashboard.main") else "problems"
 
 
 # Actual rendering function
-def draw_dashboard(name: DashboardName) -> None:
+def draw_dashboard(name: DashboardName, owner: UserId) -> None:
     mode = "display"
     if request.var("edit") == "1":
         mode = "edit"
@@ -119,7 +140,24 @@ def draw_dashboard(name: DashboardName) -> None:
     if mode == "edit" and not user.may("general.edit_dashboards"):
         raise MKAuthException(_("You are not allowed to edit dashboards."))
 
-    board = load_dashboard_with_cloning(get_permitted_dashboards(), name, edit=mode == "edit")
+    need_replication = False
+    permitted_dashboards = get_permitted_dashboards()
+    board = load_dashboard(permitted_dashboards, name)
+
+    if mode == "edit" and board["owner"] == UserId.builtin():
+        # Trying to edit a built-in dashboard results in doing a copy
+        all_dashboards = get_all_dashboards()
+        active_user = user.id
+        assert active_user is not None
+        board = copy.deepcopy(board)
+        board["owner"] = active_user
+        board["public"] = False
+
+        all_dashboards[(active_user, name)] = board
+        permitted_dashboards[name] = board
+        save_all_dashboards()
+        need_replication = True
+
     board = _add_context_to_dashboard(board)
 
     # Like _dashboard_info_handler we assume that only host / service filters are relevant
@@ -138,7 +176,7 @@ def draw_dashboard(name: DashboardName) -> None:
         set(board["mandatory_context_filters"]), board["context"]
     )
 
-    dashlets = _get_dashlets(name, board)
+    dashlets = _get_dashlets(name, owner, board)
 
     missing_single_infos: set[InfoName] = set()
     unconfigured_single_infos: set[InfoName] = set()
@@ -156,6 +194,14 @@ def draw_dashboard(name: DashboardName) -> None:
             breadcrumb, name, board, board_context, unconfigured_single_infos, mode
         ),
     )
+
+    # replication is only needed if we have remote sites
+    if need_replication and get_enabled_remote_sites_for_logged_in_user(user):
+        save_and_replicate_all_dashboards(
+            makeuri(request, [("name", name), ("edit", "1" if mode == "edit" else "0")])
+        )
+
+    call_hooks("rmk_dashboard_banner", name)
 
     html.open_div(class_=["dashboard_%s" % name], id_="dashboard")  # Container of all dashlets
 
@@ -215,13 +261,13 @@ cmk.dashboard.register_event_handlers();
     html.body_end()  # omit regular footer with status icons, etc.
 
 
-def _get_dashlets(name: DashboardName, board: DashboardConfig) -> list[Dashlet]:
+def _get_dashlets(name: DashboardName, owner: UserId, board: DashboardConfig) -> list[Dashlet]:
     """Return dashlet instances of the dashboard"""
     dashlets: list[Dashlet] = []
     for nr, dashlet_spec in enumerate(board["dashlets"]):
         try:
             dashlet_type = get_dashlet_type(dashlet_spec)
-            dashlet = dashlet_type(name, board, nr, dashlet_spec)
+            dashlet = dashlet_type(name, owner, board, nr, dashlet_spec)
         except KeyError as e:
             info_text = (
                 _(
@@ -230,9 +276,9 @@ def _get_dashlets(name: DashboardName, board: DashboardConfig) -> list[Dashlet]:
                 )
                 % e
             )
-            dashlet = _fallback_dashlet(name, board, dashlet_spec, nr, info_text=info_text)
+            dashlet = _fallback_dashlet(name, owner, board, dashlet_spec, nr, info_text=info_text)
         except Exception:
-            dashlet = _fallback_dashlet(name, board, dashlet_spec, nr)
+            dashlet = _fallback_dashlet(name, owner, board, dashlet_spec, nr)
 
         dashlets.append(dashlet)
 
@@ -281,9 +327,9 @@ def dashlet_container(dashlet: Dashlet) -> Iterator[None]:
 
 def _render_dashlet(
     board: DashboardConfig, dashlet: Dashlet, is_update: bool, mtime: int
-) -> tuple[str | HTML, HTMLInput]:
-    content: HTMLInput = ""
-    title: str | HTML = ""
+) -> tuple[HTML | str, HTML | str]:
+    content: HTML | str = ""
+    title: HTML | str = ""
     missing_infos = visuals.missing_context_filters(
         set(board["mandatory_context_filters"]), board["context"]
     )
@@ -315,7 +361,7 @@ def _render_dashlet(
 
 def _render_dashlet_content(
     board: DashboardConfig, dashlet: Dashlet, is_update: bool, mtime: int
-) -> str:
+) -> HTML:
     with output_funnel.plugged():
         if is_update:
             dashlet.update()
@@ -332,10 +378,10 @@ def _render_dashlet_content(
                 "}" % board["mtime"]
             )
 
-        return output_funnel.drain()
+        return HTML.without_escaping(output_funnel.drain())
 
 
-def render_dashlet_exception_content(dashlet: Dashlet, e: Exception) -> HTMLInput:
+def render_dashlet_exception_content(dashlet: Dashlet, e: Exception) -> HTML | str:
     if isinstance(e, (MKMissingDataError, MKCombinedGraphLimitExceededError)):
         return html.render_message(str(e))
 
@@ -360,17 +406,27 @@ def render_dashlet_exception_content(dashlet: Dashlet, e: Exception) -> HTMLInpu
             return output_funnel.drain()
 
         crash_handler.handle_exception_as_gui_crash_report(
-            details={
-                "dashlet_id": dashlet.dashlet_id,
-                "dashlet_type": dashlet.type_name(),
-                "dashlet_spec": dashlet.dashlet_spec,
-            }
+            details=GUIDetails(
+                dashlet_id=dashlet.dashlet_id,
+                dashlet_type=dashlet.type_name(),
+                dashlet_spec=dashlet.dashlet_spec,
+                page="unknown",
+                vars={},
+                username=None,
+                user_agent="unknown",
+                referer="unknown",
+                is_mobile=False,
+                is_ssl_request=False,
+                language="unknown",
+                request_method="unknown",
+            )
         )
         return output_funnel.drain()
 
 
 def _fallback_dashlet(
     name: DashboardName,
+    owner: UserId,
     board: DashboardConfig,
     dashlet_spec: DashletConfig,
     dashlet_id: int,
@@ -380,6 +436,7 @@ def _fallback_dashlet(
     initialized"""
     return StaticTextDashlet(
         name,
+        owner,
         board,
         dashlet_id,
         StaticTextDashletConfig(
@@ -398,7 +455,7 @@ def _get_mandatory_filters(
 ) -> Iterable[str]:
     # Get required single info keys (the ones that are not set by the config)
     for info_key in unconfigured_single_infos:
-        for info, _unused in visuals.visual_info_registry[info_key]().single_spec:
+        for info, _unused in visual_info_registry[info_key]().single_spec:
             yield info
 
     # Get required context filters set in the dashboard config
@@ -459,13 +516,13 @@ def _page_menu(
         enable_suggestions=False,
     )
 
-    _extend_display_dropdown(menu, board, board_context, unconfigured_single_infos)
+    _extend_display_dropdown(name, menu, board, board_context, unconfigured_single_infos)
 
     return menu
 
 
-def _page_menu_dashboards(name) -> Iterable[PageMenuTopic]:  # type: ignore[no-untyped-def]
-    if cmk_version.is_raw_edition():
+def _page_menu_dashboards(name: DashboardName) -> Iterable[PageMenuTopic]:
+    if cmk_version.edition(paths.omd_root) is cmk_version.Edition.CRE:
         linked_dashboards = ["main", "checkmk"]  # problems = main in raw edition
     else:
         linked_dashboards = ["main", "problems", "checkmk"]
@@ -480,15 +537,17 @@ def _page_menu_dashboards(name) -> Iterable[PageMenuTopic]:  # type: ignore[no-u
     )
     yield PageMenuTopic(
         title=_("Customize"),
-        entries=[
-            PageMenuEntry(
-                title=_("Edit dashboards"),
-                icon_name="dashboard",
-                item=make_simple_link("edit_dashboards.py"),
-            )
-        ]
-        if user.may("general.edit_dashboards")
-        else [],
+        entries=(
+            [
+                PageMenuEntry(
+                    title=_("Edit dashboards"),
+                    icon_name="dashboard",
+                    item=make_simple_link("edit_dashboards.py"),
+                )
+            ]
+            if user.may("general.edit_dashboards")
+            else []
+        ),
     )
 
 
@@ -514,7 +573,7 @@ def _page_menu_topics(name: DashboardName) -> Iterator[PageMenuTopic]:
     )
 
     yield PageMenuTopic(
-        title=_("Inventory"),
+        title=_("HW/SW Inventory"),
         entries=list(_dashboard_add_inventory_dashlet_entries(name)),
     )
 
@@ -546,7 +605,7 @@ def _dashboard_edit_entries(
         # edit mode using javascript, use the URL with edit=1. When this URL is opened,
         # the dashboard will be cloned for this user
         yield PageMenuEntry(
-            title=_("Clone builtin dashboard"),
+            title=_("Clone built-in dashboard"),
             icon_name="edit",
             item=make_simple_link(makeuri(request, [("edit", 1)])),
         )
@@ -581,7 +640,7 @@ def _dashboard_edit_entries(
                 request,
                 [
                     ("load_name", name),
-                    ("back", urlencode(makeuri(request, []))),
+                    ("mode", "edit"),
                 ],
                 filename="edit_dashboard.py",
             )
@@ -594,7 +653,9 @@ def _dashboard_other_entries(
     linked_dashboards: Iterable[str],
 ) -> Iterable[PageMenuEntry]:
     ntop_not_configured = not is_ntop_configured()
-    for dashboard_name, dashboard in get_permitted_dashboards().items():
+    for dashboard_name, dashboard in sorted(
+        get_permitted_dashboards().items(), key=lambda x: x[1]["sort_index"]
+    ):
         if name in linked_dashboards and dashboard_name in linked_dashboards:
             continue
         if dashboard["hidden"]:
@@ -651,6 +712,7 @@ def _minimal_context(
 
 
 def _extend_display_dropdown(
+    name: str,
     menu: PageMenu,
     board: DashboardConfig,
     board_context: VisualContext,
@@ -664,6 +726,10 @@ def _extend_display_dropdown(
     # Like _dashboard_info_handler we assume that only host / service filters are relevant
     info_list = ["host", "service"]
 
+    is_filter_set = check_if_non_default_filter_in_request(
+        AjaxInitialDashboardFilters().get_context(page_name=name)
+    )
+
     display_dropdown.topics.insert(
         0,
         PageMenuTopic(
@@ -671,7 +737,9 @@ def _extend_display_dropdown(
             entries=[
                 PageMenuEntry(
                     title=_("Filter"),
-                    icon_name="filter",
+                    icon_name=(
+                        {"icon": "filter", "emblem": "warning"} if is_filter_set else "filter"
+                    ),
                     item=PageMenuSidePopup(
                         visuals.render_filter_form(
                             info_list,
@@ -690,9 +758,15 @@ def _extend_display_dropdown(
 
 
 class AjaxInitialDashboardFilters(ABCAjaxInitialFilters):
+    def get_context(self, page_name: str) -> VisualContext:
+        return self._get_context(page_name)
+
     def _get_context(self, page_name: str) -> VisualContext:
         dashboard_name = page_name
-        board = load_dashboard_with_cloning(get_permitted_dashboards(), dashboard_name, edit=False)
+        board = load_dashboard(
+            get_permitted_dashboards(),
+            dashboard_name,
+        )
         board = _add_context_to_dashboard(board)
 
         # For the topology dashboard filters are retrieved from a corresponding view context.
@@ -706,24 +780,10 @@ class AjaxInitialDashboardFilters(ABCAjaxInitialFilters):
         return _minimal_context(_get_mandatory_filters(board, set()), board["context"])
 
 
-def get_topology_context_and_filters() -> tuple[Mapping[str, Mapping[str, str]], list[Filter]]:
-    view_name = "topology_filters"
-    view_spec = get_permitted_views()[view_name]
-    view = View(view_name, view_spec, view_spec.get("context", {}))
-    context = cmk.gui.visuals.active_context_from_request(
-        view.datasource.infos, view.spec["context"]
-    )
-    filters = cmk.gui.visuals.filters_of_visual(
-        view.spec, view.datasource.infos, link_filters=view.datasource.link_filters
-    )
-    show_filters = cmk.gui.visuals.visible_filters_of_visual(view.spec, filters)
-    return context, show_filters
-
-
 @dataclass
 class PageMenuEntryCEEOnly(PageMenuEntry):
     def __post_init__(self) -> None:
-        if cmk_version.is_raw_edition():
+        if cmk_version.edition(paths.omd_root) is cmk_version.Edition.CRE:
             self.is_enabled = False
             self.disabled_tooltip = _("Enterprise feature")
 
@@ -857,7 +917,7 @@ def _dashboard_add_state_dashlet_entries(name: DashboardName) -> Iterable[PageMe
 
 def _dashboard_add_inventory_dashlet_entries(name: DashboardName) -> Iterable[PageMenuEntryCEEOnly]:
     yield PageMenuEntryCEEOnly(
-        title="Host inventory",
+        title="HW/SW Inventory of host",
         icon_name="inventory",
         item=_dashboard_add_non_view_dashlet_link(name, "inventory"),
     )
@@ -886,6 +946,12 @@ def _dashboard_add_metrics_dashlet_entries(name: DashboardName) -> Iterable[Page
         title="Single metric",
         icon_name="single_metric",
         item=_dashboard_add_non_view_dashlet_link(name, "single_metric"),
+    )
+
+    yield PageMenuEntryCEEOnly(
+        title="Top list",
+        icon_name="rank",
+        item=_dashboard_add_non_view_dashlet_link(name, "top_list"),
     )
 
 
@@ -962,7 +1028,6 @@ def _dashboard_add_checkmk_dashlet_entries(name: DashboardName) -> Iterable[Page
         title="Sidebar element",
         icon_name="custom_snapin",
         item=_dashboard_add_non_view_dashlet_link(name, "snapin"),
-        is_show_more=True,
     )
 
 
@@ -1000,14 +1065,12 @@ def _dashboard_add_other_dashlet_entries(name: DashboardName) -> Iterable[PageMe
         title="Custom URL",
         icon_name="dashlet_url",
         item=_dashboard_add_non_view_dashlet_link(name, "url"),
-        is_show_more=True,
     )
 
     yield PageMenuEntry(
         title="Static text",
         icon_name="dashlet_nodata",
         item=_dashboard_add_non_view_dashlet_link(name, "nodata"),
-        is_show_more=True,
     )
 
 
@@ -1065,7 +1128,7 @@ def get_dashlet_type(dashlet_spec: DashletConfig) -> type[Dashlet]:
     return dashlet_registry[dashlet_spec["type"]]
 
 
-def draw_dashlet(dashlet: Dashlet, content: HTMLInput, title: str | HTML) -> None:
+def draw_dashlet(dashlet: Dashlet, content: HTML | str, title: HTML | str) -> None:
     """Draws the initial HTML code for one dashlet
 
     Each dashlet has an id "dashlet_%d", where %d is its index (in
@@ -1092,18 +1155,19 @@ def draw_dashlet(dashlet: Dashlet, content: HTMLInput, title: str | HTML) -> Non
         css.append("background")
 
     html.open_div(id_="dashlet_inner_%d" % dashlet.dashlet_id, class_=css)
-    html.write_html(HTML(content))
+    html.write_html(HTML.with_escaping(content))
     html.close_div()
 
 
 def ajax_dashlet() -> None:
     """Render the inner HTML of a dashlet"""
     name = request.get_ascii_input_mandatory("name", "")
+    owner = request.get_validated_type_input_mandatory(UserId, "owner", UserId.builtin())
     if not name:
         raise MKUserError("name", _("The name of the dashboard is missing."))
 
     try:
-        board = get_permitted_dashboards()[name]
+        board = get_permitted_dashboards_by_owners()[name][owner]
     except KeyError:
         raise MKUserError("name", _("The requested dashboard does not exist."))
 
@@ -1127,14 +1191,14 @@ def ajax_dashlet() -> None:
     dashlet = None
     try:
         dashlet_type = get_dashlet_type(dashlet_spec)
-        dashlet = dashlet_type(name, board, ident, dashlet_spec)
+        dashlet = dashlet_type(name, owner, board, ident, dashlet_spec)
         _title, content = _render_dashlet(board, dashlet, is_update=True, mtime=mtime)
     except Exception as e:
         if dashlet is None:
-            dashlet = _fallback_dashlet(name, board, dashlet_spec, ident)
+            dashlet = _fallback_dashlet(name, owner, board, dashlet_spec, ident)
         content = render_dashlet_exception_content(dashlet, e)
 
-    html.write_html(HTML(content))
+    html.write_html(HTML.with_escaping(content))
 
 
 # TODO: This should not be done during runtime at "random" places. Instead the typing and

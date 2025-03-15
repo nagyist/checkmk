@@ -9,6 +9,14 @@
 
 checkname = "f5_bigip_vserver"
 
+mock_item_state = {
+    "": {
+        "connections_rate.0" : (0, 42),
+        "if_out_pkts.0": (0, 42),
+        "if_in_octets.0": (0, 32),
+    },
+}
+
 
 info = [
     [
@@ -165,7 +173,7 @@ checks = {
                     ],
                 ),
                 (1, "Incoming bytes: 0.00 B/s (warn/crit at -23.0 B/s/42.0 B/s)", []),
-                (2, "Total packets: 0.0/s (warn/crit below 100.0/s/200.0/s)", []),
+                (2, "Total packets: 0.0/s (warn/crit below 100/s/200/s)", []),
             ],
         ),
     ],

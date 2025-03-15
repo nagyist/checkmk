@@ -10,69 +10,60 @@ Currently we aim for V4.0.3 L1
 
 See:
 - https://owasp.org/www-project-application-security-verification-standard/"""
-from playwright.sync_api import BrowserContext
 
-from tests.testlib.playwright.helpers import PPage
+from playwright.sync_api import BrowserContext, Page
+
+from tests.gui_e2e.testlib.playwright.helpers import CmkCredentials
+from tests.gui_e2e.testlib.playwright.pom.change_password import ChangePassword
+from tests.gui_e2e.testlib.playwright.pom.dashboard import Dashboard
+from tests.gui_e2e.testlib.playwright.pom.login import LoginPage
 from tests.testlib.site import Site
 
 
-def _change_password(page: PPage, old_password: str, new_password: str) -> None:
-    page.main_menu.user.click()
-    page.main_menu.locator("text=Change password").click()
-
-    page.main_area.locator("input[name='cur_password']").fill(old_password)
-    page.main_area.locator("input[name='password']").fill(new_password)
-    page.main_area.locator("#suggestions >> text=Save").click()
-    page.main_area.check_success("Successfully changed password.")
-
-
-def test_v2_1_5(logged_in_page: PPage) -> None:
+def test_v2_1_5(test_site: Site, dashboard_page: Dashboard, credentials: CmkCredentials) -> None:
     """Verify users can change their password."""
 
-    page = logged_in_page
-    _change_password(page, "cmk", "not-cmk")
-    page.logout()
+    page = dashboard_page
+
+    change_password_page = ChangePassword(dashboard_page.page)
+    change_password_page.change_password(credentials.password, "not-cmk-really-not")
+    change_password_page.main_area.check_success("Successfully changed password.")
+    change_password_page.main_menu.logout()
+    login_page = LoginPage(page.page, navigate_to_page=False)
 
     # check old password, shouldn't work anymore
-    page.login("cmkadmin", "cmk")
-    page.check_error("Invalid login")
+    login_page.login(credentials)
+    login_page.check_error("Incorrect username or password. Please try again.")
 
     # changing it back for other tests
-    page.login("cmkadmin", "not-cmk")
-    page.main_area.check_page_title("Main dashboard")
-    _change_password(page, "not-cmk", "cmk")
-    page.logout()
+    test_site.reset_admin_password()
 
-    page.login("cmkadmin", "cmk")
+    login_page.login(credentials)
     page.main_area.check_page_title("Main dashboard")
 
 
-def test_password_truncation_error(logged_in_page: PPage) -> None:
+def test_password_truncation_error(dashboard_page: Dashboard) -> None:
     """Bcrypt truncates at 72 chars, check for the error if the password is longer"""
 
-    page = logged_in_page
-    page.main_menu.user.click()
-    page.main_menu.locator("text=Change password").click()
-
-    page.main_area.locator("input[name='cur_password']").fill("cmk")
-    page.main_area.locator("input[name='password']").fill("A" * 80)
-    page.main_area.locator("#suggestions >> text=Save").click()
-    page.main_area.check_error(
+    change_password_page = ChangePassword(dashboard_page.page)
+    change_password_page.change_password("cmk", "A" * 80)
+    change_password_page.main_area.check_error(
         "Passwords over 72 bytes would be truncated and are therefore not allowed!"
     )
 
 
-def test_cookie_flags(context: BrowserContext, test_site: Site, is_chromium: bool) -> None:
+def test_cookie_flags(
+    test_site: Site,
+    is_chromium: bool,
+    credentials: CmkCredentials,
+    new_browser_context_and_page: tuple[BrowserContext, Page],
+) -> None:
     """tests for 3.4.X"""
-    username = "cmkadmin"
-    password = "cmk"
+    browser_context, page = new_browser_context_and_page
+    ppage = LoginPage(page, site_url=test_site.internal_url)
+    ppage.login(credentials)
 
-    page = context.new_page()
-    page.goto(test_site.internal_url)
-    ppage = PPage(page, site_id=test_site.id)
-    ppage.login(username, password)
-
-    cookie = context.cookies()[0]
+    cookie = browser_context.cookies()[0]
     # V3.4.2
     assert cookie["httpOnly"]
 
@@ -81,4 +72,4 @@ def test_cookie_flags(context: BrowserContext, test_site: Site, is_chromium: boo
         assert cookie["sameSite"] == "Lax"
 
     # V3.4.5
-    assert cookie["path"] == "/gui_e2e_central/"
+    assert cookie["path"] == f"/{test_site.id}/"

@@ -8,8 +8,8 @@ from typing import Literal
 
 from livestatus import SiteId
 
-import cmk.gui.weblib as weblib
 from cmk.gui.config import active_config
+from cmk.gui.data_source import ABCDataSource
 from cmk.gui.display_options import display_options
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.htmllib.html import html
@@ -17,19 +17,22 @@ from cmk.gui.http import request
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
 from cmk.gui.type_defs import InfoName, Row, Rows, ViewSpec
-from cmk.gui.utils.confirm_with_preview import confirm_with_preview
+from cmk.gui.utils.confirm_with_preview import command_confirm_dialog
+from cmk.gui.utils.selection_id import SelectionId
 
-from ..data_source import ABCDataSource
-from .base import Command, CommandExecutor, CommandGroup, CommandSpec
+from .base import Command, CommandConfirmDialogOptions, CommandExecutor, CommandSpec
+from .group import CommandGroup
 from .registry import command_registry
 
 
 def core_command(
     what: str, row: Row, row_nr: int, action_rows: Rows
-) -> tuple[Sequence[CommandSpec], list[tuple[str, str]], str, CommandExecutor]:
+) -> tuple[
+    Sequence[CommandSpec], list[tuple[str, str]], CommandConfirmDialogOptions, CommandExecutor
+]:
     """Examine the current HTML variables in order determine, which command the user has selected.
-    The fetch ids from a data row (host name, service description, downtime/commands id) and
-    construct one or several core command lines and a descriptive title."""
+    The fetch ids from a data row (host name, service name, downtime/commands id) and
+    construct one or several core command lines and a descriptive confirm dialog."""
     host = row.get("host_name")
     descr = row.get("service_description")
 
@@ -50,22 +53,20 @@ def core_command(
         cmdtag = "SVC" if descr else "HOST"
 
     commands: Sequence[CommandSpec] | None = None
-    title: str | None = None
     # Call all command actions. The first one that detects
     # itself to be executed (by examining the HTML variables)
-    # will return a command to execute and a title for the
+    # will return a command to execute and confirm dialog options for the
     # confirmation dialog.
-    for cmd_class in command_registry.values():
-        cmd = cmd_class()
+    for cmd in command_registry.values():
         if user.may(cmd.permission.name):
             result = cmd.action(cmdtag, spec, row, row_nr, action_rows)
             confirm_options = cmd.user_confirm_options(len(action_rows), cmdtag)
             if result:
                 executor = cmd.executor
-                commands, title = result
+                commands, confirm_dialog_options = result
                 break
 
-    if commands is None or title is None:
+    if commands is None:
         raise MKUserError(None, _("Sorry. This command is not implemented."))
 
     # Some commands return lists of commands, others
@@ -73,7 +74,7 @@ def core_command(
     if isinstance(commands, str):
         commands = [commands]
 
-    return commands, confirm_options, title, executor
+    return commands, confirm_options, confirm_dialog_options, executor
 
 
 def should_show_command_form(
@@ -95,8 +96,7 @@ def should_show_command_form(
     # information) then the first info is the primary table. So 'what'
     # will be one of "host", "service", "command" or "downtime".
     what = datasource.infos[0]
-    for command_class in command_registry.values():
-        command = command_class()
+    for command in command_registry.values():
         if what in command.tables and user.may(command.permission.name):
             return True
 
@@ -106,8 +106,7 @@ def should_show_command_form(
 def get_command_groups(info_name: InfoName) -> dict[type[CommandGroup], list[Command]]:
     by_group: dict[type[CommandGroup], list[Command]] = {}
 
-    for command_class in command_registry.values():
-        command = command_class()
+    for command in command_registry.values():
         if info_name in command.tables and user.may(command.permission.name):
             # Some special commands can be shown on special views using this option.  It is
             # currently only used by custom commands, not shipped with Checkmk.
@@ -121,7 +120,7 @@ def get_command_groups(info_name: InfoName) -> dict[type[CommandGroup], list[Com
 # Returns:
 # True -> Actions have been done
 # False -> No actions done because now rows selected
-def do_actions(  # pylint: disable=too-many-branches
+def do_actions(
     view: ViewSpec,
     what: InfoName,
     action_rows: Rows,
@@ -137,6 +136,10 @@ def do_actions(  # pylint: disable=too-many-branches
         )
         return False  # no actions done
 
+    # User canceled the first confirm dialog
+    if request.get_str_input("_cancel") is not None:
+        return False
+
     if not action_rows:
         message_no_rows = _("No rows selected to perform actions for.")
         message_no_rows += '<br><a href="{}">{}</a>'.format(backurl, _("Back to view"))
@@ -144,12 +147,24 @@ def do_actions(  # pylint: disable=too-many-branches
         return False  # no actions done
 
     command = None
-    confirm_options, cmd_title, executor = core_command(what, action_rows[0], 0, action_rows)[
-        1:4
-    ]  # just get confirm_options, title and executor
+    _commands, confirm_options, confirm_dialog_options, executor = core_command(
+        what, action_rows[0], 0, action_rows
+    )
 
-    command_title = _("Do you really want to %s") % cmd_title
-    if not confirm_with_preview(command_title, confirm_options, method="GET"):
+    if not command_confirm_dialog(
+        confirm_options,
+        confirm_dialog_options.confirm_title,
+        (
+            confirm_dialog_options.affected + confirm_dialog_options.additions
+            if confirm_dialog_options.additions
+            else confirm_dialog_options.affected
+        ),
+        confirm_dialog_options.icon_class,
+        confirm_dialog_options.confirm_button,
+        confirm_dialog_options.cancel_button,
+        confirm_dialog_options.deny_button,
+        confirm_dialog_options.deny_js_function,
+    ):
         return False
 
     if request.has_var("_do_confirm_host_downtime"):
@@ -158,7 +173,7 @@ def do_actions(  # pylint: disable=too-many-branches
     count = 0
     already_executed = set()
     for nr, row in enumerate(action_rows):
-        core_commands, _confirm_options, _title, executor = core_command(
+        core_commands, _confirm_options, _confirm_dialog_options, executor = core_command(
             what,
             row,
             nr,
@@ -192,8 +207,7 @@ def do_actions(  # pylint: disable=too-many-branches
         message += '<br><a href="{}">{}</a>'.format(backurl, _("Back to view"))
         if request.var("show_checkboxes") == "1":
             request.del_var("selection")
-            weblib.selection_id()
-            backurl += "&selection=" + request.get_str_input_mandatory("selection")
+            backurl += "&selection=" + SelectionId.from_request(request)
             message += '<br><a href="{}">{}</a>'.format(
                 backurl,
                 _("Back to view with checkboxes reset"),

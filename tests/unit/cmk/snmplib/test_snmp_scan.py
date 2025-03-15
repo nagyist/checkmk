@@ -3,29 +3,31 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-# pylint: disable=protected-access, redefined-outer-name
 
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from pytest_mock import MockerFixture
 
-from tests.testlib.base import Scenario
+from tests.unit.mocks_and_helpers import FixPluginLegacy
 
-from tests.unit.conftest import FixPluginLegacy
+from cmk.ccc.exceptions import MKSNMPError, OnError
 
-from cmk.utils.exceptions import OnError
+from cmk.utils.hostaddress import HostAddress, HostName
 from cmk.utils.log import logger
 from cmk.utils.paths import snmp_scan_cache_dir
-from cmk.utils.type_defs import HostName, SectionName
+from cmk.utils.sectionname import SectionName
 
-import cmk.snmplib.snmp_cache as snmp_cache
-import cmk.snmplib.snmp_scan as snmp_scan
-from cmk.snmplib.type_defs import OID, SNMPBackend, SNMPBackendEnum, SNMPHostConfig
-from cmk.snmplib.utils import evaluate_snmp_detection
+from cmk.snmplib import OID, SNMPBackend, SNMPBackendEnum, SNMPHostConfig, SNMPVersion
 
-import cmk.base.api.agent_based.register as agent_based_register
+import cmk.fetchers._snmpcache as snmp_cache
+import cmk.fetchers._snmpscan as snmp_scan
+
+from cmk.base.api.agent_based.plugin_classes import AgentBasedPlugins
+
+from cmk.agent_based.v2 import SimpleSNMPSection, SNMPSection
+from cmk.plugins.collection.agent_based import aironet_clients, brocade_info
 
 
 @pytest.mark.parametrize(
@@ -55,19 +57,37 @@ import cmk.base.api.agent_based.register as agent_based_register
             {".1.3.6.1.2.1.1.1.0": "contains STE2"},
             True,
         ),
+    ],
+)
+def test_evaluate_snmp_detection_legacy(
+    fix_plugin_legacy: FixPluginLegacy,
+    name: str,
+    oids_data: dict[str, str | None],
+    expected_result: bool,
+) -> None:
+    assert (detect_spec := fix_plugin_legacy.check_info[name].detect) is not None
+    assert (
+        snmp_scan._evaluate_snmp_detection(detect_spec=detect_spec, oid_value_getter=oids_data.get)
+        is expected_result
+    )
+
+
+@pytest.mark.parametrize(
+    "plugin, oids_data, expected_result",
+    [
         (
-            "aironet_clients",
+            aironet_clients.snmp_section_aironet_clients,
             {".1.3.6.1.2.1.1.2.0": ".1.3.6.1.4.1.9.1.5251"},
             False,
         ),
         (
-            "aironet_clients",
+            aironet_clients.snmp_section_aironet_clients,
             {".1.3.6.1.2.1.1.2.0": ".1.3.6.1.4.1.9.1.525"},
             True,
         ),
         # for one example do all 6 permutations:
         (
-            "brocade_info",
+            brocade_info.snmp_section_brocade_info,
             {
                 ".1.3.6.1.2.1.1.2.0": ".1.3.6.1.4.1.1588.Moo",
                 ".1.3.6.1.4.1.1588.2.1.1.1.1.6.0": "Not None",
@@ -75,7 +95,7 @@ import cmk.base.api.agent_based.register as agent_based_register
             True,
         ),
         (
-            "brocade_info",
+            brocade_info.snmp_section_brocade_info,
             {
                 ".1.3.6.1.2.1.1.2.0": ".1.3.6.1.4.1.1588.Moo",
                 ".1.3.6.1.4.1.1588.2.1.1.1.1.6.0": None,
@@ -83,7 +103,7 @@ import cmk.base.api.agent_based.register as agent_based_register
             False,
         ),
         (
-            "brocade_info",
+            brocade_info.snmp_section_brocade_info,
             {
                 ".1.3.6.1.2.1.1.2.0": ".1.3.6.1.24.1.1588.2.1.1.Quack",
                 ".1.3.6.1.4.1.1588.2.1.1.1.1.6.0": "Not None",
@@ -91,7 +111,7 @@ import cmk.base.api.agent_based.register as agent_based_register
             True,
         ),
         (
-            "brocade_info",
+            brocade_info.snmp_section_brocade_info,
             {
                 ".1.3.6.1.2.1.1.2.0": ".1.3.6.1.24.1.1588.2.1.1.Quack",
                 ".1.3.6.1.4.1.1588.2.1.1.1.1.6.0": None,
@@ -99,27 +119,25 @@ import cmk.base.api.agent_based.register as agent_based_register
             False,
         ),
         (
-            "brocade_info",
+            brocade_info.snmp_section_brocade_info,
             {".1.3.6.1.2.1.1.2.0": "Moo.Quack", ".1.3.6.1.4.1.1588.2.1.1.1.1.6.0": "Not None"},
             False,
         ),
         (
-            "brocade_info",
+            brocade_info.snmp_section_brocade_info,
             {".1.3.6.1.2.1.1.2.0": "Moo.Quack", ".1.3.6.1.4.1.1588.2.1.1.1.1.6.0": None},
             False,
         ),
     ],
 )
 def test_evaluate_snmp_detection(
-    fix_plugin_legacy: FixPluginLegacy,
-    name: str,
+    plugin: SNMPSection | SimpleSNMPSection,
     oids_data: dict[str, str | None],
     expected_result: bool,
 ) -> None:
     assert (
-        evaluate_snmp_detection(
-            detect_spec=fix_plugin_legacy.check_info[name]["detect"],
-            oid_value_getter=oids_data.get,
+        snmp_scan._evaluate_snmp_detection(
+            detect_spec=plugin.detect, oid_value_getter=oids_data.get
         )
         is expected_result
     )
@@ -129,11 +147,11 @@ def test_evaluate_snmp_detection(
 SNMPConfig = SNMPHostConfig(
     is_ipv6_primary=False,
     hostname=HostName("testhost"),
-    ipaddress="1.2.3.4",
+    ipaddress=HostAddress("1.2.3.4"),
     credentials="",
     port=42,
-    is_bulkwalk_host=False,
-    is_snmpv2or3_without_bulkwalk_host=False,
+    bulkwalk_enabled=True,
+    snmp_version=SNMPVersion.V2C,
     bulk_walk_size_of=0,
     timing={},
     oid_range_limits={},
@@ -145,11 +163,11 @@ SNMPConfig = SNMPHostConfig(
 
 # Adapted from `test_snmplib_snmp_table`.
 class SNMPTestBackend(SNMPBackend):
-    def get(self, oid, context_name=None):
+    def get(self, /, oid, *, context):
         # See also: `snmp_mode.get_single_oid()`
         return None
 
-    def walk(self, oid, section_name=None, table_base_oid=None, context_name=None):
+    def walk(self, /, oid, *, context, **kw):
         raise NotImplementedError("walk")
 
 
@@ -166,34 +184,26 @@ def backend() -> Iterator[SNMPBackend]:
 
 
 @pytest.fixture
-def scenario(backend, monkeypatch):
-    # Set the `ruleset_matcher` on the config.
-    ts = Scenario()
-    ts.add_host(backend.hostname)
-    ts.apply(monkeypatch)
-
-
-@pytest.fixture
-def cache_oids(backend):
+def cache_oids(backend, tmp_path):
     # Cache OIDs to avoid actual SNMP I/O.
-    snmp_cache.initialize_single_oid_cache(backend.config.hostname, backend.config.ipaddress)
+    snmp_cache.initialize_single_oid_cache(
+        backend.config.hostname, backend.config.ipaddress, cache_dir=tmp_path
+    )
     snmp_cache.single_oid_cache()[snmp_scan.OID_SYS_DESCR] = "sys description"
     snmp_cache.single_oid_cache()[snmp_scan.OID_SYS_OBJ] = "sys object"
     yield
     snmp_cache._clear_other_hosts_oid_cache(backend.hostname)
 
 
-@pytest.mark.usefixtures("scenario")
 @pytest.mark.usefixtures("cache_oids")
 @pytest.mark.parametrize("oid", [snmp_scan.OID_SYS_DESCR, snmp_scan.OID_SYS_OBJ])
 def test_snmp_scan_prefetch_description_object__oid_missing(oid: OID, backend: SNMPBackend) -> None:
     snmp_cache.single_oid_cache()[oid] = None
 
-    with pytest.raises(snmp_scan.MKSNMPError, match=r"Cannot fetch [\w ]+ OID %s" % oid):
+    with pytest.raises(MKSNMPError, match=r"Cannot fetch [\w ]+ OID %s" % oid):
         snmp_scan._prefetch_description_object(backend=backend)
 
 
-@pytest.mark.usefixtures("scenario")
 @pytest.mark.usefixtures("cache_oids")
 def test_snmp_scan_prefetch_description_object__success(backend: SNMPBackend) -> None:
     sys_desc = snmp_cache.single_oid_cache()[snmp_scan.OID_SYS_DESCR]
@@ -208,19 +218,20 @@ def test_snmp_scan_prefetch_description_object__success(backend: SNMPBackend) ->
     assert snmp_cache.single_oid_cache()[snmp_scan.OID_SYS_OBJ] == sys_obj
 
 
-@pytest.mark.usefixtures("scenario")
 @pytest.mark.usefixtures("cache_oids")
 def test_snmp_scan_fake_description_object__success(backend: SNMPBackend) -> None:
-    snmp_scan._fake_description_object()
+    snmp_scan._fake_description_object(logging.getLogger("test"))
 
     assert snmp_cache.single_oid_cache()[snmp_scan.OID_SYS_DESCR] == ""
     assert snmp_cache.single_oid_cache()[snmp_scan.OID_SYS_OBJ] == ""
 
 
-@pytest.mark.usefixtures("scenario")
 @pytest.mark.usefixtures("cache_oids")
-def test_snmp_scan_find_plugins__success(backend: SNMPBackend) -> None:
-    sections = [(s.name, s.detect_spec) for s in agent_based_register.iter_all_snmp_sections()]
+def test_snmp_scan_find_plugins__success(
+    backend: SNMPBackend,
+    agent_based_plugins: AgentBasedPlugins,
+) -> None:
+    sections = [(s.name, s.detect_spec) for s in agent_based_plugins.snmp_sections.values()]
     found = snmp_scan._find_sections(
         sections,
         on_error=OnError.RAISE,
@@ -232,18 +243,22 @@ def test_snmp_scan_find_plugins__success(backend: SNMPBackend) -> None:
     assert len(sections) > len(found)
 
 
-@pytest.mark.usefixtures("scenario")
 @pytest.mark.usefixtures("cache_oids")
 def test_gather_available_raw_section_names_defaults(
-    backend: SNMPBackend, mocker: MockerFixture
+    backend: SNMPBackend,
+    tmp_path: Path,
+    agent_based_plugins: AgentBasedPlugins,
 ) -> None:
     assert snmp_cache.single_oid_cache()[snmp_scan.OID_SYS_DESCR]
     assert snmp_cache.single_oid_cache()[snmp_scan.OID_SYS_OBJ]
 
     assert snmp_scan.gather_available_raw_section_names(
-        [(s.name, s.detect_spec) for s in agent_based_register.iter_all_snmp_sections()],
-        on_error=OnError.RAISE,
-        missing_sys_description=False,
+        [(s.name, s.detect_spec) for s in agent_based_plugins.snmp_sections.values()],
+        scan_config=snmp_scan.SNMPScanConfig(
+            on_error=OnError.RAISE,
+            missing_sys_description=False,
+            oid_cache_dir=tmp_path,
+        ),
         backend=backend,
     ) == {
         SectionName("hr_mem"),

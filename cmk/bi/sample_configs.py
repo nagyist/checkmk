@@ -31,7 +31,7 @@ bi_sample_config = {
                             "conditions": {
                                 "host_choice": {"type": "all_hosts"},
                                 "host_folder": "",
-                                "host_labels": {},
+                                "host_label_groups": [],
                                 "host_tags": {"tcp": "tcp"},
                             },
                             "refer_to": "host",
@@ -120,7 +120,7 @@ bi_sample_config = {
                         {
                             "action": {
                                 "host_regex": "$HOSTNAME$",
-                                "service_regex": "Mount options " "of $FS$$",
+                                "service_regex": "Mount options of $FS$$",
                                 "type": "state_of_service",
                             },
                             "search": {"type": "empty"},
@@ -160,7 +160,7 @@ bi_sample_config = {
                         },
                         {
                             "action": {
-                                "params": {"arguments": ["$HOSTNAME$", "$1$"]},
+                                "params": {"arguments": ["$HOSTNAME$", "$2$"]},
                                 "rule_id": "filesystem",
                                 "type": "call_a_rule",
                             },
@@ -171,9 +171,9 @@ bi_sample_config = {
                                         "type": "host_name_regex",
                                     },
                                     "host_folder": "",
-                                    "host_labels": {},
+                                    "host_label_groups": [],
                                     "host_tags": {},
-                                    "service_labels": {},
+                                    "service_label_groups": [],
                                     "service_regex": "fs_(.*)",
                                 },
                                 "type": "service_search",
@@ -181,7 +181,7 @@ bi_sample_config = {
                         },
                         {
                             "action": {
-                                "params": {"arguments": ["$HOSTNAME$", "$1$"]},
+                                "params": {"arguments": ["$HOSTNAME$", "$2$"]},
                                 "rule_id": "filesystem",
                                 "type": "call_a_rule",
                             },
@@ -192,9 +192,9 @@ bi_sample_config = {
                                         "type": "host_name_regex",
                                     },
                                     "host_folder": "",
-                                    "host_labels": {},
+                                    "host_label_groups": [],
                                     "host_tags": {},
-                                    "service_labels": {},
+                                    "service_label_groups": [],
                                     "service_regex": "Filesystem(.*)",
                                 },
                                 "type": "service_search",
@@ -462,7 +462,7 @@ bi_sample_config = {
                         {
                             "action": {
                                 "host_regex": "$HOSTNAME$",
-                                "service_regex": "CPU|Memory|Vmalloc|Kernel|Number " "of threads",
+                                "service_regex": "CPU|Memory|Vmalloc|Kernel|Number of threads",
                                 "type": "state_of_service",
                             },
                             "search": {"type": "empty"},

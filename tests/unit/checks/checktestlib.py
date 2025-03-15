@@ -7,11 +7,74 @@ from __future__ import annotations
 import copy
 import os
 import types
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, NamedTuple
 from unittest import mock
 
 import pytest
+
+from tests.testlib.common.repo import repo_path
+
+from cmk.ccc import store
+
+import cmk.utils.paths
+
+from cmk.agent_based.legacy import discover_legacy_checks, FileLoader, find_plugin_files
+from cmk.agent_based.legacy.v0_unstable import LegacyCheckDefinition
+
+
+class MissingCheckInfoError(KeyError):
+    pass
+
+
+class Check:
+    _LEGACY_CHECKS: dict[str, LegacyCheckDefinition] = {}
+
+    @classmethod
+    def _load_checks(cls) -> None:
+        for legacy_check in discover_legacy_checks(
+            find_plugin_files(str(repo_path() / "cmk/base/legacy_checks")),
+            FileLoader(
+                precomile_path=cmk.utils.paths.precompiled_checks_dir,
+                local_path="/not_relevant_for_test",
+                makedirs=store.makedirs,
+            ),
+            raise_errors=True,
+        ).sane_check_info:
+            cls._LEGACY_CHECKS[legacy_check.name] = legacy_check
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        if not self._LEGACY_CHECKS:
+            self._load_checks()
+
+        if (info := self._LEGACY_CHECKS.get(name)) is None:
+            raise MissingCheckInfoError(self.name)
+
+        self.info = info
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.name!r})"
+
+    def default_parameters(self) -> Mapping[str, Any]:
+        return self.info.check_default_parameters or {}
+
+    def run_parse(self, info: list) -> object:
+        if self.info.parse_function is None:
+            raise MissingCheckInfoError("Check '%s' " % self.name + "has no parse function defined")
+        return self.info.parse_function(info)
+
+    def run_discovery(self, info: object) -> Any:
+        if self.info.discovery_function is None:
+            raise MissingCheckInfoError(
+                "Check '%s' " % self.name + "has no discovery function defined"
+            )
+        return self.info.discovery_function(info)
+
+    def run_check(self, item: object, params: object, info: object) -> Any:
+        if self.info.check_function is None:
+            raise MissingCheckInfoError("Check '%s' " % self.name + "has no check function defined")
+        return self.info.check_function(item, params, info)
 
 
 class Tuploid:
@@ -96,29 +159,20 @@ def assertPerfValuesEqual(actual, expected):
     assert isinstance(actual, PerfValue), "not a PerfValue: %r" % actual
     assert isinstance(expected, PerfValue), "not a PerfValue: %r" % expected
     assert expected.key == actual.key, f"expected {expected!r}, but key is {actual.key!r}"
-    assert expected.value == pytest.approx(actual.value), "expected {!r}, but value is {!r}".format(
-        expected,
-        actual.value,
+    assert expected.value == pytest.approx(actual.value), (
+        f"expected {expected!r}, but value is {actual.value!r}"
     )
-    assert (
-        pytest.approx(expected.warn, rel=0.1) == actual.warn
-    ), "expected {!r}, but warn is {!r}".format(
-        expected,
-        actual.warn,
+    assert pytest.approx(expected.warn, rel=0.1) == actual.warn, (
+        f"expected {expected!r}, but warn is {actual.warn!r}"
     )
-    assert (
-        pytest.approx(expected.crit, rel=0.1) == actual.crit
-    ), "expected {!r}, but crit is {!r}".format(
-        expected,
-        actual.crit,
+    assert pytest.approx(expected.crit, rel=0.1) == actual.crit, (
+        f"expected {expected!r}, but crit is {actual.crit!r}"
     )
-    assert expected.minimum == actual.minimum, "expected {!r}, but minimum is {!r}".format(
-        expected,
-        actual.minimum,
+    assert expected.minimum == actual.minimum, (
+        f"expected {expected!r}, but minimum is {actual.minimum!r}"
     )
-    assert expected.maximum == actual.maximum, "expected {!r}, but maximum is {!r}".format(
-        expected,
-        actual.maximum,
+    assert expected.maximum == actual.maximum, (
+        f"expected {expected!r}, but maximum is {actual.maximum!r}"
     )
 
 
@@ -148,22 +202,16 @@ class BasicCheckResult(Tuploid):
             3,
         ], f"BasicCheckResult: status must be in (0, 1, 2, 3) - not {status!r}"
 
-        assert isinstance(
-            infotext, str
-        ), "BasicCheckResult: infotext {!r} must be of type str or unicode - not {!r}".format(
-            infotext,
-            type(infotext),
+        assert isinstance(infotext, str), (
+            f"BasicCheckResult: infotext {infotext!r} must be of type str or unicode - not {type(infotext)!r}"
         )
         if "\n" in infotext:
             self.infotext, self.multiline = infotext.split("\n", 1)
 
         if perfdata is not None:
             tp = type(perfdata)
-            assert (
-                tp == list
-            ), "BasicCheckResult: perfdata {!r} must be of type list - not {!r}".format(
-                perfdata,
-                tp,
+            assert tp is list, (
+                f"BasicCheckResult: perfdata {perfdata!r} must be of type list - not {tp!r}"
             )
             for entry in perfdata:
                 te = type(entry)
@@ -198,14 +246,14 @@ def assertBasicCheckResultsEqual(actual, expected):
 
     diff_idx = len(os.path.commonprefix((expected.infotext, actual.infotext)))
     diff_msg = ", differing at char %r" % diff_idx
-    assert expected.infotext == actual.infotext, msg % ("infotext", actual.infotext) + diff_msg
+    assert actual.infotext == expected.infotext, msg % ("infotext", actual.infotext) + diff_msg
 
     perf_count = len(actual.perfdata)
-    assert len(expected.perfdata) == perf_count, msg % ("perfdata count", perf_count)
+    assert perf_count == len(expected.perfdata), msg % ("perfdata count", perf_count)
     for pact, pexp in zip(actual.perfdata, expected.perfdata):
         assertPerfValuesEqual(pact, pexp)
 
-    assert expected.multiline == actual.multiline, msg % ("multiline", actual.multiline)
+    assert actual.multiline == expected.multiline, msg % ("multiline", actual.multiline)
 
 
 class CheckResult:
@@ -305,12 +353,17 @@ def assertCheckResultsEqual(actual, expected):
 class DiscoveryEntry(Tuploid):
     """A single entry as returned by the discovery function."""
 
-    def __init__(self, entry: tuple[str | None, dict | str | tuple | None]) -> None:
-        self.item, self.default_params = entry
+    @staticmethod
+    def _normalize_params(p: dict | None) -> dict:
+        return {} if p is None else p
+
+    def __init__(self, entry: tuple[str | None, dict | None]) -> None:
+        self.item = entry[0]
+        self.default_params = self._normalize_params(entry[1])
         assert self.item is None or isinstance(self.item, str)
 
     @property
-    def tuple(self):
+    def tuple(self) -> tuple[str | None, dict]:
         return self.item, self.default_params
 
     def __repr__(self) -> str:
@@ -326,8 +379,8 @@ class DiscoveryResult:
     get lost in the laziness.
     """
 
-    def __init__(self, result: Sequence[tuple[str | None, dict | str | tuple | None]] = ()) -> None:
-        self.entries = sorted((DiscoveryEntry(e) for e in (result or ())), key=repr)
+    def __init__(self, result: Sequence[tuple[str | None, dict | None]] = ()) -> None:
+        self.entries = sorted((DiscoveryEntry(e) for e in result), key=repr)
 
     def __eq__(self, other):
         return self.entries == other.entries
@@ -344,42 +397,17 @@ def assertDiscoveryResultsEqual(check, actual, expected):
     """
     assert isinstance(actual, DiscoveryResult), "%r is not a DiscoveryResult instance" % actual
     assert isinstance(expected, DiscoveryResult), "%r is not a DiscoveryResult instance" % expected
-    assert len(actual.entries) == len(
-        expected.entries
-    ), f"DiscoveryResults entries are not of equal length: {actual!r} != {expected!r}"
+    assert len(actual.entries) == len(expected.entries), (
+        f"DiscoveryResults entries are not of equal length: {actual!r} != {expected!r}"
+    )
 
     for enta, ente in zip(actual.entries, expected.entries):
         item_a, default_params_a = enta
         item_e, default_params_e = ente
         assert item_a == item_e, f"items differ: {item_a!r} != {item_e!r}"
-        assert (
-            default_params_a == default_params_e
-        ), "default parameters differ: {!r} != {!r}".format(
-            default_params_a,
-            default_params_e,
+        assert default_params_a == default_params_e, (
+            f"default parameters differ: {default_params_a!r} != {default_params_e!r}"
         )
-
-
-class BasicItemState:
-    """Item state as returned by get_item_state
-
-    We assert that we have exactly two values,
-    where the first one is either float or int.
-    """
-
-    def __init__(self, *args) -> None:  # type: ignore[no-untyped-def]
-        if len(args) == 1:
-            args = args[0]
-        msg = "BasicItemState: expected 2-tuple (time_diff, value) - not %r"
-        assert isinstance(args, tuple), msg % args
-        assert len(args) == 2, msg % args
-        self.time_diff, self.value = args
-
-        time_diff_type = type(self.time_diff)
-        msg = "BasicItemState: time_diff should be of type float/int - not %r"
-        assert time_diff_type in (float, int), msg % time_diff_type
-        # We do allow negative time diffs.
-        # We want to be able to test time anomalies.
 
 
 class _MockValueStore:
@@ -423,7 +451,7 @@ def mock_item_state(mock_state):
 
     See for example 'test_statgrab_cpu_check.py'.
     """
-    target = "cmk.base.api.agent_based.value_store._global_state._active_host_value_store"
+    target = "cmk.agent_based.v1.value_store._active_host_value_store"
 
     getter = (  #
         mock_state.get
@@ -432,73 +460,6 @@ def mock_item_state(mock_state):
     )
 
     return mock.patch(target, _MockVSManager(_MockValueStore(getter)))
-
-
-class MockHostExtraConf:
-    """Mock the calls to host_extra_conf.
-
-    Due to our rather unorthodox import structure, we cannot mock
-    host_extra_conf_merged directly (it's a global var in running checks!)
-    Instead, we mock the calls to cmk.base.config.host_extra_conf.
-
-    Passing a single dict to this objects init method will result in
-    host_extra_conf_merged returning said dict.
-
-    You can also pass a list of dicts, but that's rather pointless, as
-    host_extra_conf_merged will return a merged dict, the result of
-
-        merged_dict = {}
-        for d in reversed(list_of_dicts):
-            merged_dict.update(d)
-    .
-
-    Usage:
-
-    with MockHostExtraConf(mockconfig):
-        # run your check test here,
-        # host_extra_conf_merged in your check will return
-        # mockconfig
-
-    See for example 'test_df_check.py'.
-    """
-
-    def __init__(
-        self,
-        check: object,
-        mock_config: Callable | dict[object, object],
-        target: str = "host_extra_conf",
-    ) -> None:
-        self.target = target
-        self.context: Any = None  # TODO: Figure out the right type
-        self.check = check
-        self.config = mock_config
-
-    def __call__(self, _hostname, _ruleset):
-        # ensure the default value is sane
-        if hasattr(self.config, "__call__"):
-            return self.config(_hostname, _ruleset)
-
-        if self.target == "host_extra_conf" and isinstance(self.config, dict):
-            return [self.config]
-        return self.config
-
-    def __enter__(self):
-        """The default context: just mock get_item_state"""
-        import cmk.base.config  # pylint: disable=import-outside-toplevel
-
-        config_cache = cmk.base.config.get_config_cache()
-        self.context = mock.patch.object(
-            config_cache,
-            self.target,
-            # I'm the MockObj myself!
-            new_callable=lambda: self,
-        )
-        assert self.context is not None
-        return self.context.__enter__()
-
-    def __exit__(self, *exc_info):
-        assert self.context is not None
-        return self.context.__exit__(*exc_info)
 
 
 class ImmutablesChangedError(AssertionError):
@@ -531,14 +492,8 @@ def assertEqual(first, second, descr=""):
     if first == second:
         return
 
-    assert isinstance(
-        first, type(second)
-    ), "{}differing type: {!r} != {!r} for values {!r} and {!r}".format(
-        descr,
-        type(first),
-        type(second),
-        first,
-        second,
+    assert isinstance(first, type(second)), (
+        f"{descr}differing type: {type(first)!r} != {type(second)!r} for values {first!r} and {second!r}"
     )
 
     if isinstance(first, dict):

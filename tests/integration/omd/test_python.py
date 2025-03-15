@@ -3,34 +3,27 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-# flake8: noqa
-
 import json
-import os
-import re
 import subprocess
 from pathlib import Path
+from subprocess import check_output
 from typing import NamedTuple, NewType
 
-import pkg_resources as pkg
 import pytest
-from pipfile import Pipfile  # type: ignore[import]
 from semver import VersionInfo
 
-from tests.testlib import repo_path
+from tests.testlib.common.repo import repo_path
 from tests.testlib.site import Site
 
 ImportName = NewType("ImportName", "str")
 
 
 def _get_python_version_from_defines_make() -> VersionInfo:
-    with (repo_path() / "defines.make").open() as defines:
-        python_version = (
-            [line for line in defines.readlines() if re.match(r"^PYTHON_VERSION .*:=", line)][0]
-            .split(":=")[1]
-            .strip()
-        )
-    return VersionInfo.parse(python_version)
+    return VersionInfo.parse(
+        check_output(["make", "--no-print-directory", "print-PYTHON_VERSION"], cwd=repo_path())
+        .decode()
+        .rstrip()
+    )
 
 
 class PipCommand(NamedTuple):
@@ -38,15 +31,13 @@ class PipCommand(NamedTuple):
     needs_target_as_commandline: bool
 
 
-PYTHON_VERSION = _get_python_version_from_defines_make()
+PYVER = _get_python_version_from_defines_make()
 
 SUPPORTED_PIP_CMDS: tuple[PipCommand, ...] = (
     PipCommand(["python3", "-m", "pip"], True),
+    PipCommand([f"pip{PYVER.major}"], False),  # Target is set in the wrapper script as cmd line
     PipCommand(
-        [f"pip{PYTHON_VERSION.major}"], False
-    ),  # Target is set in the wrapper script as cmd line
-    PipCommand(
-        [f"pip{PYTHON_VERSION.major}.{PYTHON_VERSION.minor}"], False
+        [f"pip{PYVER.major}.{PYVER.minor}"], False
     ),  # Target is set in the wrapper script as cmd line
 )
 
@@ -85,61 +76,8 @@ def assert_uninstall_and_purge_cache(pip_cmd: PipCommand, package_name: str, sit
         assert p.returncode == 0
 
 
-def _load_pipfile_data() -> dict:
-    return Pipfile.load(filename=str(repo_path() / "Pipfile")).data
-
-
-def _get_import_names_from_dist_name(dist_name: str) -> list[ImportName]:
-    # We still have some exceptions to the rule...
-    dist_renamings = {
-        "repoze-profile": "repoze.profile",
-    }
-
-    metadata_dir = pkg.get_distribution(dist_renamings.get(dist_name, dist_name)).egg_info
-    with open("{}/{}".format(metadata_dir, "top_level.txt")) as top_level:
-        import_names = top_level.read().rstrip().split("\n")
-        # Skip the private modules (starting with an underscore)
-        return [
-            ImportName(name.replace("/", ".")) for name in import_names if not name.startswith("_")
-        ]
-
-
-def _get_import_names_from_pipfile() -> list[ImportName]:
-    # TODO: There are packages which are currently missing the top_level.txt,
-    # so we need to hardcode the import names for those packages.
-    # We couldn't find a better way to get from Pipfile package name to import name.
-    # What we've tried:
-    # * pip show <package_name> -> use the "Name" attribute
-    # --> fails e.g already for "docstring_parser" (Name: docstring-parser)
-    # --> pip show is really slow
-    # * listing *all* import names explicit
-    # --> huge maintenance effort...
-    packagename_to_importname = {
-        "attrs": "attrs",
-        "black": "black",
-        "docstring-parser": "docstring_parser",
-        "idna": "idna",
-        "jsonschema": "jsonschema",
-        "pyparsing": "pyparsing",
-        "uvicorn": "uvicorn",
-        "more-itertools": "more_itertools",
-        "ordered-set": "ordered_set",
-        "openapi-spec-validator": "openapi_spec_validator",
-        "pysaml2": "saml2",
-    }
-
-    import_names = []
-    for dist_name in _load_pipfile_data()["default"].keys():
-        if dist_name in packagename_to_importname:
-            import_names.append(ImportName(packagename_to_importname[dist_name]))
-            continue
-        import_names.extend(_get_import_names_from_dist_name(dist_name))
-    assert import_names
-    return import_names
-
-
 def test_01_python_interpreter_exists(site: Site) -> None:
-    assert os.path.exists(site.root + f"/bin/python{_get_python_version_from_defines_make().major}")
+    assert site.path(f"bin/python{_get_python_version_from_defines_make().major}").exists()
 
 
 def test_02_python_interpreter_path(site: Site) -> None:
@@ -168,19 +106,19 @@ def test_03_python_path(site: Site) -> None:
 
     ordered_path_elements = [
         # there may be more, but these have to occur in this order:
-        site.root + f"/local/lib/python{python_version.major}",
-        site.root + f"/lib/python{python_version.major}/cloud",
-        site.root + f"/lib/python{python_version.major}.{python_version.minor}",
-        site.root + f"/lib/python{python_version.major}",
+        site.root.as_posix() + f"/local/lib/python{python_version.major}",
+        site.root.as_posix() + f"/lib/python{python_version.major}/cloud",
+        site.root.as_posix() + f"/lib/python{python_version.major}.{python_version.minor}",
+        site.root.as_posix() + f"/lib/python{python_version.major}",
     ]
     assert [s for s in sys_path if s in ordered_path_elements] == ordered_path_elements
 
     for path in sys_path[1:]:
-        assert path.startswith(site.root), f"Found non site path {path!r} in sys.path"
+        assert path.startswith(site.root.as_posix()), f"Found non site path {path!r} in sys.path"
 
 
 def test_01_pip_exists(site: Site) -> None:
-    assert os.path.exists(site.root + "/bin/pip3")
+    assert site.path("bin/pip3").exists()
 
 
 def test_02_pip_path(site: Site) -> None:
@@ -196,7 +134,7 @@ def test_02_pip_path(site: Site) -> None:
 def test_03_pip_interpreter_version(site: Site, pip_cmd: PipCommand) -> None:
     p = site.execute(pip_cmd.command + ["-V"], stdout=subprocess.PIPE)
     version = p.stdout.read() if p.stdout else "<NO STDOUT>"
-    assert version.startswith("pip 22.3.1")
+    assert version.startswith("pip 24.0")
 
 
 def test_04_pip_user_can_install_non_wheel_packages(site: Site) -> None:
@@ -214,8 +152,7 @@ def test_04_pip_user_can_install_non_wheel_packages(site: Site) -> None:
 
 @pytest.mark.parametrize("pip_cmd", SUPPORTED_PIP_CMDS)
 def test_05_pip_user_can_install_wheel_packages(site: Site, pip_cmd: PipCommand) -> None:
-    # We're using here another package which is needed for check_sql but not deployed by us
-    package_name = "cx_Oracle"
+    package_name = "trickkiste"
     if pip_cmd.needs_target_as_commandline:
         command = pip_cmd.command + [
             "install",
@@ -231,23 +168,6 @@ def test_05_pip_user_can_install_wheel_packages(site: Site, pip_cmd: PipCommand)
     assert_uninstall_and_purge_cache(pip_cmd, package_name, site)
 
 
-@pytest.mark.skip(
-    """
-    Test relies on deprectated top_level.txt mechanism and yields too many false positives.
-    TODO: We need a general rework of this test.
-    """
-)
-@pytest.mark.parametrize("import_name", _get_import_names_from_pipfile())
-def test_import_python_packages_which_are_defined_in_pipfile(
-    site: Site,
-    import_name: ImportName,
-) -> None:
-    module_file = import_module_and_get_file_path(site, import_name)
-    # Skip namespace modules, they don't have __file__
-    if module_file:
-        assert module_file.startswith(site.root)
-
-
 def import_module_and_get_file_path(site: Site, import_name: str) -> str:
     p = site.execute(
         ["python3", "-c", f"import {import_name} as m; print(m.__file__ or '')"],
@@ -256,7 +176,67 @@ def import_module_and_get_file_path(site: Site, import_name: str) -> str:
     return p.communicate()[0].rstrip()
 
 
-def test_python_preferred_encoding() -> None:
-    import locale  # pylint: disable=import-outside-toplevel
+def test_python_preferred_encoding(site: Site) -> None:
+    p = site.execute(
+        ["python3", "-c", "import locale; print(locale.getpreferredencoding())"],
+        stdout=subprocess.PIPE,
+    )
+    assert p.communicate()[0].rstrip() == "UTF-8"
 
-    assert locale.getpreferredencoding() == "UTF-8"
+
+def test_python_optimized_and_lto_enable(site: Site) -> None:
+    output = site.execute(
+        ["python3", "-c", "import sysconfig; print(sysconfig.get_config_vars('CONFIG_ARGS'));"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    ).communicate()[0]
+    assert "--enable-optimizations" in output
+    assert "--with-lto" in output
+
+
+@pytest.mark.parametrize(
+    "import_path,expected_source_file,expected_pyc_file",
+    [
+        pytest.param(
+            "cmk.base.config",
+            f"lib/python{PYVER.major}/cmk/base/config.py",
+            f"lib/python{PYVER.major}/cmk/base/__pycache__/config.cpython-{PYVER.major}{PYVER.minor}.pyc",
+            id="pyc for imports from the big monolith cmk namespace",
+        ),
+        pytest.param(
+            "cmk.werks.config",
+            f"lib/python{PYVER.major}.{PYVER.minor}/site-packages/cmk/werks/config.py",
+            f"lib/python{PYVER.major}.{PYVER.minor}/site-packages/cmk/werks/__pycache__/config.cpython-{PYVER.major}{PYVER.minor}.pyc",
+            id="pyc for imports from cmk packages namespace",
+        ),
+        pytest.param(
+            "omdlib.main",
+            f"lib/python{PYVER.major}/omdlib/main.py",
+            f"lib/python{PYVER.major}/omdlib/__pycache__/main.cpython-{PYVER.major}{PYVER.minor}.pyc",
+            id="pyc for imports from omdlib",
+        ),
+        pytest.param(
+            "requests.sessions",
+            f"lib/python{PYVER.major}.{PYVER.minor}/site-packages/requests/sessions.py",
+            f"lib/python{PYVER.major}.{PYVER.minor}/site-packages/requests/__pycache__/sessions.cpython-{PYVER.major}{PYVER.minor}.pyc",
+            id="pyc for imports from third party packages",
+        ),
+    ],
+)
+def test_python_is_bytecode_compiled(
+    import_path: str,
+    expected_source_file: str,
+    expected_pyc_file: str,
+    site: Site,
+) -> None:
+    # This tests sample-tests some well known (and hopefully long existing) modules regarding pre-compiled pyc files
+    # !!! IMPORTANT !!!
+    # in case any tested module does not exist anymore, please replace it with an existing one!
+
+    output = site.check_output(
+        ["python3", "-v", "-c", f"import {import_path}"], stderr=subprocess.STDOUT
+    )
+    assert (
+        f"{site.root}/{expected_pyc_file} matches {site.root}/{expected_source_file}" in output
+    ), f"No matching pyc file for '{import_path}' found"

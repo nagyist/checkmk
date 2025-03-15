@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, TypeVar
 
@@ -14,17 +16,22 @@ from redis import ConnectionError as RedisConnectionError
 from redis import Redis
 from redis.client import Pipeline
 
-from .exceptions import MKTimeout
-from .paths import omd_root
+from cmk.ccc.exceptions import MKTimeout
+
+from cmk.utils.paths import omd_root
 
 QueryData = TypeVar("QueryData")
 
 
 def get_redis_client() -> Redis[str]:
+    """Builds a ready-to-use Redis client instance
+
+    Note: Use the returing object as context manager to ensure proper cleanup.
+    """
     if not redis_enabled():
         raise RuntimeError("Redis currently explicitly disabled")
     return Redis.from_url(
-        f"unix://{omd_root}/tmp/run/redis",
+        f"unix://{omd_root / 'tmp/run/redis'}",
         db=0,
         encoding="utf-8",
         decode_responses=True,
@@ -60,8 +67,8 @@ def query_redis(
     ttl_query_lock: int = 5,
     ttl_update_lock: int = 10,
 ) -> QueryData:
-    query_lock = client.lock("%s.query_lock" % data_key, timeout=ttl_query_lock)
-    update_lock = client.lock("%s.update_lock" % data_key, timeout=ttl_update_lock)
+    query_lock = client.lock(f"{data_key}.query_lock", timeout=ttl_query_lock)
+    update_lock = client.lock(f"{data_key}.update_lock", timeout=ttl_update_lock)
     try:
         query_lock.acquire()
         integrity_result = integrity_callback()
@@ -83,13 +90,12 @@ def query_redis(
             query_lock.acquire()
             pipeline.execute()
         elif blocking:
-            # Blocking was required, but timeout occurred
-            raise DataUnavailableException()
+            raise DataUnavailableException("Could not aquire lock in time")
         return query_callback()
     except MKTimeout:
         raise
     except Exception as e:
-        raise DataUnavailableException(e)
+        raise DataUnavailableException(e) from e
     finally:
         if query_lock.owned():
             query_lock.release()
@@ -97,19 +103,23 @@ def query_redis(
             update_lock.release()
 
 
-_ENABLED = True
-
-
 @contextmanager
 def disable_redis() -> Iterator[None]:
-    global _ENABLED
-    last_value = _ENABLED
-    _ENABLED = False
+    last_value = _SWITCH.enabled
+    _SWITCH.enabled = False
     try:
         yield
     finally:
-        _ENABLED = last_value
+        _SWITCH.enabled = last_value
 
 
 def redis_enabled() -> bool:
-    return _ENABLED
+    return _SWITCH.enabled
+
+
+@dataclass
+class _ThreadSafeRedisSwitch(threading.local):
+    enabled: bool
+
+
+_SWITCH = _ThreadSafeRedisSwitch(enabled=True)

@@ -6,21 +6,22 @@
 import abc
 import collections
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+
+import cmk.ccc.version as cmk_version
 
 import cmk.utils.paths
-import cmk.utils.version as cmk_version
 
 import cmk.gui.pages
-import cmk.gui.sites as sites
 import cmk.gui.view_utils
-import cmk.gui.visuals as visuals
-import cmk.gui.weblib as weblib
+from cmk.gui import sites, visuals, weblib
 from cmk.gui.alarm import play_alarm_sounds
 from cmk.gui.breadcrumb import Breadcrumb
 from cmk.gui.config import active_config
+from cmk.gui.data_source import row_id
 from cmk.gui.display_options import display_options
 from cmk.gui.exceptions import MKUserError
+from cmk.gui.hooks import call as call_hooks
 from cmk.gui.htmllib.html import html
 from cmk.gui.htmllib.top_heading import top_heading
 from cmk.gui.http import request
@@ -39,27 +40,21 @@ from cmk.gui.page_menu import (
     PageMenuTopic,
 )
 from cmk.gui.page_menu_entry import toggle_page_menu_entries
-from cmk.gui.page_menu_utils import (
-    collect_context_links,
-    get_context_page_menu_dropdowns,
-    get_ntop_page_menu_dropdown,
-)
-from cmk.gui.plugins.visuals.utils import Filter
+from cmk.gui.page_menu_utils import collect_context_links, get_context_page_menu_dropdowns
+from cmk.gui.painter_options import PainterOptions
 from cmk.gui.type_defs import HTTPVariables, InfoName, Rows, ViewSpec
+from cmk.gui.utils.filter import check_if_non_default_filter_in_request
 from cmk.gui.utils.html import HTML
-from cmk.gui.utils.ntop import get_ntop_connection, is_ntop_configured
 from cmk.gui.utils.output_funnel import output_funnel
+from cmk.gui.utils.selection_id import SelectionId
 from cmk.gui.utils.transaction_manager import transactions
 from cmk.gui.utils.urls import DocReference, makeuri, makeuri_contextless
 from cmk.gui.view import View
 from cmk.gui.views.command import Command, do_actions, get_command_groups, should_show_command_form
-from cmk.gui.views.data_source import row_id
-from cmk.gui.views.painter_options import PainterOptions
+from cmk.gui.views.page_ajax_filters import AjaxInitialViewFilters
 from cmk.gui.visuals import view_title
+from cmk.gui.visuals.filter import Filter
 from cmk.gui.watolib.activate_changes import get_pending_changes_tooltip, has_pending_changes
-
-if not cmk_version.is_raw_edition():
-    from cmk.gui.cee.ntop.connector import get_cache  # pylint: disable=no-name-in-module
 
 
 def _filter_selected_rows(view_spec: ViewSpec, rows: Rows, selected_ids: list[str]) -> Rows:
@@ -71,9 +66,12 @@ def _filter_selected_rows(view_spec: ViewSpec, rows: Rows, selected_ids: list[st
 
 
 def show_filter_form(view: View, show_filters: list[Filter]) -> None:
+    context = dict(view.context)
+    if "siteopt" in context and (site_id := request.var("site")):
+        context["siteopt"] = {"site": site_id}
     visuals.show_filter_form(
         info_list=view.datasource.infos,
-        context={f.ident: view.context.get(f.ident, {}) for f in show_filters if f.available()},
+        context={f.ident: context.get(f.ident, {}) for f in show_filters if f.available()},
         page_name=view.name,
         reset_ajax_page="ajax_initial_view_filters",
     )
@@ -101,30 +99,34 @@ class ABCViewRenderer(abc.ABC):
 
 
 class GUIViewRenderer(ABCViewRenderer):
-    def __init__(self, view: View, show_buttons: bool) -> None:
+    def __init__(
+        self,
+        view: View,
+        show_buttons: bool,
+        page_menu_dropdowns_callback: Callable[[View, Rows, list[PageMenuDropdown]], None],
+    ) -> None:
         super().__init__(view)
         self._show_buttons = show_buttons
+        self._page_menu_dropdowns_callback = page_menu_dropdowns_callback
 
-    def render(  # type: ignore[no-untyped-def] # pylint: disable=too-many-branches
+    def render(
         self,
         rows: Rows,
         show_checkboxes: bool,
         num_columns: int,
         show_filters: list[Filter],
         unfiltered_amount_of_rows: int,
-    ):
+    ) -> None:
         view_spec = self.view.spec
 
         if transactions.transaction_valid() and html.do_actions():
             html.browser_reload = 0.0
 
-        # Show/Hide the header with page title, MK logo, etc.
+        # Show/hide the header with page title, MK logo, etc.
         if display_options.enabled(display_options.H):
             html.body_start(view_title(view_spec, self.view.context))
 
         if display_options.enabled(display_options.T):
-            if self.view.checkboxes_displayed:
-                weblib.selection_id()
             breadcrumb = self.view.breadcrumb()
             top_heading(
                 html,
@@ -172,7 +174,9 @@ class GUIViewRenderer(ABCViewRenderer):
                 rows = _filter_selected_rows(
                     view_spec,
                     rows,
-                    user.get_rowselection(weblib.selection_id(), "view-" + view_spec["name"]),
+                    user.get_rowselection(
+                        SelectionId.from_request(request), "view-" + view_spec["name"]
+                    ),
                 )
 
             if (
@@ -211,6 +215,18 @@ class GUIViewRenderer(ABCViewRenderer):
         if display_options.enabled(display_options.R):
             html.open_div(id_="data_container")
 
+        # In multi site setups error messages of single sites do not block the
+        # output and raise now exception. We simply print error messages here.
+        # In case of the web service we show errors only on single site installations.
+        if active_config.show_livestatus_errors and display_options.enabled(display_options.W):
+            for info in sites.live().dead_sites().values():
+                if isinstance(info["site"], dict):
+                    html.show_error(
+                        "<b>{} - {}</b><br>{}".format(
+                            info["site"]["alias"], _("Livestatus error"), info["exception"]
+                        )
+                    )
+
         missing_single_infos = self.view.missing_single_infos
         if missing_single_infos:
             html.show_warning(
@@ -225,7 +241,17 @@ class GUIViewRenderer(ABCViewRenderer):
         for message in self.view.warning_messages:
             html.show_warning(message)
 
+        call_hooks("rmk_view_banner", self.view.name)
+
         if not has_done_actions and not missing_single_infos:
+            if self.view.spec.get("mustsearch") and len(rows) == 0:
+                html.open_div(class_="info")
+                html.icon("toggle_details")
+                html.span(
+                    _(' To view content, click on "<b>Apply filters</b>" in the "Filters" panel.')
+                )
+                html.close_div()
+
             html.div("", id_="row_info")
             if display_options.enabled(display_options.W):
                 row_limit = None if self.view.datasource.ignore_limit else self.view.row_limit
@@ -253,7 +279,9 @@ class GUIViewRenderer(ABCViewRenderer):
                 selected = _filter_selected_rows(
                     view_spec,
                     rows,
-                    user.get_rowselection(weblib.selection_id(), "view-" + view_spec["name"]),
+                    user.get_rowselection(
+                        SelectionId.from_request(request), "view-" + view_spec["name"]
+                    ),
                 )
                 row_info = "%d/%s" % (len(selected), row_info)
             html.javascript("cmk.utils.update_row_info(%s);" % json.dumps(row_info))
@@ -274,17 +302,6 @@ class GUIViewRenderer(ABCViewRenderer):
         else:
             # Always hide action related context links in this situation
             toggle_page_menu_entries(html, css_class="command", state=False)
-
-        # In multi site setups error messages of single sites do not block the
-        # output and raise now exception. We simply print error messages here.
-        # In case of the web service we show errors only on single site installations.
-        if active_config.show_livestatus_errors and display_options.enabled(display_options.W):
-            for info in sites.live().dead_sites().values():
-                if isinstance(info["site"], dict):
-                    html.show_error(
-                        "<b>%s - %s</b><br>%s"
-                        % (info["site"]["alias"], _("Livestatus error"), info["exception"])
-                    )
 
         if display_options.enabled(display_options.R):
             html.close_div()
@@ -333,7 +350,8 @@ class GUIViewRenderer(ABCViewRenderer):
             PageMenuDropdown(
                 name="export",
                 title=_("Export"),
-                topics=[
+                topics=self._page_menu_topic_add_to()
+                + [
                     PageMenuTopic(
                         title=_("Data"),
                         entries=list(self._page_menu_entries_export_data()),
@@ -349,22 +367,10 @@ class GUIViewRenderer(ABCViewRenderer):
         page_menu_dropdowns = (
             self._page_menu_dropdown_commands()
             + self._page_menu_dropdowns_context(rows)
-            + self._page_menu_dropdown_add_to()
             + export_dropdown
         )
 
-        if rows:
-            host_address = rows[0].get("host_address")
-            if is_ntop_configured():
-                ntop_connection = get_ntop_connection()
-                assert ntop_connection
-                ntop_instance = ntop_connection["hostaddress"]
-                if (
-                    host_address is not None
-                    and get_cache().is_instance_up(ntop_instance)
-                    and get_cache().is_ntop_host(host_address)
-                ):
-                    page_menu_dropdowns.insert(3, self._page_menu_dropdowns_ntop(host_address))
+        self._page_menu_dropdowns_callback(self.view, rows, page_menu_dropdowns)
 
         menu = PageMenu(
             dropdowns=page_menu_dropdowns,
@@ -412,9 +418,22 @@ class GUIViewRenderer(ABCViewRenderer):
         for _group_class, commands in sorted(by_group.items(), key=lambda x: x[0]().sort_index):
             for command in commands:
                 yield PageMenuEntry(
-                    title=command.title,
+                    title=str(command.title),
                     icon_name=command.icon_name,
-                    item=PageMenuPopup(self._render_command_form(info_name, command)),
+                    item=(
+                        PageMenuPopup(self._render_command_form(info_name, command))
+                        if command.show_command_form
+                        else make_simple_link(
+                            makeuri(
+                                request,
+                                [
+                                    ("_transid", str(transactions.get())),
+                                    ("_do_actions", "yes"),
+                                    (f"_{command.ident}", True),
+                                ],
+                            )
+                        )
+                    ),
                     name="command_%s" % command.ident,
                     is_enabled=should_show_command_form(self.view.datasource),
                     is_show_more=command.is_show_more,
@@ -425,11 +444,6 @@ class GUIViewRenderer(ABCViewRenderer):
 
     def _page_menu_dropdowns_context(self, rows: Rows) -> list[PageMenuDropdown]:
         return get_context_page_menu_dropdowns(self.view, rows, mobile=False)
-
-    def _page_menu_dropdowns_ntop(  # type: ignore[no-untyped-def]
-        self, host_address
-    ) -> PageMenuDropdown:
-        return get_ntop_page_menu_dropdown(self.view, host_address)
 
     def _page_menu_entries_export_data(self) -> Iterator[PageMenuEntry]:
         if not user.may("general.csv_export"):
@@ -460,7 +474,7 @@ class GUIViewRenderer(ABCViewRenderer):
         )
 
     def _page_menu_entries_export_reporting(self, rows: Rows) -> Iterator[PageMenuEntry]:
-        if cmk_version.is_raw_edition():
+        if cmk_version.edition(cmk.utils.paths.omd_root) is cmk_version.Edition.CRE:
             return
 
         if not user.may("general.instant_reports"):
@@ -494,16 +508,10 @@ class GUIViewRenderer(ABCViewRenderer):
             ),
         )
 
-        if display_options.enabled(display_options.D):
-            display_dropdown.topics.insert(
-                0,
-                PageMenuTopic(
-                    title=_("Format"),
-                    entries=list(self._page_menu_entries_view_format()),
-                ),
-            )
-
-        if display_options.enabled(display_options.F):
+        # Only render the filter page menu popup if there are filters available for the given infos
+        if display_options.enabled(display_options.F) and visuals.filters_exist_for_infos(
+            self.view.datasource.infos
+        ):
             display_dropdown.topics.insert(
                 0,
                 PageMenuTopic(
@@ -513,27 +521,28 @@ class GUIViewRenderer(ABCViewRenderer):
             )
 
     def _page_menu_entries_filter(self, show_filters: list[Filter]) -> Iterator[PageMenuEntry]:
-        is_filter_set = request.var("filled_in") == "filter"
-
+        is_filter_set = check_if_non_default_filter_in_request(
+            AjaxInitialViewFilters().get_context(page_name=self.view.name)
+        )
         yield PageMenuEntry(
             title=_("Filter"),
-            icon_name="filters_set" if is_filter_set else "filter",
+            icon_name={"icon": "filter", "emblem": "warning"} if is_filter_set else "filter",
             item=PageMenuSidePopup(self._render_filter_form(show_filters)),
             name="filters",
             is_shortcut=True,
         )
 
-    def _page_menu_entries_view_format(self) -> Iterator[PageMenuEntry]:
-        painter_options = PainterOptions.get_instance()
-        yield PageMenuEntry(
-            title=_("Modify display options"),
-            icon_name="painteroptions",
-            item=PageMenuPopup(self._render_painter_options_form()),
-            name="display_painter_options",
-            is_enabled=painter_options.painter_option_form_enabled(),
-        )
-
     def _page_menu_entries_view_layout(self) -> Iterator[PageMenuEntry]:
+        if display_options.enabled(display_options.D):
+            painter_options = PainterOptions.get_instance()
+            yield PageMenuEntry(
+                title=_("Modify display options"),
+                icon_name="painteroptions",
+                item=PageMenuPopup(self._render_painter_options_form()),
+                name="display_painter_options",
+                is_enabled=painter_options.painter_option_form_enabled(),
+            )
+
         checkboxes_toggleable = (
             self.view.layout.can_display_checkboxes and not self.view.checkboxes_enforced
         )
@@ -586,7 +595,7 @@ class GUIViewRenderer(ABCViewRenderer):
 
             if is_builtin_view or not is_own_view:
                 yield PageMenuEntry(
-                    title=_("Clone builtin view") if is_builtin_view else _("Clone view"),
+                    title=_("Clone built-in view") if is_builtin_view else _("Clone view"),
                     icon_name="clone",
                     item=make_simple_link(
                         makeuri_contextless(
@@ -597,41 +606,42 @@ class GUIViewRenderer(ABCViewRenderer):
                     ),
                 )
 
-    def _page_menu_dropdown_add_to(self) -> list[PageMenuDropdown]:
-        return visuals.page_menu_dropdown_add_to_visual(add_type="view", name=self.view.name)
+    def _page_menu_topic_add_to(self) -> list[PageMenuTopic]:
+        return visuals.page_menu_topic_add_to(
+            visual_type="view", name=self.view.name, source_type="view"
+        )
 
     def _render_filter_form(self, show_filters: list[Filter]) -> HTML:
-        if not display_options.enabled(display_options.F) or not show_filters:
-            return HTML()
+        if not display_options.enabled(display_options.F):
+            return HTML.empty()
 
         with output_funnel.plugged():
             show_filter_form(self.view, show_filters)
-            return HTML(output_funnel.drain())
+            return HTML.without_escaping(output_funnel.drain())
 
     def _render_painter_options_form(self) -> HTML:
         with output_funnel.plugged():
             painter_options = PainterOptions.get_instance()
             painter_options.show_form(self.view.spec, self.view.painter_options)
-            return HTML(output_funnel.drain())
+            return HTML.without_escaping(output_funnel.drain())
 
     def _render_command_form(self, info_name: InfoName, command: Command) -> HTML:
         with output_funnel.plugged():
             if not should_show_command_form(self.view.datasource):
-                return HTML()
+                return HTML.empty()
 
             # TODO: Make unique form names (object IDs), investigate whether or not something
             # depends on the form name "actions"
-            html.begin_form("actions")
-            # TODO: Are these variables still needed
-            html.hidden_field("_do_actions", "yes")
-            html.hidden_field("actions", "yes")
+            with html.form_context("actions"):
+                # TODO: Are these variables still needed
+                html.hidden_field("_do_actions", "yes")
+                html.hidden_field("actions", "yes")
 
-            command.render(info_name)
+                command.render(info_name)
 
-            html.hidden_fields()
-            html.end_form()
+                html.hidden_fields()
 
-            return HTML(output_funnel.drain())
+            return HTML.without_escaping(output_funnel.drain())
 
     def _extend_help_dropdown(self, menu: PageMenu) -> None:
         # TODO

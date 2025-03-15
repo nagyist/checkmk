@@ -8,7 +8,7 @@ This is the Check_MK Agent plugin. If configured it will be called by the
 agent without arguments.
 
 Options:
-    -d               Debug mode: Colored output, no saving of status.
+    -d               Debug mode: No saving of status.
     -c CONFIG_FILE   Use this config file
     -h               Show help.
     --no_state       No state
@@ -20,7 +20,7 @@ You should find an example configuration file at
 
 from __future__ import with_statement
 
-__version__ = "2.3.0b1"
+__version__ = "2.5.0b1"
 
 import sys
 
@@ -45,15 +45,13 @@ import socket
 import time
 
 try:
-    from typing import (  # noqa: F401 # pylint: disable=unused-import
-        Any,
+    from collections.abc import (  # noqa: F401
         Collection,
-        Dict,
         Iterable,
         Iterator,
         Sequence,
-        Tuple,
     )
+    from typing import Any  # noqa: F401
 except ImportError:
     # We need typing only for testing
     pass
@@ -80,20 +78,11 @@ IPV4_REGEX = re.compile(r"^(::ffff:|::ffff:0:|)(?:[0-9]{1,3}\.){3}[0-9]{1,3}$")
 IPV6_REGEX = re.compile(r"^(?:[A-F0-9]{1,4}:){7}[A-F0-9]{1,4}$")
 
 ENCODINGS = (
-    (b"\xFF\xFE", "utf_16"),
-    (b"\xFE\xFF", "utf_16_be"),
+    (b"\xff\xfe", "utf_16"),
+    (b"\xfe\xff", "utf_16_be"),
 )
 
-TTY_COLORS = {
-    "C": "\033[1;31m",  # red
-    "W": "\033[1;33m",  # yellow
-    "O": "\033[1;32m",  # green
-    "I": "\033[1;34m",  # blue
-    ".": "",  # remain same
-    "normal": "\033[0m",
-}
-
-CONFIG_ERROR_PREFIX = "CANNOT READ CONFIG FILE: "  # detected by check plugin
+CONFIG_ERROR_PREFIX = "CANNOT READ CONFIG FILE: "  # detected by check plug-in
 
 PY2 = sys.version_info[0] == 2
 PY3 = sys.version_info[0] == 3
@@ -103,7 +92,7 @@ if PY3:
     text_type = str
     binary_type = bytes
 else:
-    text_type = unicode  # pylint: disable=undefined-variable
+    text_type = unicode  # noqa: F821
     binary_type = str
 
 
@@ -180,7 +169,7 @@ else:
     # Python 2 and Python < 3.4 don't support decoding with "backslashreplace" error handler,
     # but we need it to uniquely represent UNIX paths in monitoring.
     def backslashreplace_decode(exception):
-        # type: (UnicodeError) -> Tuple[text_type, int]
+        # type: (UnicodeError) -> tuple[text_type, int]
 
         if not isinstance(exception, UnicodeDecodeError):
             # We'll use this error handler only for decoding, as the original
@@ -208,7 +197,7 @@ def init_logging(verbosity):
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(lineno)s: %(message)s")
 
 
-class ArgsParser:  # pylint: disable=too-few-public-methods
+class ArgsParser:
     """
     Custom argument parsing.
     (Neither use optparse which is Python 2.3 to 2.7 only.
@@ -623,11 +612,7 @@ def get_formatted_line(line, level):
     # type: (text_type, str) -> text_type
     formatted_line = "%s %s" % (level, line)
     if sys.stdout.isatty():
-        formatted_line = "%s%s%s" % (
-            TTY_COLORS[level],
-            formatted_line.replace("\1", "\nCONT:"),
-            TTY_COLORS["normal"],
-        )
+        formatted_line = formatted_line.replace("\1", "\nCONT:")
     return formatted_line
 
 
@@ -636,7 +621,7 @@ def should_log_line_with_level(level, nocontext):
     return not (nocontext and level == ".")
 
 
-def process_logfile(section, filestate, debug):  # pylint: disable=too-many-branches
+def process_logfile(section, filestate, debug):
     # type: (LogfileSection, dict[str, Any], object) -> tuple[text_type, list[text_type]]
     """
     Returns tuple of (
@@ -799,13 +784,8 @@ def process_logfile(section, filestate, debug):  # pylint: disable=too-many-bran
         offset_wrap = new_offset // section.options.maxfilesize
         if ((offset or 0) // section.options.maxfilesize) < offset_wrap:
             warnings_and_errors.append(
-                "%sW Maximum allowed logfile size (%d bytes) exceeded for the %dth time.%s\n"
-                % (
-                    TTY_COLORS["W"] if sys.stdout.isatty() else "",
-                    section.options.maxfilesize,
-                    offset_wrap,
-                    TTY_COLORS["normal"] if sys.stdout.isatty() else "",
-                )
+                "W Maximum allowed logfile size (%d bytes) exceeded for the %dth time.\n"
+                % (section.options.maxfilesize, offset_wrap)
             )
 
     # output all lines if at least one warning, error or ok has been found
@@ -817,7 +797,7 @@ def process_logfile(section, filestate, debug):  # pylint: disable=too-many-bran
 class Options:
     """Options w.r.t. logfile patterns (not w.r.t. cluster mapping)."""
 
-    MAP_OVERFLOW = {"C": 2, "W": 1, "I": 0, "O": 0}
+    MAP_OVERFLOW = {"C": 2, "W": 1, "I": 0, "O": 0}  # case-insensitive, see set_opt
     MAP_BOOL = {"true": True, "false": False, "1": True, "0": False, "yes": True, "no": False}
     DEFAULTS = {
         "encoding": None,
@@ -829,14 +809,14 @@ class Options:
         "overflow": "C",
         "nocontext": None,
         "maxcontextlines": None,
-        "maxoutputsize": 500000,  # same as logwatch_max_filesize in check plugin
+        "maxoutputsize": 500000,  # same as logwatch_max_filesize in check plug-in
         "fromstart": False,
         "skipconsecutiveduplicated": False,
     }
 
     def __init__(self):
         # type: () -> None
-        self.values = {}  # type: Dict
+        self.values = {}  # type: dict
 
     @property
     def encoding(self):
@@ -910,7 +890,7 @@ class Options:
             elif key in ("maxtime",):
                 self.values[key] = float(value)
             elif key == "overflow":
-                if value not in Options.MAP_OVERFLOW:
+                if value.upper() not in Options.MAP_OVERFLOW:
                     raise ValueError(
                         "Invalid overflow: %r (choose from %r)"
                         % (
@@ -918,7 +898,7 @@ class Options:
                             Options.MAP_OVERFLOW.keys(),
                         )
                     )
-                self.values["overflow"] = value
+                self.values["overflow"] = value.upper()
             elif key in ("regex", "iregex"):
                 flags = (re.IGNORECASE if key.startswith("i") else 0) | re.UNICODE
                 self.values["regex"] = re.compile(value, flags)
@@ -955,6 +935,11 @@ class PatternConfigBlock:
         super().__init__()
         self.files = files
         self.patterns = patterns
+        # First read all the options like 'maxlines=100' or 'maxtime=10'
+        self.options = Options()
+        for item in self.files:
+            if "=" in item:
+                self.options.set_opt(item)
 
 
 class ClusterConfigBlock:
@@ -1034,12 +1019,8 @@ class LogfileSection:
         self.name_fs = logfile_ref[0]
         self.name_write = logfile_ref[1]
         self.options = Options()
-        self.patterns = (
-            []
-        )  # type: list[tuple[text_type, text_type, Sequence[text_type], Sequence[text_type]]]
-        self._compiled_patterns = (
-            None
-        )  # type: list[tuple[text_type, re.Pattern, Sequence[re.Pattern | int], Sequence[text_type]]] | None
+        self.patterns = []  # type: list[tuple[text_type, text_type, Sequence[text_type], Sequence[text_type]]]
+        self._compiled_patterns = None  # type: list[tuple[text_type, re.Pattern, Sequence[re.Pattern | int], Sequence[text_type]]] | None
 
     @property
     def compiled_patterns(self):
@@ -1047,9 +1028,7 @@ class LogfileSection:
         if self._compiled_patterns is not None:
             return self._compiled_patterns
 
-        compiled_patterns = (
-            []
-        )  # type: list[tuple[text_type, re.Pattern, Sequence[re.Pattern | int], Sequence[text_type]]]
+        compiled_patterns = []  # type: list[tuple[text_type, re.Pattern, Sequence[re.Pattern | int], Sequence[text_type]]]
         for level, raw_pattern, cont_list, rewrite_list in self.patterns:
             if not rewrite_list:
                 # it does not matter what the matched group is in this case
@@ -1071,24 +1050,18 @@ def parse_sections(logfiles_config):
     non_matching_patterns = []
 
     for cfg in logfiles_config:
-        # First read all the options like 'maxlines=100' or 'maxtime=10'
-        opt = Options()
-        for item in cfg.files:
-            if "=" in item:
-                opt.set_opt(item)
-
         # Then handle the file patterns
         # The thing here is that the same file could match different patterns.
         for glob_pattern in (f for f in cfg.files if "=" not in f):
             logfile_refs = find_matching_logfiles(glob_pattern)
-            if opt.regex is not None:
-                logfile_refs = [ref for ref in logfile_refs if opt.regex.search(ref[1])]
+            if cfg.options.regex is not None:
+                logfile_refs = [ref for ref in logfile_refs if cfg.options.regex.search(ref[1])]
             if not logfile_refs:
                 non_matching_patterns.append(glob_pattern)
             for logfile_ref in logfile_refs:
                 section = found_sections.setdefault(logfile_ref[0], LogfileSection(logfile_ref))
                 section.patterns.extend(cfg.patterns)
-                section.options.update(opt)
+                section.options.update(cfg.options)
 
     logfile_sections = [found_sections[k] for k in sorted(found_sections)]
 
@@ -1177,7 +1150,7 @@ def _filter_maxcontextlines(lines_list, before, after):
         if new_in_context_idx < n_lines and context_end < n_lines:
             new_in_context = lines_list[new_in_context_idx]
             # if the line ahead is relevant, extend the context
-            if new_in_context.startswith(("C", "W")):
+            if new_in_context.startswith(("C", "W", "O")):
                 context_end = new_in_context_idx + after
         if 0 <= idx <= context_end:
             yield lines_list[idx]
@@ -1281,7 +1254,7 @@ def process_batches(current_batch, current_batch_id, remote, retention_period, n
             pass
 
 
-def main(argv=None):  # pylint: disable=too-many-branches
+def main(argv=None):
     if argv is None:
         argv = sys.argv
 

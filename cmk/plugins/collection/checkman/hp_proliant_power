@@ -1,0 +1,16 @@
+title: HPE Proliant Servers: Power Meter
+agents: snmp
+catalog: hw/server/hpe
+license: GPLv2
+distribution: check_mk
+description:
+ This check connects to the SNMP agent installed on an operating system
+ on a HPE Proliant server (or iLO Board) and reads the information from the {CPQHLTH-MIB}
+ MIB.
+ The systems SNMP agent is extended by the HPE Management Agents which need
+ to be installed on the monitored systems.
+
+ The check monitors the state of the power meter and his current reading in Watt.
+
+discovery:
+ One service is created.

@@ -9,28 +9,6 @@ from unittest import mock
 
 import pytest
 
-from tests.testlib.base import Scenario
-
-from cmk.utils.type_defs import HostName
-
-
-@pytest.fixture(name="core_scenario")
-def fixture_core_scenario(monkeypatch):
-    ts = Scenario()
-    ts.add_host(HostName("test-host"))
-    ts.set_option("ipaddresses", {"test-host": "127.0.0.1"})
-    return ts.apply(monkeypatch)
-
-
-# Automatically refresh caches for each test
-@pytest.fixture(autouse=True, scope="function")
-def clear_config_caches(monkeypatch):
-    from cmk.utils.caching import config_cache as _config_cache
-    from cmk.utils.caching import runtime_cache as _runtime_cache
-
-    _config_cache.clear()
-    _runtime_cache.clear()
-
 
 class _MockVSManager(typing.NamedTuple):
     active_service_interface: abc.Mapping[str, object]
@@ -40,7 +18,7 @@ class _MockVSManager(typing.NamedTuple):
 def initialised_item_state():
     mock_vs = _MockVSManager({})
     with mock.patch(
-        "cmk.base.api.agent_based.value_store._global_state._active_host_value_store",
+        "cmk.agent_based.v1.value_store._active_host_value_store",
         mock_vs,
     ):
         yield

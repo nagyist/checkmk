@@ -7,9 +7,9 @@ import base64
 from collections.abc import Collection
 from datetime import datetime
 
-from cmk.utils.type_defs import UserId
+from cmk.utils.user import UserId
 
-import cmk.gui.userdb as userdb
+from cmk.gui import userdb
 from cmk.gui.breadcrumb import Breadcrumb, BreadcrumbItem, make_simple_page_breadcrumb
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.htmllib.html import html
@@ -25,16 +25,21 @@ from cmk.gui.page_menu import (
     PageMenuEntry,
     PageMenuTopic,
 )
-from cmk.gui.plugins.userdb.utils import connections_by_type, ConnectorType, get_connection
-from cmk.gui.plugins.wato.utils import mode_registry, mode_url, redirect, WatoMode
 from cmk.gui.type_defs import ActionResult, PermissionName, Users
+from cmk.gui.userdb import connections_by_type, ConnectorType, get_connection, get_user_attributes
+from cmk.gui.utils.csrf_token import check_csrf_token
 from cmk.gui.utils.flashed_messages import flash
+from cmk.gui.utils.selection_id import SelectionId
 from cmk.gui.utils.transaction_manager import transactions
 from cmk.gui.utils.urls import makeuri_contextless
 from cmk.gui.valuespec import CascadingDropdown, Dictionary, ListChoice
+from cmk.gui.watolib.mode import mode_url, ModeRegistry, redirect, WatoMode
 
 
-@mode_registry.register
+def register(mode_registry: ModeRegistry) -> None:
+    mode_registry.register(ModeUserMigrate)
+
+
 class ModeUserMigrate(WatoMode):
     @classmethod
     def name(cls) -> str:
@@ -140,11 +145,10 @@ class ModeUserMigrate(WatoMode):
             )
         )
 
-        html.begin_form("user_migrate", method="POST")
-        self._valuespec().render_input_as_form("_user_migrate", {})
+        with html.form_context("user_migrate", method="POST"):
+            self._valuespec().render_input_as_form("_user_migrate", {})
 
-        html.hidden_fields()
-        html.end_form()
+            html.hidden_fields()
         html.footer()
 
     def _show_result_page(self) -> None:
@@ -160,6 +164,8 @@ class ModeUserMigrate(WatoMode):
         )
 
     def action(self) -> ActionResult:
+        check_csrf_token()
+
         if not transactions.check_transaction():
             return None
 
@@ -237,8 +243,13 @@ class ModeUserMigrate(WatoMode):
             for attribute in attributes:
                 if attribute not in all_users[user_id]:
                     continue
-                # TODO Expected TypedDict key to be string literal [misc]
-                all_users[user_id].pop(attribute, None)  # type: ignore[misc]
+
+                match attribute:
+                    case "roles":
+                        all_users[user_id]["roles"] = []
+                    case _:
+                        # TODO Expected TypedDict key to be string literal [misc]
+                        all_users[user_id].pop(attribute, None)  # type: ignore[misc]
 
             all_users[user_id]["connector"] = connector
             if connector == "htpasswd":
@@ -256,13 +267,13 @@ def _get_attribute_choices() -> list[tuple[str, str]]:
     default_choices: list[tuple[str, str]] = [
         ("email", "Email address"),
         ("pager", "Pager address"),
-        ("contactgroups", "Contact Groups"),
+        ("contactgroups", "Contact groups"),
         ("fallback_contact", "Receive fallback notifications"),
         ("roles", "Roles"),
     ]
 
     builtin_attribute_choices: list[tuple[str, str]] = []
-    for name, attr in userdb.get_user_attributes():
+    for name, attr in get_user_attributes():
         builtin_attribute_choices.append((name, attr.valuespec().title() or attr.name()))
 
     return default_choices + builtin_attribute_choices
@@ -271,7 +282,7 @@ def _get_attribute_choices() -> list[tuple[str, str]]:
 def _get_selected_users() -> list[str]:
     selected_users: list[str] = []
     for selection in user.get_rowselection(
-        request.get_str_input_mandatory("selection"),
+        SelectionId.from_request(request),
         "users",
     ):
         selected_users.append(
@@ -285,7 +296,7 @@ def _get_connector_choices() -> list[tuple[str, str, None]]:
 
     for connector_type in [ConnectorType.LDAP, ConnectorType.SAML2]:
         connector_choices += [
-            (connection["id"], f'{connector_type.upper()}: {connection["id"]}', None)
+            (connection["id"], f"{connector_type.upper()}: {connection['id']}", None)
             for connection in connections_by_type(connector_type)
         ]
     return connector_choices

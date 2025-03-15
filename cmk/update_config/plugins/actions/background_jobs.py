@@ -1,102 +1,94 @@
 #!/usr/bin/env python3
-# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-import shutil
-from collections.abc import Iterator
+import hashlib
+import json
+import os
 from logging import Logger
-from pathlib import Path
-from typing import Any
+from typing import Literal, override
 
-from cmk.utils.log import VERBOSE
+from cmk.utils import tty
 
-from cmk.gui.background_job import (
-    BackgroundJobDefines,
-    BackgroundJobManager,
-    job_registry,
-    JobId,
-    JobStatusSpec,
-    JobStatusStates,
-    JobStatusStore,
-)
+from cmk.gui.background_job import BackgroundJobDefines
 
 from cmk.update_config.registry import update_action_registry, UpdateAction
-from cmk.update_config.update_state import UpdateActionState
 
 
-class UpdateBackgroundJobStatusSpec(UpdateAction):
-    def __call__(self, logger: Logger, update_action_state: UpdateActionState) -> None:
-        for job_id in _get_all_job_ids(logger):
-            update_job_status(logger, Path(BackgroundJobDefines.base_dir, job_id))
+class UpdateBackgroundJobs(UpdateAction):
+    @override
+    def __call__(self, logger: Logger) -> None:
+        _rename_background_job_dirs(logger)
 
 
-def update_job_status(logger: Logger, job_path: Path) -> None:
-    logger.log(VERBOSE, "Processing job status from %s", job_path)
-    job_status_store = JobStatusStore(str(job_path))
-    try:
-        raw_status = job_status_store.read_raw()
-    except ValueError:
-        raw_status = None  # Don't fail on falsy values here
-
-    if not raw_status:
-        # The file either vanished magically, was empty or contained None or an empty dict
-        # for some weird reason. Instead of trying to recover this, we clean up this job.
-        logger.log(VERBOSE, "Removing unreadable job status")
-        shutil.rmtree(job_path)
+def _rename_background_job_dirs(logger: Logger) -> None:
+    """
+    Hostnames can be too long, see CMK-16289.
+    We now use the hash of the hostname to create the directory name.
+    """
+    logger.debug("       Rename directories of service discovery background job...")
+    dir_prefix: Literal["service_discovery-"] = "service_discovery-"
+    background_job_path = BackgroundJobDefines.base_dir
+    if not os.path.exists(background_job_path):
+        logger.debug(
+            f"       Background job path {background_job_path} not found, skipping update step..."
+        )
         return
 
-    raw_status = migrate_job_status_spec(
-        raw_status, jobstatus_ctime=job_status_store._jobstatus_path.stat().st_ctime
+    migrated_file_path = os.path.join(
+        background_job_path, ".migrated_service_discovery_directories.json"
     )
 
-    job_status_store.write(JobStatusSpec.parse_obj(raw_status))
+    if os.path.exists(migrated_file_path):
+        with open(migrated_file_path, "r") as migrated_file:
+            migrated_dirs = json.load(migrated_file)
+    else:
+        migrated_dirs = []
+
+    try:
+        for item in os.listdir(background_job_path):
+            if not item.startswith(dir_prefix):
+                continue
+
+            if not os.path.isdir(item_path := os.path.join(background_job_path, item)):
+                continue
+
+            if item in migrated_dirs:
+                continue
+
+            new_name = rename_func(dir_prefix, item)
+            new_path = os.path.join(background_job_path, new_name)
+            os.rename(item_path, new_path)
+            logger.debug(
+                f"       Renamed: {item_path} -> {new_path}...{tty.green}Passed{tty.normal}"
+            )
+
+            migrated_dirs.append(new_name)
+
+    except Exception as e:
+        logger.warning(
+            f"       File {item_path} could not be renamed...{tty.red}Failed{tty.normal}\nError: {e}"
+        )
+
+    with open(migrated_file_path, "w") as migrated_file:
+        json.dump(migrated_dirs, migrated_file)
 
 
-def _get_all_job_ids(logger: Logger) -> Iterator[JobId]:
-    manager = BackgroundJobManager(logger)
-    for job_class in list(job_registry.values()):
-        yield from manager.get_all_job_ids(job_class)
-
-
-def migrate_job_status_spec(status: dict[str, Any], jobstatus_ctime: float) -> dict[str, Any]:
-    """Apply actions to make the existing data structures compatible with the current JobStatusSpec
-    data structure"""
-    status = status.copy()
-    if "state" not in status:
-        status["state"] = JobStatusStates.INITIALIZED
-        status["started"] = jobstatus_ctime
-
-    status.setdefault("pid", None)
-
-    loginfo = status.setdefault(
-        "loginfo",
-        {
-            "JobProgressUpdate": [],
-            "JobResult": [],
-            "JobException": [],
-        },
-    )
-    loginfo.setdefault("JobProgressUpdate", [])
-    loginfo.setdefault("JobResult", [])
-    loginfo.setdefault("JobException", [])
-
-    map_job_state_to_is_active = {
-        JobStatusStates.INITIALIZED: True,
-        JobStatusStates.RUNNING: True,
-        JobStatusStates.FINISHED: False,
-        JobStatusStates.STOPPED: False,
-        JobStatusStates.EXCEPTION: False,
-    }
-    status["is_active"] = map_job_state_to_is_active[status["state"]]
-
-    return status
+def rename_func(
+    dir_prefix: Literal["service_discovery-"],
+    item: str,
+) -> str:
+    """Create new directory name with hostname hash"""
+    host_name = item.replace(dir_prefix, "")
+    host_hash = hashlib.sha256(host_name.encode("utf-8")).hexdigest()
+    return f"{dir_prefix}{host_name[:20]}-{host_hash}"
 
 
 update_action_registry.register(
-    UpdateBackgroundJobStatusSpec(
-        name="background_job_status_specs",
-        title="Background jobs",
-        sort_index=60,
+    UpdateBackgroundJobs(
+        name="background_jobs",
+        title="Update background jobs",
+        sort_index=41,
     )
 )

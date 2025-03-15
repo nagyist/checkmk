@@ -10,38 +10,31 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Any, Literal, NamedTuple, NotRequired, TypedDict, Union
+from typing import Any, Literal, NamedTuple, NewType, NotRequired, TypedDict
 
 from pydantic import BaseModel
 
 from livestatus import SiteId
 
 from cmk.utils.cpu_tracking import Snapshot
-from cmk.utils.crypto import HashAlgorithm
-from cmk.utils.crypto.certificate import (
-    Certificate,
-    CertificatePEM,
-    CertificateWithPrivateKey,
-    EncryptedPrivateKeyPEM,
-    RsaPrivateKey,
-)
-from cmk.utils.crypto.password import Password, PasswordHash
 from cmk.utils.labels import Labels
+from cmk.utils.metrics import MetricName
+from cmk.utils.notify_types import DisabledNotificationsOptions, EventRule
 from cmk.utils.structured_data import SDPath
-from cmk.utils.type_defs import (
-    ContactgroupName,
-    DisabledNotificationsOptions,
-    EventRule,
-    HostName,
-    MetricName,
-    ServiceName,
-    UserId,
-)
+from cmk.utils.user import UserId
 
 from cmk.gui.exceptions import FinalizeRequest
 from cmk.gui.utils.speaklater import LazyString
 
-SizePT = float
+from cmk.crypto.certificate import Certificate, CertificatePEM, CertificateWithPrivateKey
+from cmk.crypto.hash import HashAlgorithm
+from cmk.crypto.keys import EncryptedPrivateKeyPEM, PrivateKey
+from cmk.crypto.password import Password
+from cmk.crypto.password_hashing import PasswordHash
+from cmk.crypto.secrets import Secret
+
+_ContactgroupName = str
+SizePT = NewType("SizePT", float)
 SizeMM = float
 HTTPVariables = list[tuple[str, int | str | None]]
 LivestatusQuery = str
@@ -54,25 +47,9 @@ Choice = tuple[ChoiceId, ChoiceText]
 Choices = list[Choice]  # TODO: Change to Sequence, perhaps DropdownChoiceEntries[str]
 
 
-@dataclass
-class UserRole:
-    name: str
-    alias: str
-    builtin: bool = False
-    permissions: dict[str, bool] = field(default_factory=dict)
-    basedon: str | None = None
-
-    def to_dict(self) -> dict:
-        userrole_dict = {
-            "alias": self.alias,
-            "permissions": self.permissions,
-            "builtin": self.builtin,
-        }
-
-        if not self.builtin:
-            userrole_dict["basedon"] = self.basedon
-
-        return userrole_dict
+class TrustedCertificateAuthorities(TypedDict):
+    use_system_wide_cas: bool
+    trusted_cas: Sequence[str]
 
 
 class ChoiceGroup(NamedTuple):
@@ -90,13 +67,38 @@ class WebAuthnCredential(TypedDict):
     credential_data: bytes
 
 
+class TotpCredential(TypedDict):
+    credential_id: str
+    secret: bytes
+    version: int
+    registered_at: int
+    alias: str
+
+
 class TwoFactorCredentials(TypedDict):
     webauthn_credentials: dict[str, WebAuthnCredential]
     backup_codes: list[PasswordHash]
+    totp_credentials: dict[str, TotpCredential]
+
+
+class WebAuthnActionState(TypedDict):
+    challenge: str
+    user_verification: str
 
 
 SessionId = str
-AuthType = Literal["automation", "cookie", "web_server", "http_header", "bearer", "basic_auth"]
+AuthType = Literal[
+    "basic_auth",
+    "bearer",
+    "cognito",
+    "cookie",
+    "http_header",
+    "internal_token",
+    "login_form",
+    "remote_site",
+    "saml",
+    "web_server",
+]
 
 
 @dataclass
@@ -105,11 +107,14 @@ class SessionInfo:
     started_at: int
     last_activity: int
     csrf_token: str = field(default_factory=lambda: str(uuid.uuid4()))
-    flashes: list[str] = field(default_factory=list)
+    flashes: list[tuple[str, str]] = field(default_factory=list)
+    encrypter_secret: str = field(default_factory=lambda: Secret.generate(32).b64_str)
     # In case it is enabled: Was it already authenticated?
     two_factor_completed: bool = False
+    # Enable a 'login' state for enforcing two factor
+    two_factor_required: bool = False
     # We don't care about the specific object, because it's internal to the fido2 library
-    webauthn_action_state: object = None
+    webauthn_action_state: WebAuthnActionState | None = None
 
     logged_out: bool = field(default=False)
     auth_type: AuthType | None = None
@@ -144,6 +149,51 @@ class SessionInfo:
         self.last_activity = int(now.timestamp())
 
 
+class LastLoginInfo(TypedDict, total=False):
+    auth_type: AuthType
+    timestamp: int
+    remote_address: str
+
+
+# TODO: verify if the 'idea' is the same as notify_types.DisabledNotificationsOptions
+#  but where the 'disable' field is called 'disabled'
+class DisableNotificationsAttribute(TypedDict):
+    disable: NotRequired[Literal[True]]  # disable or disabled?
+    timerange: NotRequired[tuple[float, float]]
+
+
+# TODO: verify if this is the same notify_types.Contact (merge if yes)
+#  should be sure with first validation update
+class UserContactDetails(TypedDict):
+    alias: str
+    disable_notifications: NotRequired[DisabledNotificationsOptions]
+    email: NotRequired[str]
+    pager: NotRequired[str]
+    contactgroups: NotRequired[list[str]]
+    fallback_contact: NotRequired[bool]
+    user_scheme_serial: NotRequired[int]
+    authorized_sites: NotRequired[list[str]]
+    customer: NotRequired[str | None]
+
+
+class UserDetails(TypedDict):
+    alias: str
+    connector: NotRequired[str | None]
+    locked: NotRequired[bool]
+    roles: NotRequired[list[str]]
+    temperature_unit: NotRequired[Literal["celsius", "fahrenheit"] | None]
+    force_authuser: NotRequired[bool]
+    nav_hide_icons_title: NotRequired[Literal["hide"] | None]
+    icons_per_item: NotRequired[Literal["entry"] | None]
+    show_mode: NotRequired[
+        Literal["default_show_less", "default_show_more", "enforce_show_more"] | None
+    ]
+    automation_secret: NotRequired[str]
+    language: NotRequired[str]
+
+
+# TODO: UserSpec gets composed from UserContactDetails and UserDetails so ideally the definition
+#  should highlight this fact. For now, we leave it as is and improve the individual fields
 class UserSpec(TypedDict, total=False):
     """This is not complete, but they don't yet...  Also we have a
     user_attribute_registry (cmk/gui/plugins/userdb/utils.py)
@@ -152,21 +202,23 @@ class UserSpec(TypedDict, total=False):
     """
 
     alias: str
-    authorized_sites: Any  # TODO: Improve this
-    automation_secret: str
-    connector: str | None
-    contactgroups: list[ContactgroupName]
+    authorized_sites: Sequence[SiteId] | None  # "None"/field missing => all sites
+    automation_secret: NotRequired[str]
+    connector: NotRequired[str | None]  # Contains the connection id this user was synced from
+    contactgroups: list[_ContactgroupName]
     customer: str | None
     disable_notifications: DisabledNotificationsOptions
-    email: str  # TODO: Why do we have "email" *and* "mail"?
+    email: NotRequired[str]  # TODO: Why do we have "email" *and* "mail"?
     enforce_pw_change: bool | None
     fallback_contact: bool | None
-    force_authuser: bool
+    force_authuser: NotRequired[bool]
     host_notification_options: str
     idle_timeout: Any  # TODO: Improve this
-    language: str
+    is_automation_user: bool
+    language: NotRequired[str]
     last_pw_change: int
-    locked: bool | None
+    last_login: LastLoginInfo | None
+    locked: NotRequired[bool]
     mail: str  # TODO: Why do we have "email" *and* "mail"?
     notification_method: Any  # TODO: Improve this
     notification_period: str
@@ -178,17 +230,22 @@ class UserSpec(TypedDict, total=False):
     roles: list[str]
     serial: int
     service_notification_options: str
+    store_automation_secret: bool
     session_info: dict[SessionId, SessionInfo]
-    show_mode: str | None
+    show_mode: NotRequired[
+        Literal["default_show_less", "default_show_more", "enforce_show_more"] | None
+    ]
     start_url: str | None
     two_factor_credentials: TwoFactorCredentials
     ui_sidebar_position: Any  # TODO: Improve this
+    ui_saas_onboarding_button_toggle: Literal["invisible"] | None
     ui_theme: Any  # TODO: Improve this
     user_id: UserId
     user_scheme_serial: int
-    nav_hide_icons_title: Literal["hide"] | None
-    icons_per_item: Literal["entry"] | None
-    temperature_unit: str | None
+    nav_hide_icons_title: NotRequired[Literal["hide"] | None]
+    icons_per_item: NotRequired[Literal["entry"] | None]
+    temperature_unit: NotRequired[Literal["celsius", "fahrenheit"] | None]
+    contextual_help_icon: NotRequired[Literal["hide_icon"] | None]
 
 
 class UserObjectValue(TypedDict):
@@ -213,8 +270,8 @@ SingleInfos = Sequence[InfoName]
 class LinkFromSpec(TypedDict, total=False):
     single_infos: SingleInfos
     host_labels: Labels
-    has_inventory_tree: Sequence[SDPath]
-    has_inventory_tree_history: Sequence[SDPath]
+    has_inventory_tree: SDPath
+    has_inventory_tree_history: SDPath
 
 
 class Visual(TypedDict):
@@ -231,9 +288,10 @@ class Visual(TypedDict):
     icon: Icon | None
     hidden: bool
     hidebutton: bool
-    public: bool | tuple[Literal["contact_groups"], Sequence[str]]
+    public: bool | tuple[Literal["contact_groups", "sites"], Sequence[str]]
     packaged: bool
     link_from: LinkFromSpec
+    megamenu_search_terms: Sequence[str]
 
 
 class VisualLinkSpec(NamedTuple):
@@ -243,7 +301,7 @@ class VisualLinkSpec(NamedTuple):
     @classmethod
     def from_raw(cls, value: VisualName | tuple[VisualTypeName, VisualName]) -> VisualLinkSpec:
         # With Checkmk 2.0 we introduced the option to link to dashboards. Now the link_view is not
-        # only a string (view_name) anymore, but a tuple of two elemets: ('<visual_type_name>',
+        # only a string (view_name) anymore, but a tuple of two elements: ('<visual_type_name>',
         # '<visual_name>'). Transform the old value to the new format.
         if isinstance(value, tuple):
             return cls(value[0], value[1])
@@ -267,7 +325,7 @@ class PainterParameters(TypedDict, total=False):
     # TODO Improve:
     # First step was: make painter's param a typed dict with all obvious keys
     # but some possible keys are still missing
-    aggregation: tuple[str, str]
+    aggregation: Literal["min", "max", "avg"] | tuple[str, str]
     color_choices: list[str]
     column_title: str
     ident: str
@@ -280,6 +338,13 @@ class PainterParameters(TypedDict, total=False):
     path_to_table: SDPath
     column_to_display: str
     columns_to_match: list[tuple[str, str]]
+    color_levels: tuple[Literal["abs_vals"], tuple[MetricName, tuple[float, float]]]
+    # From historic metric painters
+    rrd_consolidation: Literal["average", "min", "max"]
+    time_range: tuple[str | int, int] | Literal["report"]
+    # From graph painters
+    graph_render_options: GraphRenderOptionsVS
+    set_default_time_range: int
 
 
 def _make_default_painter_parameters() -> PainterParameters:
@@ -434,7 +499,7 @@ class SorterSpec:
         return str(self.to_raw())
 
 
-class _InventoryJoinMacrosSpec(TypedDict):
+class InventoryJoinMacrosSpec(TypedDict):
     macros: list[tuple[str, str]]
 
 
@@ -448,14 +513,14 @@ class ViewSpec(Visual):
     column_headers: Literal["off", "pergroup", "repeat"]
     sorters: Sequence[SorterSpec]
     add_headers: NotRequired[str]
-    # View editor only adds them in case they are truish. In our builtin specs these flags are also
+    # View editor only adds them in case they are truish. In our built-in specs these flags are also
     # partially set in case they are falsy
     mobile: NotRequired[bool]
     mustsearch: NotRequired[bool]
     force_checkboxes: NotRequired[bool]
     user_sortable: NotRequired[bool]
     play_sounds: NotRequired[bool]
-    inventory_join_macros: NotRequired[_InventoryJoinMacrosSpec]
+    inventory_join_macros: NotRequired[InventoryJoinMacrosSpec]
 
 
 AllViewSpecs = dict[tuple[UserId, ViewName], ViewSpec]
@@ -512,8 +577,7 @@ class ABCMegaMenuSearch(ABC):
         return 'cmk.popup_menu.focus_search_field("mk_side_search_field_%s");' % self.name
 
     @abstractmethod
-    def show_search_field(self) -> None:
-        ...
+    def show_search_field(self) -> None: ...
 
 
 class _Icon(TypedDict):
@@ -533,7 +597,7 @@ class TopicMenuItem(NamedTuple):
     is_show_more: bool = False
     icon: Icon | None = None
     button_title: str | None = None
-    additional_matches_setup_search: Sequence[str] = ()
+    megamenu_search_terms: Sequence[str] = ()
 
 
 class TopicMenuTopic(NamedTuple):
@@ -572,58 +636,20 @@ SearchResultsByTopic = Iterable[tuple[str, Iterable[SearchResult]]]
 
 # Metric & graph specific
 
-UnitRenderFunc = Callable[[Any], str]
+
+@dataclass(frozen=True)
+class PerfDataTuple:
+    metric_name: MetricName
+    lookup_metric_name: MetricName
+    value: float | int
+    unit_name: str
+    warn: float | None
+    crit: float | None
+    min: float | None
+    max: float | None
 
 
-GraphTitleFormat = Literal["plain", "add_host_name", "add_host_alias", "add_service_description"]
-GraphUnitRenderFunc = Callable[[list[float]], tuple[str, list[str]]]
-
-
-class UnitInfo(TypedDict):
-    title: str
-    symbol: str
-    render: UnitRenderFunc
-    js_render: str
-    id: NotRequired[str]
-    stepping: NotRequired[str]
-    color: NotRequired[str]
-    graph_unit: NotRequired[GraphUnitRenderFunc]
-    description: NotRequired[str]
-    valuespec: NotRequired[Any]  # TODO: better typing
-
-
-class _TranslatedMetricRequired(TypedDict):
-    scale: list[float]
-
-
-class TranslatedMetric(_TranslatedMetricRequired, total=False):
-    # All keys seem to be optional. At least in one situation there is a translation object
-    # constructed which only has the scale member (see
-    # CustomGraphPage._show_metric_type_combined_summary)
-    orig_name: list[str]
-    value: float
-    scalar: dict[str, float]
-    auto_graph: bool
-    title: str
-    unit: UnitInfo
-    color: str
-
-
-GraphPresentation = str  # TODO: Improve Literal["lines", "stacked", "sum", "average", "min", "max"]
-GraphConsoldiationFunction = Literal["max", "min", "average"]
-
-RenderingExpression = tuple[Any, ...]
-TranslatedMetrics = dict[str, TranslatedMetric]
-MetricExpression = str
-LineType = str  # TODO: Literal["line", "area", "stack", "-line", "-area", "-stack"]
-# We still need "Union" because of https://github.com/python/mypy/issues/11098
-MetricDefinition = Union[
-    tuple[MetricExpression, LineType],
-    tuple[MetricExpression, LineType, str | LazyString],
-]
-PerfometerSpec = dict[str, Any]
-PerfdataTuple = tuple[str, float, str, float | None, float | None, float | None, float | None]
-Perfdata = list[PerfdataTuple]
+Perfdata = list[PerfDataTuple]
 RGBColor = tuple[float, float, float]  # (1.5, 0.0, 0.5)
 
 
@@ -634,90 +660,30 @@ class RowShading(TypedDict):
     heading: RGBColor
 
 
-RPNExpression = tuple  # TODO: Improve this type
-
-HorizontalRule = tuple[float, str, str, str | LazyString]
+GraphTitleFormatVS = Literal["plain", "add_host_name", "add_host_alias", "add_service_description"]
 
 
-class GraphMetric(TypedDict):
-    title: str
-    line_type: LineType
-    expression: RPNExpression
-    unit: NotRequired[str]
-    color: NotRequired[str]
-    visible: NotRequired[bool]
-
-
-class GraphSpec(TypedDict):
-    pass
-
-
-class TemplateGraphSpec(GraphSpec):
-    site: SiteId | None
-    host_name: HostName
-    service_description: ServiceName
-    graph_index: NotRequired[int | None]
-    graph_id: NotRequired[str | None]
-
-
-class ExplicitGraphSpec(GraphSpec):
-    title: str
-    unit: str
-    consolidation_function: GraphConsoldiationFunction | None
-    explicit_vertical_range: tuple[float | None, float | None]
-    omit_zero_metrics: bool
-    horizontal_rules: Sequence[HorizontalRule]
-    context: VisualContext
-    add_context_to_title: bool
-    metrics: Sequence[GraphMetric]
-
-
-class CombinedGraphSpec(GraphSpec):
-    datasource: str
-    single_infos: SingleInfos
-    presentation: GraphPresentation
-    context: VisualContext
-    selected_metric: NotRequired[MetricDefinition]
-    consolidation_function: NotRequired[GraphConsoldiationFunction]
-    graph_template: NotRequired[str]
-
-
-class _SingleTimeseriesGraphSpecMandatory(GraphSpec):
-    site: str
-    metric: MetricName
-
-
-class SingleTimeseriesGraphSpec(_SingleTimeseriesGraphSpecMandatory, total=False):
-    host: HostName
-    service: ServiceName
-    service_description: ServiceName
-    color: str | None
-
-
-TemplateGraphIdentifier = tuple[Literal["template"], TemplateGraphSpec]
-CombinedGraphIdentifier = tuple[Literal["combined"], CombinedGraphSpec]
-CustomGraphIdentifier = tuple[Literal["custom"], str]
-ExplicitGraphIdentifier = tuple[Literal["explicit"], ExplicitGraphSpec]
-SingleTimeseriesGraphIdentifier = tuple[Literal["single_timeseries"], SingleTimeseriesGraphSpec]
-ForecastGraphIdentifier = tuple[Literal["forecast"], str]
-
-# We still need "Union" because of https://github.com/python/mypy/issues/11098
-GraphIdentifier = Union[
-    CustomGraphIdentifier,
-    ForecastGraphIdentifier,
-    TemplateGraphIdentifier,
-    CombinedGraphIdentifier,
-    ExplicitGraphIdentifier,
-    SingleTimeseriesGraphIdentifier,
-]
-
-
-class RenderableRecipe(NamedTuple):
-    title: str
-    expression: RenderingExpression
-    color: str
-    line_type: str
-    visible: bool
+class GraphRenderOptionsVS(TypedDict, total=False):
+    border_width: SizeMM
+    color_gradient: float
+    editing: bool
+    fixed_timerange: bool
+    font_size: SizePT
+    interaction: bool
+    preview: bool
+    resizable: bool
+    show_controls: bool
+    show_graph_time: bool
+    show_legend: bool
+    show_margin: bool
+    show_pin: bool
+    show_time_axis: bool
+    show_time_range_previews: bool
+    show_title: bool | Literal["inline"]
+    show_vertical_axis: bool
+    size: tuple[int, int]
+    vertical_axis_width: Literal["fixed"] | tuple[Literal["explicit"], SizePT]
+    title_format: Sequence[GraphTitleFormatVS]
 
 
 ActionResult = FinalizeRequest | None
@@ -731,16 +697,6 @@ class ViewProcessTracking:
     duration_fetch_rows: Snapshot = Snapshot.null()
     duration_filter_rows: Snapshot = Snapshot.null()
     duration_view_render: Snapshot = Snapshot.null()
-
-
-class CustomAttr(TypedDict):
-    title: str
-    help: str
-    name: str
-    topic: str
-    type: str
-    add_custom_macro: bool
-    show_in_table: bool
 
 
 class Key(BaseModel):
@@ -757,11 +713,13 @@ class Key(BaseModel):
 
     def to_certificate_with_private_key(self, passphrase: Password) -> CertificateWithPrivateKey:
         return CertificateWithPrivateKey(
-            certificate=Certificate.load_pem(CertificatePEM(self.certificate)),
-            private_key=RsaPrivateKey.load_pem(
-                EncryptedPrivateKeyPEM(self.private_key), passphrase
-            ),
+            certificate=self.to_certificate(),
+            private_key=PrivateKey.load_pem(EncryptedPrivateKeyPEM(self.private_key), passphrase),
         )
+
+    def to_certificate(self) -> Certificate:
+        """convert the string certificate to Certificate object"""
+        return Certificate.load_pem(CertificatePEM(self.certificate))
 
     def fingerprint(self, algorithm: HashAlgorithm) -> str:
         """return the fingerprint aka hash of the certificate as a hey string"""
@@ -774,3 +732,36 @@ class Key(BaseModel):
 
 
 GlobalSettings = Mapping[str, Any]
+
+
+class IconSpec(TypedDict):
+    icon: str
+    title: NotRequired[str]
+    url: NotRequired[tuple[str, str]]
+    toplevel: NotRequired[bool]
+    sort_index: NotRequired[int]
+
+
+class BuiltinIconVisibility(TypedDict):
+    toplevel: NotRequired[bool]
+    sort_index: NotRequired[int]
+
+
+class CustomAttrSpec(TypedDict):
+    type: Literal["TextAscii"]
+    name: str
+    title: str
+    topic: str
+    help: str
+    # None case should be cleaned up to False
+    show_in_table: bool | None
+    # None case should be cleaned up to False
+    add_custom_macro: bool | None
+
+
+class CustomHostAttrSpec(CustomAttrSpec): ...
+
+
+class CustomUserAttrSpec(CustomAttrSpec):
+    # None case should be cleaned up to False
+    user_editable: bool | None

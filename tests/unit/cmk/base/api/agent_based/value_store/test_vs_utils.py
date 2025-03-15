@@ -5,22 +5,24 @@
 
 from ast import literal_eval
 from pathlib import Path
+from unittest.mock import Mock
 
-# pylint: disable=protected-access
 import pytest
 
-from cmk.utils import store
-from cmk.utils.type_defs import HostName
+from cmk.ccc import store
 
-from cmk.checkers.check_table import ServiceID
-from cmk.checkers.checking import CheckPluginName
+from cmk.utils.hostaddress import HostName
 
-from cmk.base.api.agent_based.value_store._utils import (
-    _DiskSyncedMapping,
-    _DynamicDiskSyncedMapping,
-    _StaticDiskSyncedMapping,
+from cmk.checkengine.checking import CheckPluginName, ServiceID
+
+from cmk.base.api.agent_based.value_store._api import (
     _ValueStore,
     ValueStoreManager,
+)
+from cmk.base.api.agent_based.value_store._utils import (
+    _DynamicDiskSyncedMapping,
+    _StaticDiskSyncedMapping,
+    DiskSyncedMapping,
 )
 
 _TEST_KEY = ("check", "item", "user-key")
@@ -109,7 +111,7 @@ class Test_StaticDiskSyncedMapping:
             deserializer=literal_eval,
         )
 
-    def test_mapping_features(self, mocker, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    def test_mapping_features(self, mocker: Mock, tmp_path: Path) -> None:
         self._mock_load(mocker)
         sdsm = self._get_sdsm(tmp_path)
         assert sdsm.get(("check_no", None, "moo")) is None
@@ -125,7 +127,7 @@ class Test_StaticDiskSyncedMapping:
         ]
         assert len(sdsm) == 2
 
-    def test_store(self, mocker, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    def test_store(self, mocker: Mock, tmp_path: Path) -> None:
         self._mock_load(mocker)
         self._mock_store(mocker)
 
@@ -147,7 +149,7 @@ class Test_StaticDiskSyncedMapping:
 
 class Test_DiskSyncedMapping:
     @staticmethod
-    def _get_dsm() -> _DiskSyncedMapping:
+    def _get_dsm() -> DiskSyncedMapping:
         dynstore: _DynamicDiskSyncedMapping[tuple[str, str, str], str] = _DynamicDiskSyncedMapping()
         dynstore.update(
             {
@@ -155,7 +157,7 @@ class Test_DiskSyncedMapping:
                 ("dyn", "key", "2"): "dyn-val-2",
             }
         )
-        return _DiskSyncedMapping(
+        return DiskSyncedMapping(
             dynamic=dynstore,
             static={  # type: ignore[arg-type]
                 ("stat", "key", "1"): "stat-val-1",
@@ -219,8 +221,8 @@ class Test_ValueStore:
         host_name = HostName("moritz")
         return _ValueStore(
             data={
-                (host_name, "check1", "item", "key1"): 42,
-                (host_name, "check2", "item", "key2"): 23,
+                (host_name, "check1", "item", "key1"): "42",
+                (host_name, "check2", "item", "key2"): "23",
             },
             service_id=(CheckPluginName("check1"), "item"),
             host_name=host_name,
@@ -235,6 +237,12 @@ class Test_ValueStore:
         s_store = self._get_store()
         with pytest.raises(TypeError):
             s_store[2] = "key must be string!"  # type: ignore[index]
+
+    def test_serialization_happens_in_plugin_scope(self) -> None:
+        s_store = self._get_store()
+        s_store["key"] = float("inf")  # gets serialized here
+        with pytest.raises(ValueError):
+            _ = s_store["key"]  # deserialization failes here, not upon loading the store.
 
 
 class TestValueStoreManager:

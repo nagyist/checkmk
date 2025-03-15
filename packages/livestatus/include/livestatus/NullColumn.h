@@ -7,16 +7,10 @@
 #define NullColumn_h
 
 #include <chrono>
-#include <memory>
 #include <string>
 
 #include "livestatus/Column.h"
 #include "livestatus/Filter.h"
-#include "livestatus/opids.h"
-class Aggregator;
-class Row;
-class RowRenderer;
-class User;
 
 class NullColumn : public Column {
 public:
@@ -30,6 +24,8 @@ public:
     [[nodiscard]] std::unique_ptr<Filter> createFilter(
         Filter::Kind kind, RelationalOperator relOp,
         const std::string &value) const override;
+
+    [[nodiscard]] std::unique_ptr<Sorter> createSorter() const override;
 
     [[nodiscard]] std::unique_ptr<Aggregator> createAggregator(
         AggregationFactory factory) const override;

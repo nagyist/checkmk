@@ -9,8 +9,8 @@ from collections.abc import Mapping, Sequence
 import pydantic
 import requests
 
-from cmk.special_agents.utils.agent_common import SectionWriter, special_agent_main
-from cmk.special_agents.utils.argument_parsing import Args, create_default_argument_parser
+from cmk.special_agents.v0_unstable.agent_common import SectionWriter, special_agent_main
+from cmk.special_agents.v0_unstable.argument_parsing import Args, create_default_argument_parser
 
 
 def agent_elasticsearch_main(args: Args) -> int:
@@ -24,18 +24,31 @@ def agent_elasticsearch_main(args: Args) -> int:
         section_urls_and_handlers = {
             "cluster_health": ("/_cluster/health", handle_cluster_health),
             "nodes": ("/_nodes/_all/stats", handle_nodes),
-            "stats": ("/*-*/_stats/store,docs", handle_stats),
+            "stats": ("/_stats/store,docs?ignore_unavailable=true", handle_stats),
         }
 
+        sections_to_query = set()
+        if args.cluster_health:
+            sections_to_query.add("cluster_health")
+        if args.nodes:
+            sections_to_query.add("nodes")
+        if args.stats:
+            sections_to_query.add("stats")
+
         try:
-            for section in args.modules:
+            for section in sections_to_query:
                 section_url, handler = section_urls_and_handlers[section]
-                url = url_base + section_url
+
+                url = (
+                    f"{url_base}/{','.join(args.stats)}{section_url}"
+                    if section == "stats"
+                    else f"{url_base}{section_url}"
+                )
 
                 auth = (args.user, args.password) if args.user and args.password else None
                 certcheck = not args.no_cert_check
                 try:
-                    response = requests.get(url, auth=auth, verify=certcheck)  # nosec B113
+                    response = requests.get(url, auth=auth, verify=certcheck)  # nosec B113 # BNS:0b0eac
                 except requests.exceptions.RequestException as e:
                     sys.stderr.write("Error: %s\n" % e)
                     if args.debug:
@@ -66,16 +79,19 @@ def parse_arguments(argv: Sequence[str] | None) -> Args:
         "-p", "--port", default=9200, type=int, help="Use alternative port (default: 9200)"
     )
     parser.add_argument(
-        "-m",
-        "--modules",
-        nargs="*",
-        default=["cluster_health", "nodes", "stats"],
-        choices=["cluster_health", "nodes", "stats"],
-        help="List of modules to query.",
+        "--no-cert-check", action="store_true", help="Disable certificate verification."
     )
+
+    parser.add_argument("--cluster-health", action="store_true", help="Query cluster health data")
+    parser.add_argument("--nodes", action="store_true", help="Query nodes data")
+
     parser.add_argument(
-        "--no-cert-check", action="store_true", help="Disable certificate verification"
+        "--stats",
+        nargs="*",
+        default=[],
+        help="List of patterns for the statistics query",
     )
+
     parser.add_argument(
         "hosts",
         metavar="HOSTNAME",
@@ -119,27 +135,19 @@ class _NodesReponse(pydantic.BaseModel, frozen=True):
 
 def handle_nodes(response: Mapping[str, object]) -> None:
     with SectionWriter("elasticsearch_nodes", separator=" ") as writer:
-        for node_response in _NodesReponse.parse_obj(response).nodes.values():
+        for node_response in _NodesReponse.model_validate(response).nodes.values():
             writer.append(
-                "{} open_file_descriptors {}".format(
-                    node_response.name, node_response.process.open_file_descriptors
-                )
+                f"{node_response.name} open_file_descriptors {node_response.process.open_file_descriptors}"
             )
             writer.append(
-                "{} max_file_descriptors {}".format(
-                    node_response.name, node_response.process.max_file_descriptors
-                )
+                f"{node_response.name} max_file_descriptors {node_response.process.max_file_descriptors}"
             )
             writer.append(f"{node_response.name} cpu_percent {node_response.process.cpu.percent}")
             writer.append(
-                "{} cpu_total_in_millis {}".format(
-                    node_response.name, node_response.process.cpu.total_in_millis
-                )
+                f"{node_response.name} cpu_total_in_millis {node_response.process.cpu.total_in_millis}"
             )
             writer.append(
-                "{} mem_total_virtual_in_bytes {}".format(
-                    node_response.name, node_response.process.mem.total_virtual_in_bytes
-                )
+                f"{node_response.name} mem_total_virtual_in_bytes {node_response.process.mem.total_virtual_in_bytes}"
             )
 
 

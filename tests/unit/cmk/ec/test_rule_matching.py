@@ -3,20 +3,16 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+
+import re
+
 import pytest
 
 from livestatus import SiteId
 
-from cmk.ec.main import Event, EventServer, MatchGroups
-from cmk.ec.rule_matcher import (
-    MatchFailure,
-    MatchPriority,
-    MatchResult,
-    MatchSuccess,
-    Rule,
-    RuleMatcher,
-    TextMatchResult,
-)
+import cmk.ec.export as ec
+from cmk.ec.config import MatchGroups, TextMatchResult
+from cmk.ec.rule_matcher import compile_matching_value, MatchPriority
 
 
 @pytest.mark.parametrize(
@@ -25,7 +21,7 @@ from cmk.ec.rule_matcher import (
         # No pattern, match
         (
             "bla CRIT",
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             "",
             None,
             (),
@@ -34,7 +30,7 @@ from cmk.ec.rule_matcher import (
         # Non regex, no match
         (
             "bla CRIT",
-            MatchFailure(reason="did not match, message text does not match"),
+            ec.MatchFailure(reason="did not match, message text does not match"),
             "blub",
             None,
             False,
@@ -43,7 +39,7 @@ from cmk.ec.rule_matcher import (
         # Regex, no match
         (
             "bla CRIT",
-            MatchFailure(reason="did not match, message text does not match"),
+            ec.MatchFailure(reason="did not match, message text does not match"),
             "blub$",
             None,
             False,
@@ -52,7 +48,7 @@ from cmk.ec.rule_matcher import (
         # None regex, no match, cancel match
         (
             "bla CRIT",
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             "blub",
             "bla CRIT",
             False,
@@ -61,7 +57,7 @@ from cmk.ec.rule_matcher import (
         # regex, no match, cancel match
         (
             "bla CRIT",
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             "blub$",
             "bla CRIT$",
             False,
@@ -70,7 +66,7 @@ from cmk.ec.rule_matcher import (
         # Non regex -> no match group
         (
             "bla CRIT",
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             "bla CRIT",
             "bla OK",
             (),
@@ -78,7 +74,7 @@ from cmk.ec.rule_matcher import (
         ),
         (
             "bla OK",
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             "bla CRIT",
             "bla OK",
             False,
@@ -87,7 +83,7 @@ from cmk.ec.rule_matcher import (
         # Regex without match group
         (
             "bla CRIT",
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             "bla CRIT$",
             "bla OK$",
             (),
@@ -95,7 +91,7 @@ from cmk.ec.rule_matcher import (
         ),
         (
             "bla OK",
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             "bla CRIT$",
             "bla OK$",
             False,
@@ -104,7 +100,7 @@ from cmk.ec.rule_matcher import (
         # Regex With match group
         (
             "bla CRIT",
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             "(bla) CRIT$",
             "(bla) OK$",
             ("bla",),
@@ -112,7 +108,7 @@ from cmk.ec.rule_matcher import (
         ),
         (
             "bla OK",
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             "(bla) CRIT$",
             "(bla) OK$",
             False,
@@ -121,9 +117,27 @@ from cmk.ec.rule_matcher import (
         # regex, both match
         (
             "bla OK",
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             "bla .*",
             "bla OK",
+            (),
+            (),
+        ),
+        # regex, dot star
+        (
+            "test ODBC test",
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ".*ODBC",
+            "test ODBC",
+            (),
+            (),
+        ),
+        # regex, dot star also at the end
+        (
+            "test ODBC test",
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ".*ODBC.*",
+            "test ODBC test",
             (),
             (),
         ),
@@ -131,30 +145,27 @@ from cmk.ec.rule_matcher import (
 )
 def test_match_message(
     message: str,
-    result: MatchResult,
+    result: ec.MatchResult,
     match_message: str,
     cancel_message: str | None,
     match_result: TextMatchResult,
     cancel_groups: bool | None,
 ) -> None:
-    m = RuleMatcher(None, SiteId("test_site"), lambda time_period_name: True)
-    rule: Rule = {
-        "match": EventServer._compile_matching_value("match", match_message),
-    }
+    m = ec.RuleMatcher(None, SiteId("test_site"), lambda time_period_name: True)
+    rule = (
+        ec.Rule(match=match_message)
+        if cancel_message is None
+        else ec.Rule(match=match_message, match_ok=cancel_message)
+    )
+    ec.compile_rule(rule)
+    event = ec.Event(text=message)
+    match_groups = MatchGroups()
 
-    if cancel_message is not None:
-        rule["match_ok"] = EventServer._compile_matching_value("match_ok", cancel_message)
-
-    event: Event = {"text": message}
-
-    match_groups: MatchGroups = {}
     assert m.event_rule_matches_message(rule, event, match_groups) == result
     assert match_groups["match_groups_message"] == match_result
-
-    if cancel_message is not None:
-        assert match_groups["match_groups_message_ok"] == cancel_groups
-    else:
-        assert "match_groups_message_ok" not in match_groups
+    assert match_groups.get("match_groups_message_ok") == (
+        None if cancel_message is None else cancel_groups
+    )
 
 
 @pytest.mark.parametrize(
@@ -190,13 +201,13 @@ def test_match_priority(
     cancel_priority: MatchPriority | None,
     expected: MatchPriority | None,
 ) -> None:
-    m = RuleMatcher(None, SiteId("test_site"), lambda time_period_name: True)
-    rule: Rule = {}
+    m = ec.RuleMatcher(None, SiteId("test_site"), lambda time_period_name: True)
+    rule = ec.Rule()
     if match_priority is not None:
         rule["match_priority"] = match_priority
     if cancel_priority is not None:
         rule["cancel_priority"] = cancel_priority
-    event: Event = {"priority": priority}
+    event = ec.Event(priority=priority)
     assert m.event_rule_determine_match_priority(rule, event) == expected
 
 
@@ -208,21 +219,21 @@ def test_match_priority(
             {"match": ""},
             {"match_groups_message": ()},
             MatchPriority(has_match=True, has_canceling_match=False),
-            MatchSuccess(cancelling=False, match_groups=MatchGroups(match_groups_message=())),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups(match_groups_message=())),
         ),
         # Both configured but positive matches
         (
             {"match": "abc A abc", "match_ok": "abc X abc"},
             {"match_groups_message": ()},
             MatchPriority(has_match=True, has_canceling_match=False),
-            MatchSuccess(cancelling=False, match_groups=MatchGroups(match_groups_message=())),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups(match_groups_message=())),
         ),
         # Both configured but  negative matches
         (
             {"match": "abc A abc", "match_ok": "abc X abc"},
             {"match_groups_message": False, "match_groups_message_ok": ()},
             MatchPriority(has_match=True, has_canceling_match=False),
-            MatchSuccess(
+            ec.MatchSuccess(
                 cancelling=True,
                 match_groups=MatchGroups(
                     match_groups_message=False,
@@ -235,7 +246,7 @@ def test_match_priority(
             {"match": "abc . abc", "match_ok": "abc X abc"},
             {"match_groups_message": (), "match_groups_message_ok": ()},
             MatchPriority(has_match=True, has_canceling_match=False),
-            MatchSuccess(
+            ec.MatchSuccess(
                 cancelling=True,
                 match_groups=MatchGroups(
                     match_groups_message=(),
@@ -246,141 +257,143 @@ def test_match_priority(
     ],
 )
 def test_match_outcome(
-    rule: Rule,
+    rule: ec.Rule,
     match_groups: MatchGroups,
     match_priority: MatchPriority,
-    expected: MatchResult,
+    expected: ec.MatchResult,
 ) -> None:
-    m = RuleMatcher(None, SiteId("test_site"), lambda time_period_name: True)
+    m = ec.RuleMatcher(None, SiteId("test_site"), lambda time_period_name: True)
     assert m._check_match_outcome(rule, match_groups, match_priority) == expected
 
 
 @pytest.mark.parametrize(
     "result,rule",
     [
-        (MatchSuccess(cancelling=False, match_groups=MatchGroups()), {}),
-        (MatchFailure(reason="The site does not match."), {"match_site": []}),
-        (MatchSuccess(cancelling=False, match_groups=MatchGroups()), {"match_site": ["NO_SITE"]}),
-        (MatchFailure(reason="The site does not match."), {"match_site": ["dong"]}),
+        (ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()), {}),
+        (ec.MatchFailure(reason="The site does not match."), {"match_site": []}),
+        (
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            {"match_site": ["NO_SITE"]},
+        ),
+        (ec.MatchFailure(reason="The site does not match."), {"match_site": ["dong"]}),
     ],
 )
-def test_match_site(rule: Rule, result: MatchResult) -> None:
+def test_match_site(rule: ec.Rule, result: ec.MatchResult) -> None:
     # TODO why is "NO_SITE" necessary here. Random string as SiteId fails
-    m = RuleMatcher(None, SiteId("NO_SITE"), lambda time_period_name: True)
+    m = ec.RuleMatcher(None, SiteId("NO_SITE"), lambda time_period_name: True)
     assert m.event_rule_matches_site(rule, {}) == result
 
 
 @pytest.mark.parametrize(
     "result,rule,event",
     [
-        (MatchSuccess(cancelling=False, match_groups=MatchGroups()), {}, {"host": "abc"}),
+        (ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()), {}, {"host": "abc"}),
         # TODO weird the empty string in the rule seems to be interpreted as 'no match_host specified', which is clearly incorrect.
         (
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             {"match_host": ""},
             {"host": "abc"},
         ),
         (
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             {"match_host": ""},
             {"host": ""},
         ),
         (
-            MatchFailure(reason="Did not match because of wrong host 'aaaabc' (need 'abc')"),
+            ec.MatchFailure(reason="Did not match because of wrong host 'aaaabc' (need 'abc')"),
             {"match_host": "abc"},
             {"host": "aaaabc"},
         ),
         (
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             {"match_host": ".bc"},
             {"host": "xbc"},
         ),
         (
-            MatchFailure(reason="Did not match because of wrong host 'abcc' (need 'abc')"),
+            ec.MatchFailure(reason="Did not match because of wrong host 'abcc' (need 'abc')"),
             {"match_host": "abc"},
             {"host": "abcc"},
         ),
         (
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             {"match_host": "abc.*"},
             {"host": "abcc"},
         ),
         (
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             {"match_host": ".*abc.*"},
             {"host": "ccabcc"},
         ),
         (
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             {"match_host": "^abc$"},
             {"host": "abc"},
         ),
         (
-            MatchFailure(reason="Did not match because of wrong host 'abx' (need '^abc$')"),
+            ec.MatchFailure(reason="Did not match because of wrong host 'abx' (need '^abc$')"),
             {"match_host": "^abc$"},
             {"host": "abx"},
         ),
     ],
 )
-def test_match_host(result: MatchResult, rule: Rule, event: Event) -> None:
-    m = RuleMatcher(None, SiteId("test_site"), lambda time_period_name: True)
-
-    if "match_host" in rule:
-        rule = {
-            **rule,  # type: ignore[misc] # mypy bug https://github.com/python/mypy/issues/4122
-            "match_host": EventServer._compile_matching_value("match_host", rule["match_host"]),
-        }
-
+def test_match_host(result: ec.MatchResult, rule: ec.Rule, event: ec.Event) -> None:
+    m = ec.RuleMatcher(None, SiteId("test_site"), lambda time_period_name: True)
+    rule = rule.copy()
+    ec.compile_rule(rule)
     assert m.event_rule_matches_host(rule, event) == result
 
 
 @pytest.mark.parametrize(
     "result,rule,event",
     [
-        (MatchSuccess(cancelling=False, match_groups=MatchGroups()), {}, {"ipaddress": "10.3.3.4"}),
         (
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            {},
+            {"ipaddress": "10.3.3.4"},
+        ),
+        (
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             {"match_ipaddress": "10.3.3.4"},
             {"ipaddress": "10.3.3.4"},
         ),
         (
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             {"match_ipaddress": "10.3.3.0/24"},
             {"ipaddress": "10.3.3.4"},
         ),
         (
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             {"match_ipaddress": "2001:db00::0/24"},
             {"ipaddress": "2001:db00::1"},
         ),
         (
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             {"match_ipaddress": "10.0.0.0/8"},
             {"ipaddress": "10.3.3.4"},
         ),
         (
-            MatchFailure(
+            ec.MatchFailure(
                 reason="Did not match because of wrong source IP address '10.3.3.4' (need '11.0.0.0/8')"
             ),
             {"match_ipaddress": "11.0.0.0/8"},
             {"ipaddress": "10.3.3.4"},
         ),
         (
-            MatchFailure(
+            ec.MatchFailure(
                 reason="Did not match because of wrong source IP address '2002:db00::1' (need '2001:db00::0/24')"
             ),
             {"match_ipaddress": "2001:db00::0/24"},
             {"ipaddress": "2002:db00::1"},
         ),
         (
-            MatchFailure(
+            ec.MatchFailure(
                 reason="Did not match because of wrong source IP address '10.3.3.4' (need '10.3.3.5')"
             ),
             {"match_ipaddress": "10.3.3.5"},
             {"ipaddress": "10.3.3.4"},
         ),
         (
-            MatchFailure(
+            ec.MatchFailure(
                 reason="Did not match because of wrong source IP address '10.3.3.4' (need '10.3.3.0')"
             ),
             {"match_ipaddress": "10.3.3.0"},
@@ -388,32 +401,66 @@ def test_match_host(result: MatchResult, rule: Rule, event: Event) -> None:
         ),
     ],
 )
-def test_match_ipaddress(result: MatchResult, rule: Rule, event: Event) -> None:
-    m = RuleMatcher(None, SiteId("test_site"), lambda time_period_name: True)
+def test_match_ipaddress(result: ec.MatchResult, rule: ec.Rule, event: ec.Event) -> None:
+    m = ec.RuleMatcher(None, SiteId("test_site"), lambda time_period_name: True)
     assert m.event_rule_matches_ip(rule, event) == result
 
 
 @pytest.mark.parametrize(
     "result,rule,event",
     [
-        (MatchSuccess(cancelling=False, match_groups=MatchGroups()), {}, {"facility": 1}),
+        (ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()), {}, {"facility": 1}),
         (
-            MatchSuccess(cancelling=False, match_groups=MatchGroups()),
+            ec.MatchSuccess(cancelling=False, match_groups=MatchGroups()),
             {"match_facility": 1},
             {"facility": 1},
         ),
         (
-            MatchFailure(reason="Did not match because of wrong syslog facility"),
+            ec.MatchFailure(reason="Did not match because of wrong syslog facility"),
             {"match_facility": 2},
             {"facility": 1},
         ),
         (
-            MatchFailure(reason="Did not match because of wrong syslog facility"),
+            ec.MatchFailure(reason="Did not match because of wrong syslog facility"),
             {"match_facility": 0},
             {"facility": 1},
         ),
     ],
 )
-def test_match_facility(result: MatchResult, rule: Rule, event: Event) -> None:
-    m = RuleMatcher(None, SiteId("test_site"), lambda time_period_name: True)
+def test_match_facility(result: ec.MatchResult, rule: ec.Rule, event: ec.Event) -> None:
+    m = ec.RuleMatcher(None, SiteId("test_site"), lambda time_period_name: True)
     assert m.event_rule_matches_facility(rule, event) == result
+
+
+@pytest.mark.parametrize(
+    "original_value, expected_result",
+    [
+        ("simpleString", "simplestring"),
+        ("  spaces  ", "spaces"),
+        (".*regex", "regex"),
+        ("", None),
+        ("    ", None),
+        (".*", None),
+    ],
+)
+def test_compile_matching_value_non_regex(original_value: str, expected_result: str) -> None:
+    assert compile_matching_value("match", original_value) == expected_result
+
+
+@pytest.mark.parametrize(
+    "original_value, expected_start",
+    [("^regex$", "^regex$"), (".*regex.*", "regex.*"), (".*?lazy", ".*?lazy")],
+)
+def test_compile_matching_value_regex(original_value: str, expected_start: str) -> None:
+    compiled_pattern = compile_matching_value("match", original_value)
+    assert isinstance(compiled_pattern, re.Pattern)
+    assert compiled_pattern.pattern.startswith(expected_start)
+
+
+@pytest.mark.parametrize("key", ["non_match", "random_key"])
+def test_compile_matching_value_different_key(key: str) -> None:
+    original_value = ".*regex"
+    compiled_pattern = compile_matching_value(key, original_value)
+    assert isinstance(compiled_pattern, re.Pattern)
+    # Expect the original pattern since the key is not in {"match", "match_ok"}
+    assert compiled_pattern.pattern == original_value

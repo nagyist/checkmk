@@ -3,21 +3,18 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-import functools
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Container, Iterable, Mapping, Sequence
+from typing import Any, NotRequired, TypedDict, TypeVar
 
-import cmk.utils.aws_constants as agent_aws_types
-
-from cmk.base.check_api import (
+import cmk.plugins.aws.constants as agent_aws_types
+import cmk.plugins.aws.lib as aws  # pylint: disable=cmk-module-layer-violation
+from cmk.agent_based.legacy.v0_unstable import (
     check_levels,
-    get_number_with_precision,
-    get_percent_human_readable,
-    MKCounterWrapped,
-    ServiceCheckResult,
-    state_markers,
+    LegacyCheckResult,
+    LegacyDiscoveryResult,
+    LegacyResult,
 )
-from cmk.base.plugins.agent_based.agent_based_api.v1 import render
-from cmk.base.plugins.agent_based.utils import aws
+from cmk.agent_based.v2 import IgnoreResultsError, render
 
 AWSRegions = dict(agent_aws_types.AWSRegions)
 
@@ -26,19 +23,27 @@ parse_aws = aws.parse_aws
 AWSLimitsByRegion = aws.AWSLimitsByRegion
 
 
-def inventory_aws_generic(parsed, required_metrics):
+def inventory_aws_generic(
+    parsed: Mapping[str, Container[str]], required_metrics: Iterable[str]
+) -> LegacyDiscoveryResult:
     for instance_name, instance in parsed.items():
         if all(required_metric in instance for required_metric in required_metrics):
             yield instance_name, {}
 
 
-def inventory_aws_generic_single(parsed, required_metrics, requirement=all):
+def inventory_aws_generic_single(
+    parsed: Mapping[str, Container[str]],
+    required_metrics: Iterable[str],
+    requirement: Callable[[Iterable[object]], bool] = all,
+) -> LegacyDiscoveryResult:
     if requirement(required_metric in parsed for required_metric in required_metrics):
         return [(None, {})]
     return []
 
 
-def check_aws_elb_summary_generic(item, params, load_balancers):
+def check_aws_elb_summary_generic(
+    _no_item: None, _no_params: Mapping[str, object], load_balancers: Sequence[Mapping[str, Any]]
+) -> LegacyCheckResult:
     yield 0, "Balancers: %s" % len(load_balancers)
 
     balancers_by_avail_zone: dict[str, list] = {}
@@ -71,13 +76,17 @@ def check_aws_elb_summary_generic(item, params, load_balancers):
         yield 0, "\n%s" % "\n".join(long_output)
 
 
-def check_aws_limits(aws_service, params, parsed_region_data):
+def check_aws_limits(
+    aws_service: str,
+    params: Mapping[str, tuple[float | None, float, float]],
+    parsed_region_data: Iterable[tuple[str, str, float, float, Callable[[float], str]]],
+) -> LegacyCheckResult:
     """
     Generic check for checking limits of AWS resource.
     - levels: use plain resource_key
     - performance data: aws_%s_%s % AWS resource, resource_key
     """
-    long_output = []
+    long_output: list[tuple[int, str]] = []
     levels_reached = set()
     max_state = 0
     perfdata = []
@@ -93,11 +102,7 @@ def check_aws_limits(aws_service, params, parsed_region_data):
         else:
             limit_ref = p_limit
 
-        infotext = "{}: {} (of max. {})".format(
-            resource_title,
-            human_readable_func(amount),
-            human_readable_func(limit_ref),
-        )
+        infotext = f"{resource_title}: {human_readable_func(amount)} (of max. {human_readable_func(limit_ref)})"
         perfvar = f"aws_{aws_service}_{resource_key}"
         if aws.is_valid_aws_limits_perf_data(resource_key):
             perfdata.append((perfvar, amount))
@@ -109,38 +114,40 @@ def check_aws_limits(aws_service, params, parsed_region_data):
             100.0 * amount / limit_ref,
             None,
             (warn, crit),
-            human_readable_func=get_percent_human_readable,
+            human_readable_func=render.percent,
             infoname="Usage",
         )
 
         max_state = max(state, max_state)
         if state:
             levels_reached.add(resource_title)
-            infotext += f", {extrainfo}{state_markers[state]}"
-        long_output.append(infotext)
+            infotext += f", {extrainfo}"
+        long_output.append((state, infotext))
 
     if levels_reached:
         yield max_state, "Levels reached: %s" % ", ".join(sorted(levels_reached)), perfdata
     else:
         yield 0, "No levels reached", perfdata
 
-    if long_output:
-        yield 0, "\n%s" % "\n".join(sorted(long_output))
+    # use `notice` upon migration!
+    for state, details in sorted(long_output, key=lambda x: x[1]):
+        yield state, f"\n{details}"
 
 
-def aws_get_float_human_readable(f, unit=""):
-    return get_number_with_precision(f, unit=unit, precision=3)
+def aws_get_float_human_readable(value: float, unit: str = "") -> str:
+    value_str = "%.3f" % value
+    return f"{value_str} {unit}" if unit else value_str
 
 
-def aws_get_counts_rate_human_readable(rate):
+def aws_get_counts_rate_human_readable(rate: float) -> str:
     return aws_get_float_human_readable(rate) + "/s"
 
 
-def aws_get_bytes_rate_human_readable(rate):
+def aws_get_bytes_rate_human_readable(rate: float) -> str:
     return render.iobandwidth(rate)
 
 
-def check_aws_request_rate(request_rate):
+def check_aws_request_rate(request_rate: float) -> LegacyResult:
     return (
         0,
         "Requests: %s" % aws_get_counts_rate_human_readable(request_rate),
@@ -149,8 +156,13 @@ def check_aws_request_rate(request_rate):
 
 
 def check_aws_error_rate(
-    error_rate, request_rate, metric_name_rate, metric_name_perc, levels, display_text
-):
+    error_rate: float,
+    request_rate: float,
+    metric_name_rate: str,
+    metric_name_perc: str,
+    levels: tuple[float, float] | None,
+    display_text: str,
+) -> LegacyCheckResult:
     yield (
         0,
         f"{display_text}: {aws_get_counts_rate_human_readable(error_rate)}",
@@ -166,17 +178,21 @@ def check_aws_error_rate(
         errors_perc,
         metric_name_perc,
         levels,
-        human_readable_func=get_percent_human_readable,
+        human_readable_func=render.percent,
         infoname="%s of total requests" % display_text,
     )
 
 
 def check_aws_http_errors(
-    params, parsed, http_err_codes, cloudwatch_metrics_format, key_all_requests="RequestCount"
-):
+    params: Mapping[str, tuple[float, float]],
+    parsed: Mapping[str, float],
+    http_err_codes: Iterable[str],
+    cloudwatch_metrics_format: str,
+    key_all_requests: str = "RequestCount",
+) -> LegacyCheckResult:
     request_rate = parsed.get(key_all_requests)
     if request_rate is None:
-        raise MKCounterWrapped("Currently no data from AWS")
+        raise IgnoreResultsError("Currently no data from AWS")
 
     yield check_aws_request_rate(request_rate)
 
@@ -192,9 +208,17 @@ def check_aws_http_errors(
         )
 
 
+class MetricInfo(TypedDict):
+    metric_val: float
+    metric_name: str | None
+    levels: NotRequired[tuple[float, float] | None]
+    human_readable_func: Callable[[float], str]
+    info_name: NotRequired[str]
+
+
 def check_aws_metrics(
-    metric_infos: list[dict[str, float | str | None | tuple | None | Callable | None]]
-) -> Iterable[ServiceCheckResult]:
+    metric_infos: Iterable[MetricInfo],
+) -> LegacyCheckResult:
     go_stale = True
 
     for metric_info in metric_infos:
@@ -204,33 +228,22 @@ def check_aws_metrics(
         go_stale = False
 
         yield check_levels(
-            metric_val,  # type: ignore[arg-type]
-            metric_info.get("metric_name"),  # type: ignore[arg-type]
+            metric_val,
+            metric_info.get("metric_name"),
             metric_info.get("levels"),
-            human_readable_func=metric_info.get("human_readable_func"),  # type: ignore[arg-type]
-            infoname=metric_info.get("info_name"),  # type: ignore[arg-type]
+            human_readable_func=metric_info.get("human_readable_func"),
+            infoname=metric_info.get("info_name"),
         )
 
     if go_stale:
-        raise MKCounterWrapped("Currently no data from AWS")
+        raise IgnoreResultsError("Currently no data from AWS")
 
 
-def aws_get_parsed_item_data(check_function: Callable) -> Callable:
-    """
-    Modified version of get_parsed_item_data which lets services go stale instead of UNKN if the
-    item is not found.
-    """
+_Data = TypeVar("_Data")
 
-    @functools.wraps(check_function)
-    def wrapped_check_function(item, params, parsed):
-        if not isinstance(parsed, dict):
-            return (
-                3,
-                "Wrong usage of decorator function 'aws_get_parsed_item_data': parsed is "
-                "not a dict",
-            )
-        if item not in parsed:
-            raise MKCounterWrapped("Currently no data from AWS")
-        return check_function(item, params, parsed[item])
 
-    return wrapped_check_function
+def get_data_or_go_stale(item: str, section: Mapping[str, _Data]) -> _Data:
+    try:
+        return section[item]
+    except KeyError:
+        raise IgnoreResultsError("Currently no data from AWS")

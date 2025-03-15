@@ -8,6 +8,7 @@ For code to be admitted to this module, it should itself be tested thoroughly, s
 have any friction during testing with these helpers themselves.
 
 """
+
 from __future__ import annotations
 
 import collections
@@ -20,9 +21,10 @@ import re
 import socket
 import statistics
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from typing import Any, Literal
+from types import TracebackType
+from typing import Any, Literal, override
 from unittest import mock
 
 from livestatus import LivestatusTestingError, MultiSiteConnection, SiteConfigurations, SiteId
@@ -203,11 +205,11 @@ class MockLiveStatusConnection:
             ...     response = live.result_of_next_query(
             ...         'GET status\\n'
             ...         'Columns: livestatus_version program_version program_start '
-            ...         'num_hosts num_services core_pid'
+            ...         'num_hosts num_services max_long_output_size core_pid edition'
             ...     )[0]
-            ...     # Response looks like [['2020-07-03', 'Check_MK 2020-07-03', 1593762478, 1, 36]]
+            ...     # Response looks like [['2020-07-03', 'Check_MK 2020-07-03', 1593762478, 1, 2, 2000, 36, 'raw']]
             ...     assert len(response) == 1
-            ...     assert len(response[0]) == 6
+            ...     assert len(response[0]) == 8
 
         Some Stats calls are supported as well:
 
@@ -229,9 +231,9 @@ class MockLiveStatusConnection:
             ...      pass
             Traceback (most recent call last):
             ...
-            livestatus.LivestatusTestingError: Expected queries were not queried on site 'NO_SITE':
+            cmk.livestatus_client.LivestatusTestingError: Expected queries were not queried on site 'NO_SITE':
              * 'GET status\\nColumns: livestatus_version program_version \
-program_start num_hosts num_services core_pid'
+program_start num_hosts num_services max_long_output_size core_pid edition'
             <BLANKLINE>
             No queries were sent to site NO_SITE.
 
@@ -243,7 +245,7 @@ program_start num_hosts num_services core_pid'
             ...     live.result_of_next_query("Foo bar!")
             Traceback (most recent call last):
             ...
-            livestatus.LivestatusTestingError: Expected query (strict) on site 'NO_SITE':
+            cmk.livestatus_client.LivestatusTestingError: Expected query (strict) on site 'NO_SITE':
              * 'Hello world!'
             Got query:
              * 'Foo bar!'
@@ -259,7 +261,7 @@ program_start num_hosts num_services core_pid'
             ...     live.result_of_next_query("Spanish inquisition!")
             Traceback (most recent call last):
             ...
-            livestatus.LivestatusTestingError: Got unexpected query on site 'NO_SITE':
+            cmk.livestatus_client.LivestatusTestingError: Got unexpected query on site 'NO_SITE':
              * 'Spanish inquisition!'
             <BLANKLINE>
             The following queries were sent to site NO_SITE:
@@ -360,7 +362,7 @@ program_start num_hosts num_services core_pid'
             # We expect this query and give the expected result.
             query = [
                 "GET status",
-                "Columns: livestatus_version program_version program_start num_hosts num_services core_pid",
+                "Columns: livestatus_version program_version program_start num_hosts num_services max_long_output_size core_pid edition",
             ]
             self.expect_query(query, force_pos=0)  # first query to be expected
 
@@ -368,7 +370,12 @@ program_start num_hosts num_services core_pid'
             single_conn.__enter__()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         if exc_type:
             raise
         for single_conn in self.connections.values():
@@ -430,6 +437,7 @@ program_start num_hosts num_services core_pid'
         query: str | list[str],
         match_type: MatchType = "strict",
         force_pos: int | None = None,
+        sites: Collection[SiteName] | None = None,
     ) -> MockLiveStatusConnection:
         """Add a LiveStatus query to be expected by this class.
 
@@ -449,6 +457,11 @@ program_start num_hosts num_services core_pid'
             force_pos:
                 Only used internally. Ignore.
 
+            site:
+                Optionally the sites where the query should be expected. NOTE: When this is not
+                given, we default to all configured sites, unless the query stats with `COMMAND`. In
+                this case, we default to the FIRST SITE configured.
+
         Returns:
             The object itself, so you can chain.
 
@@ -459,12 +472,19 @@ program_start num_hosts num_services core_pid'
             query = "\n".join(query)
         query = query.rstrip()
 
-        if query.startswith("COMMAND"):
-            first_conn = list(self.connections.values())[0]
-            first_conn.expect_query(query, match_type, force_pos)
+        if sites is not None:
+            if unknown_sites := set(sites) - set(self.connections):
+                raise ValueError(f"Unknown site(s): {','.join(unknown_sites)}")
+            connections: Iterable[MockSingleSiteConnection] = (
+                self.connections[site] for site in sites
+            )
+        elif query.startswith("COMMAND"):
+            connections = list(self.connections.values())[:1]
         else:
-            for single_conn in self.connections.values():
-                single_conn.expect_query(query, match_type, force_pos)
+            connections = self.connections.values()
+
+        for single_conn in connections:
+            single_conn.expect_query(query, match_type, force_pos)
         return self
 
 
@@ -512,7 +532,7 @@ def execute_query(
         # We check the store for data and filter for the actual data that is requested.
         if table not in tables:
             raise LivestatusTestingError(
-                f"Table {table!r} not stored on site {site_name!r}." " Call .add_table(...)"
+                f"Table {table!r} not stored on site {site_name!r}. Call .add_table(...)"
             )
 
         # Filtering and Aggregating
@@ -527,7 +547,7 @@ def execute_query(
                     row.append(entry[col])
                 except KeyError as exc:
                     raise KeyError(
-                        f"Column '{col}' not in result. " "Add to test-data or fix query."
+                        f"Column '{col}' not in result. Add to test-data or fix query."
                     ) from exc
 
             for col in sorted(entry.keys()):
@@ -615,15 +635,15 @@ class MockSingleSiteConnection:
 
         self.socket = FakeSocket(self)
 
-    def _format_sent_queries(self):
+    def _format_sent_queries(self) -> str:
         if not self._sent_queries:
             return f"\n\nNo queries were sent to site {self._site_name}."
         formatted_queries = "\n".join(["* " + repr(query.decode()) for query in self._sent_queries])
         return (
-            f"\n\nThe following queries were sent to site {self._site_name}:\n "
-            f"{formatted_queries}"
+            f"\n\nThe following queries were sent to site {self._site_name}:\n {formatted_queries}"
         )
 
+    @override
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} id={id(self)} site={self._site_name}>"
 
@@ -725,7 +745,7 @@ def _show_columns(query: str) -> bool:
 
 def _default_tables() -> dict[TableName, ResultList]:
     # Just that parse_check_mk_version is happy we replace the dashes with dots.
-    _today = str(dt.datetime.utcnow().date()).replace("-", ".")
+    _today = str(dt.datetime.now(tz=dt.timezone.utc).date()).replace("-", ".")
     _program_start_timestamp = int(time.time())
     return {
         "status": [
@@ -733,6 +753,7 @@ def _default_tables() -> dict[TableName, ResultList]:
                 "livestatus_version": _today,
                 "program_version": f"Check_MK {_today}",
                 "program_start": _program_start_timestamp,
+                "max_long_output_size": 2000,
                 "num_hosts": 1,
                 "num_services": 36,
                 "helper_usage_fetcher": 0.00151953,
@@ -742,6 +763,7 @@ def _default_tables() -> dict[TableName, ResultList]:
                 "average_latency_fetcher": 0.0846039,
                 "average_latency_generic": 0.0846039,
                 "core_pid": 12345,
+                "edition": "raw",
             }
         ],
         "downtimes": [
@@ -873,7 +895,9 @@ def _compare(expected: str, query: str, match_type: MatchType) -> bool:
     elif match_type == "strict":
         result = expected == query
     elif match_type == "ellipsis":
-        final_pattern = expected.replace("[", "\\[").replace("...", ".*?")  # non-greedy match
+        final_pattern = (
+            expected.replace("[", "\\[").replace("+", "\\+").replace("...", ".*?")
+        )  # non-greedy match
         result = bool(re.match(f"^{final_pattern}$", query))
     else:
         raise LivestatusTestingError(f"Unsupported match behaviour: {match_type}")
@@ -925,7 +949,7 @@ def evaluate_stats(query: str, columns: list[ColumnName], result: ResultList) ->
             ...                [{'state': 1}, {'state': 2}, {'state': 1}])
             Traceback (most recent call last):
             ...
-            livestatus.LivestatusTestingError: Stats combinators are not yet implemented!
+            cmk.livestatus_client.LivestatusTestingError: Stats combinators are not yet implemented!
 
         Non-contiguous results don't throw the grouper off-track.
 
@@ -1208,6 +1232,7 @@ OPERATORS: dict[str, OperatorFunc] = {
     ">=": cast_down(operator.ge),
     "<=": cast_down(operator.le),
     "~": match_regexp,
+    "~~": operator.contains,
 }
 """A dict of all implemented comparison operators."""
 
@@ -1259,7 +1284,8 @@ def make_filter_func(line: str) -> FilterKeyFunc:
             >>> f = make_filter_func("Filter: name !! heute")
             Traceback (most recent call last):
             ...
-            livestatus.LivestatusTestingError: Operator '!!' not implemented. Please check docs or implement.
+            cmk.livestatus_client.LivestatusTestingError: Operator '!!' not \
+implemented. Please check docs or implement.
 
 
     """
@@ -1405,9 +1431,12 @@ def _unpack_headers(query: str) -> dict[str, str]:
 @contextmanager
 def mock_livestatus_communication() -> Iterator[MockLiveStatusConnection]:
     live = MockLiveStatusConnection()
-    with mock.patch(
-        "livestatus.MultiSiteConnection.expect_query", new=live.expect_query, create=True
-    ), mock.patch("livestatus.SingleSiteConnection._create_socket", new=live.create_socket):
+    with (
+        mock.patch(
+            "livestatus.MultiSiteConnection.expect_query", new=live.expect_query, create=True
+        ),
+        mock.patch("livestatus.SingleSiteConnection._create_socket", new=live.create_socket),
+    ):
         yield live
 
 

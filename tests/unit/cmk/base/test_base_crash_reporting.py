@@ -3,15 +3,13 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+from pathlib import Path
 
-from pytest import MonkeyPatch
+from cmk.ccc.crash_reporting import VersionInfo
 
-from tests.testlib.base import Scenario
+from cmk.utils.hostaddress import HostName
 
-from cmk.utils.crash_reporting import CrashReportStore
-from cmk.utils.type_defs import HostName
-
-from cmk.checkers.crash_reporting import CheckCrashReport
+from cmk.base.errorhandling import CheckCrashReport, CheckDetails
 
 
 def _check_generic_crash_info(crash):
@@ -30,58 +28,48 @@ def _check_generic_crash_info(crash):
         "local_vars": str,
     }.items():
         assert key in crash.crash_info
-        assert isinstance(crash.crash_info[key], ty), "Key {!r} has an invalid type {!r}".format(
-            key,
-            type(crash.crash_info[key]),
+        assert isinstance(crash.crash_info[key], ty), (
+            f"Key {key!r} has an invalid type {type(crash.crash_info[key])!r}"
         )
 
 
-def test_check_crash_report_from_exception(monkeypatch: MonkeyPatch) -> None:
+def test_check_crash_report_from_exception(tmp_path: Path) -> None:
+    # Tautological test...
+    crashdir = tmp_path / "crash"
     hostname = HostName("testhost")
-    Scenario().apply(monkeypatch)
     crash = None
     try:
         raise Exception("DING")
     except Exception:
-        crash = CheckCrashReport.from_exception(
-            details={
-                "check_output": "Output",
-                "host": hostname,
-                "is_cluster": False,
-                "description": "Uptime",
-                "check_type": "uptime",
-                "inline_snmp": False,
-                "enforced_service": False,
-            },
-            type_specific_attributes={},
+        crash = CheckCrashReport(
+            crashdir,
+            CheckCrashReport.make_crash_info(
+                VersionInfo(
+                    time=0.0,
+                    os="",
+                    version="",
+                    edition="",
+                    core="",
+                    python_version="",
+                    python_paths=[],
+                ),
+                CheckDetails(
+                    item="foo",
+                    params={},
+                    check_output="Output",
+                    host=hostname,
+                    is_cluster=False,
+                    description="Uptime",
+                    check_type="uptime",
+                    manual_check=False,
+                    uses_snmp=False,
+                    inline_snmp=False,
+                    enforced_service=False,
+                ),
+            ),
         )
 
     _check_generic_crash_info(crash)
     assert crash.type() == "check"
     assert crash.crash_info["exc_type"] == "Exception"
     assert crash.crash_info["exc_value"] == "DING"
-
-
-def test_check_crash_report_save(monkeypatch: MonkeyPatch) -> None:
-    hostname = HostName("testhost")
-    Scenario().apply(monkeypatch)
-    store = CrashReportStore()
-    try:
-        raise Exception("DING")
-    except Exception:
-        crash = CheckCrashReport.from_exception(
-            details={
-                "check_output": "Output",
-                "host": hostname,
-                "is_cluster": False,
-                "description": "Uptime",
-                "check_type": "uptime",
-                "inline_snmp": False,
-                "enforced_service": False,
-            },
-            type_specific_attributes={},
-        )
-        store.save(crash)
-
-    crash2 = store.load_from_directory(crash.crash_dir())
-    assert crash2.crash_info["exc_value"] == "DING"

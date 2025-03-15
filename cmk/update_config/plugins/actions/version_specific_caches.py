@@ -6,17 +6,18 @@
 import errno
 from logging import Logger
 from pathlib import Path
+from typing import override
 
 from cmk.utils import paths as paths_utils
 
-from cmk.gui import visuals
+from cmk.gui.visuals._store import _CombinedVisualsCache
 
 from cmk.update_config.registry import update_action_registry, UpdateAction
-from cmk.update_config.update_state import UpdateActionState
 
 
 class VersionSpecificCachesCleaner(UpdateAction):
-    def __call__(self, logger: Logger, update_action_state: UpdateActionState) -> None:
+    @override
+    def __call__(self, logger: Logger) -> None:
         paths = [
             Path(paths_utils.include_cache_dir, "builtin"),
             Path(paths_utils.include_cache_dir, "local"),
@@ -39,7 +40,7 @@ class VersionSpecificCachesCleaner(UpdateAction):
         # The caches might contain visuals in a deprecated format. For example, in 2.2, painters in
         # visuals are represented by a dedicated type, which was not the case the before. The caches
         # from 2.1 will still contain the old data structures.
-        visuals._CombinedVisualsCache.invalidate_all_caches()
+        _CombinedVisualsCache.invalidate_all_caches()
 
 
 update_action_registry.register(

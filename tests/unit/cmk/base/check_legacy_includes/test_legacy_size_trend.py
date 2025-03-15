@@ -18,7 +18,7 @@ def patch_rate_and_average(monkeypatch: MonkeyPatch, negative: bool = False) -> 
     monkeypatch.setattr(size_trend, "get_average", lambda *_args: growth)
 
 
-def test_size_trend_growing(monkeypatch: MonkeyPatch) -> None:
+def test_size_trend_growing(monkeypatch: MonkeyPatch, initialised_item_state: None) -> None:
     patch_rate_and_average(monkeypatch, False)
     state, infotext, perfdata = size_trend.size_trend(
         "somecheck",
@@ -52,7 +52,7 @@ def test_size_trend_growing(monkeypatch: MonkeyPatch) -> None:
     ]
 
 
-def test_size_trend_shrinking(monkeypatch: MonkeyPatch) -> None:
+def test_size_trend_shrinking(monkeypatch: MonkeyPatch, initialised_item_state: None) -> None:
     patch_rate_and_average(monkeypatch, True)
     state, infotext, perfdata = size_trend.size_trend(
         "somecheck",
@@ -82,4 +82,39 @@ def test_size_trend_shrinking(monkeypatch: MonkeyPatch) -> None:
         ("growth", -2400.0),
         ("trend", -2400.0, 1200.0, 2400.0, 0, 1000.0),
         ("trend_hoursleft", -1),
+    ]
+
+
+def test_size_trend_negative_free_space(
+    monkeypatch: MonkeyPatch, initialised_item_state: None
+) -> None:
+    patch_rate_and_average(monkeypatch, False)
+    state, infotext, perfdata = size_trend.size_trend(
+        "somecheck",
+        "someitem",
+        "some resource",
+        {
+            "trend_range": 1,
+            "trend_perfdata": True,
+            "trend_bytes": (50 * 1024**2, 100 * 1024**2),
+            "trend_shrinking_bytes": (50 * 1024**2, 100 * 1024**2),
+            "trend_perc": (10, 20),
+            "trend_shrinking_perc": (10, 20),
+            "trend_timeleft": (72, 48),
+            "trend_showtimeleft": True,
+        },
+        1200.0,
+        1000.0,
+        1800.0,
+    )
+    assert state == 2
+    assert (
+        infotext
+        == ", trend: +100 MiB / 1 hours - growing too fast (warn/crit at 50.0 MiB/100 MiB per 1.0 h)(!!), "
+        "growing too fast (warn/crit at 10.00%/20.00% per 1.0 h)(!), only 0 hours until some resource full(!!)"
+    )
+    assert perfdata == [
+        ("growth", 2400.0),
+        ("trend", 2400.0, 1200.0, 2400.0, 0, 1000.0),
+        ("trend_hoursleft", 0),
     ]

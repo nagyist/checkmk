@@ -34,7 +34,7 @@ class BINodeGenerator(ABCBINodeGenerator):
             filtered_search_results = []
             for search_result in search_results:
                 action_arguments = dict(macros)
-                action_arguments.update(search_result)
+                action_arguments |= search_result
                 if self.restrict_rule_title == self.action.preview_rule_title(action_arguments):
                     filtered_search_results.append(search_result)
             search_results = filtered_search_results
@@ -49,5 +49,11 @@ class BINodeGenerator(ABCBINodeGenerator):
 
 
 class BINodeGeneratorSchema(Schema):
-    search = create_nested_schema(BISearchSchema, default_schema=BIEmptySearchSchema)
-    action = create_nested_schema(BIActionSchema, default_schema=BIStateOfHostActionSchema)
+    search = create_nested_schema(
+        BISearchSchema, default_schema=BIEmptySearchSchema, description="Search criteria."
+    )
+    action = create_nested_schema(
+        BIActionSchema,
+        default_schema=BIStateOfHostActionSchema,
+        description="Action on search results.",
+    )

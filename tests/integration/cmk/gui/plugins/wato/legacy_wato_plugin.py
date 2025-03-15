@@ -4,11 +4,11 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 # Names for the legacy plugins are provided dynamically
-from cmk.gui.plugins.wato import (  # type: ignore[attr-defined]  # pylint: disable=no-name-in-module
+from cmk.gui.plugins.wato import (  # type: ignore[attr-defined]
     HostRulespec,
     rulespec_registry,
 )
-from cmk.gui.plugins.wato.check_mk_configuration import RulespecGroupHostsMonitoringRulesVarious
+from cmk.gui.plugins.wato.utils import RulespecGroupHostsMonitoringRulesVarious
 from cmk.gui.valuespec import Dictionary
 
 

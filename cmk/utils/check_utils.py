@@ -8,6 +8,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+ParametersTypeAlias = Mapping[str, Any]  # Modification may result in an incompatible API change.
+
 
 def worst_service_state(*states: int, default: int) -> int:
     """Return the 'worst' aggregation of all states
@@ -53,7 +55,7 @@ def section_name_of(check_plugin_name: str) -> str:
 
 
 def maincheckify(subcheck_name: str) -> str:
-    """Get new plugin name
+    """Get new plug-in name
 
     The new API does not know about "subchecks", so drop the dot notation.
     The validation step will prevent us from having colliding plugins.
@@ -61,37 +63,3 @@ def maincheckify(subcheck_name: str) -> str:
     return subcheck_name.replace(".", "_").replace(  # subchecks don't exist anymore
         "-", "_"
     )  # "sap.value-groups"
-
-
-# (un)wrap_parameters:
-#
-# The old "API" allowed for check plugins to discover and use all kinds of parameters:
-# None, str, tuple, dict, int, ...
-# The new API will only allow None and a dictionary. Since this is enforced by the API,
-# we need some wrapper functions to wrap the parameters of legacy functions into a
-# dictionary to pass validation. Since the merging of check parameters is quite convoluted
-# (in particular if dict and non-dict values are merged), we unwrap the parameters once
-# they have passed validation.
-# In a brighter future all parameters ever encountered will be dicts, and these functions
-# may be dropped.
-
-_PARAMS_WRAPPER_KEY = "auto-migration-wrapper-key"
-
-
-# keep return type in sync with ParametersTypeAlias
-def wrap_parameters(parameters: Any) -> Mapping[str, Any]:
-    """wrap the passed data structure in a dictionary, if it isn't one itself"""
-    if isinstance(parameters, dict):
-        return parameters
-    return {_PARAMS_WRAPPER_KEY: parameters}
-
-
-# keep argument parameters in sync with ParametersTypeAlias
-def unwrap_parameters(parameters: Mapping[str, Any]) -> Any:
-    if set(parameters) == {_PARAMS_WRAPPER_KEY}:
-        return parameters[_PARAMS_WRAPPER_KEY]
-    # Note: having *both* the wrapper key and other keys can only happen, if we
-    # merge wrapped (non dict) legacy parameters with newer configured (dict) parameters.
-    # In this case the the plugin can deal with dicts, and will ignore the wrapper key anyway.
-    # Still: cleaning it up here is less confusing.
-    return {k: v for k, v in parameters.items() if k != _PARAMS_WRAPPER_KEY}

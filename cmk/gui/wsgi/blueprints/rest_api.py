@@ -5,22 +5,20 @@
 from __future__ import annotations
 
 import functools
-import typing
+from wsgiref.types import WSGIApplication
 
 from flask import Blueprint, current_app, make_response, Response, send_from_directory
-from flask.blueprints import BlueprintSetupState
 
-from cmk.utils import paths, store
-from cmk.utils.site import get_omd_config
+from cmk.ccc import store
+from cmk.ccc.site import get_omd_config
 
-from cmk.gui import hooks, main_modules, sites
-from cmk.gui.permissions import load_dynamic_permissions
+from cmk.utils import paths
+from cmk.utils.paths import omd_root
+
+from cmk.gui import hooks, sites
 from cmk.gui.wsgi.applications import CheckmkRESTAPI
 from cmk.gui.wsgi.blueprints.global_vars import set_global_vars
 from cmk.gui.wsgi.middleware import OverrideRequestMethod
-
-if typing.TYPE_CHECKING:
-    from _typeshed.wsgi import WSGIApplication
 
 rest_api = Blueprint(
     "rest-api",
@@ -32,21 +30,14 @@ rest_api.before_app_request(set_global_vars)
 
 
 @functools.lru_cache
-def app_instance(debug: bool) -> CheckmkRESTAPI:
-    app = CheckmkRESTAPI(debug=debug)
+def app_instance(debug: bool, testing: bool) -> CheckmkRESTAPI:
+    app = CheckmkRESTAPI(debug=debug, testing=testing)
     app.wsgi_app = OverrideRequestMethod(app.wsgi_app)  # type: ignore[method-assign]
     return app
 
 
-@rest_api.record_once
-def rest_api_first_request(state: BlueprintSetupState) -> None:
-    # Will be called once on setup-time.
-    main_modules.load_plugins()
-
-
 @rest_api.before_request
 def before_request() -> None:
-    load_dynamic_permissions()
     hooks.call("request-start")
 
 
@@ -61,7 +52,7 @@ def after_request(response: Response) -> Response:
 @rest_api.route("/<string:version>/<path:path>", methods=["GET", "PUT", "POST", "DELETE"])
 def endpoint(site: str, version: str, path: str) -> WSGIApplication:
     # TODO: Carve out parts from `CheckmkRESTAPI` and move them here, decorated by @rest_api.route
-    return app_instance(debug=current_app.debug)
+    return app_instance(debug=current_app.debug, testing=current_app.testing)
 
 
 @rest_api.route("/doc/", defaults={"file_name": "index.html"})
@@ -73,7 +64,7 @@ def serve_redoc(site: str, file_name: str) -> Response:
 @functools.lru_cache
 def _get_receiver_port() -> int:
     # make sure we really only ever report a number and nothing more
-    return int(get_omd_config()["CONFIG_AGENT_RECEIVER_PORT"])
+    return int(get_omd_config(omd_root)["CONFIG_AGENT_RECEIVER_PORT"])
 
 
 @rest_api.route("/<string:version>/domain-types/internal/actions/discover-receiver/invoke")

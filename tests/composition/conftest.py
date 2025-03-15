@@ -3,81 +3,121 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+import logging
 import os
-import subprocess
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from shutil import which
+from typing import Literal
 
 import pytest
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
 
-from tests.testlib.site import Site, SiteFactory
-from tests.testlib.utils import current_branch_name
-from tests.testlib.version import CMKVersion, version_from_env
+from tests.composition.utils import get_cre_agent_path
 
-from tests.composition.utils import (
+from tests.testlib.agent import (
     agent_controller_daemon,
-    bake_agent,
-    clean_agent_controller,
-    execute,
-    get_cre_agent_path,
+    bake_agents,
+    download_and_install_agent_package,
     install_agent_package,
-    is_containerized,
+)
+from tests.testlib.common.utils import is_containerized, run
+from tests.testlib.site import (
+    get_site_factory,
+    GlobalSettingsUpdate,
+    Site,
+    tracing_config_from_env,
 )
 
-from cmk.utils.version import Edition
+site_factory = get_site_factory(prefix="comp_")
 
-site_number = 0
-
-
-@pytest.fixture(name="version", scope="session")
-def _version() -> CMKVersion:
-    return version_from_env(
-        fallback_version_spec=CMKVersion.DAILY,
-        fallback_edition=Edition.CEE,
-        fallback_branch=current_branch_name,
-    )
+logger = logging.getLogger(__name__)
 
 
-# Disable this. We have a site_factory instead.
-@pytest.fixture(name="site", scope="module")
-def _site(request):
-    pass
+@pytest.fixture(scope="session", autouse=True)
+def instrument_requests() -> None:
+    RequestsInstrumentor().instrument()
 
 
-# The scope of the site factory is "module" to avoid that changing the site properties in a module
-# may result in a test failing in another one
-@pytest.fixture(name="site_factory", scope="module")
-def _site_factory(version: CMKVersion) -> Iterator[SiteFactory]:
-    # Using a different site for every module to avoid having issues when saving the results for the
-    # tests: if you call SiteFactory.save_results() twice with the same site_id, it will crash
-    # because the results are already there.
-    global site_number
-    sf = SiteFactory(
-        version=version,
-        prefix=f"comp_{site_number}_",
-    )
-    site_number += 1
-    try:
-        yield sf
-    finally:
-        sf.save_results()
-        sf.cleanup()
+@pytest.fixture(name="central_site", scope="session")
+def _central_site(request: pytest.FixtureRequest, ensure_cron: None) -> Iterator[Site]:
+    with site_factory.get_test_site_ctx(
+        "central",
+        description=request.node.name,
+        auto_restart_httpd=True,
+        tracing_config=tracing_config_from_env(os.environ),
+        global_settings_updates=[
+            GlobalSettingsUpdate(
+                relative_path=Path("etc") / "check_mk" / "multisite.d" / "wato" / "global.mk",
+                update={
+                    "log_levels": {
+                        "cmk.web": 10,
+                        "cmk.web.agent_registration": 10,
+                        "cmk.web.background-job": 10,
+                    }
+                },
+            ),
+            GlobalSettingsUpdate(
+                relative_path=Path("etc") / "check_mk" / "conf.d" / "wato" / "global.mk",
+                update={"agent_bakery_logging": 10},
+            ),
+        ],
+    ) as central_site:
+        yield central_site
 
 
-@pytest.fixture(name="central_site", scope="module")
-def _central_site(site_factory: SiteFactory) -> Site:
-    return _create_site_and_restart_httpd(site_factory, "central")
+@pytest.fixture(name="remote_site", scope="session")
+def _remote_site(
+    central_site: Site, request: pytest.FixtureRequest, ensure_cron: None
+) -> Iterator[Site]:
+    yield from _make_connected_remote_site("remote", central_site, request.node.name)
 
 
-@pytest.fixture(name="remote_site", scope="module")
-def _remote_site(central_site: Site, site_factory: SiteFactory) -> Site:
-    remote_site = _create_site_and_restart_httpd(site_factory, "remote")
-    central_site.openapi.create_site(
+@pytest.fixture(name="remote_site_2", scope="session")
+def _remote_site_2(
+    central_site: Site, request: pytest.FixtureRequest, ensure_cron: None
+) -> Iterator[Site]:
+    yield from _make_connected_remote_site("remote2", central_site, request.node.name)
+
+
+def _make_connected_remote_site(
+    site_name: Literal["remote", "remote2"],  # just to track what we're doing...
+    central_site: Site,
+    site_description: str,
+) -> Iterator[Site]:
+    with site_factory.get_test_site_ctx(
+        site_name,
+        description=site_description,
+        auto_restart_httpd=True,
+        tracing_config=tracing_config_from_env(os.environ),
+    ) as remote_site:
+        with _connection(central_site=central_site, remote_site=remote_site):
+            yield remote_site
+
+
+@contextmanager
+def _connection(
+    *,
+    central_site: Site,
+    remote_site: Site,
+) -> Iterator[None]:
+    if central_site.edition.is_managed_edition():
+        basic_settings = {
+            "alias": "Remote Testsite",
+            "site_id": remote_site.id,
+            "customer": "provider",
+        }
+    else:
+        basic_settings = {
+            "alias": "Remote Testsite",
+            "site_id": remote_site.id,
+        }
+
+    logger.info("Create site connection from '%s' to '%s'", central_site.id, remote_site.id)
+    central_site.openapi.sites.create(
         {
-            "basic_settings": {
-                "alias": "Remote Testsite",
-                "site_id": remote_site.id,
-            },
+            "basic_settings": basic_settings,
             "status_connection": {
                 "connection": {
                     "socket_type": "tcp",
@@ -104,72 +144,64 @@ def _remote_site(central_site: Site, site_factory: SiteFactory) -> Site:
                 "user_sync": {"sync_with_ldap_connections": "all"},
                 "replicate_event_console": True,
                 "replicate_extensions": True,
+                "message_broker_port": remote_site.message_broker_port,
             },
         }
     )
-    central_site.openapi.login_to_site(remote_site.id)
-    central_site.openapi.activate_changes_and_wait_for_completion(
+    logger.info("Establish site login '%s' to '%s'", central_site.id, remote_site.id)
+    central_site.openapi.sites.login(remote_site.id)
+    logger.info("Activating site setup changes")
+    central_site.openapi.changes.activate_and_wait_for_completion(
         # this seems to be necessary to avoid sporadic CI failures
         force_foreign_changes=True,
     )
-    return remote_site
+    try:
+        logger.info("Connection from '%s' to '%s' established", central_site.id, remote_site.id)
+        yield
+    finally:
+        if os.environ.get("CLEANUP", "1") == "1":
+            logger.info("Remove site connection from '%s' to '%s'", central_site.id, remote_site.id)
+            logger.info("Hosts left: %s", central_site.openapi.hosts.get_all_names())
+            logger.info("Delete remote site connection '%s'", remote_site.id)
+            central_site.openapi.sites.delete(remote_site.id)
+            logger.info("Activating site removal changes")
+            central_site.openapi.changes.activate_and_wait_for_completion(
+                # this seems to be necessary to avoid sporadic CI failures
+                force_foreign_changes=True,
+            )
 
 
-def _create_site_and_restart_httpd(site_factory: SiteFactory, site_name: str) -> Site:
-    """On RHEL-based distros, such as CentOS and AlmaLinux, we have to manually restart httpd after
-    creating a new site. Otherwise, the site's REST API won't be reachable via port 80, preventing
-    eg. the controller from querying the agent receiver port.
-    Note: the mere presence of httpd is not enough to determine whether we have to restart or not,
-    see eg. sles-15sp4.
-    """
-    site = site_factory.get_site(site_name)
-    # When executed locally and undockerized, the DISTRO may not be set
-    if os.environ.get("DISTRO") in {"centos-7", "centos-8", "almalinux-9"}:
-        execute(["sudo", "httpd", "-k", "restart"])
-    return site
-
-
-@pytest.fixture(name="installed_agent_ctl_in_unknown_state", scope="module")
-def _installed_agent_ctl_in_unknown_state(central_site: Site) -> Path:
-    return install_agent_package(_agent_package_path(central_site))
-
-
-def _agent_package_path(site: Site) -> Path:
-    if site.version.is_raw_edition():
-        return get_cre_agent_path(site)
-    return bake_agent(site)[1]
+@pytest.fixture(name="installed_agent_ctl_in_unknown_state", scope="function")
+def _installed_agent_ctl_in_unknown_state(central_site: Site, tmp_path: Path) -> Path:
+    if central_site.edition.is_raw_edition():
+        return install_agent_package(get_cre_agent_path(central_site))
+    bake_agents(central_site)
+    return download_and_install_agent_package(central_site, tmp_path)
 
 
 @pytest.fixture(name="agent_ctl", scope="function")
 def _agent_ctl(installed_agent_ctl_in_unknown_state: Path) -> Iterator[Path]:
-    with (
-        clean_agent_controller(installed_agent_ctl_in_unknown_state),
-        agent_controller_daemon(installed_agent_ctl_in_unknown_state),
-    ):
+    with agent_controller_daemon(installed_agent_ctl_in_unknown_state):
         yield installed_agent_ctl_in_unknown_state
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _run_cron() -> Iterator[None]:
+@pytest.fixture(scope="session", name="ensure_cron")
+def _run_cron() -> None:
     """Run cron for background jobs"""
     if not is_containerized():
-        yield
         return
-    for cron_cmd in (
-        cron_cmds := (
-            "cron",  # Ubuntu, Debian, ...
-            "crond",  # RHEL (CentOS, AlmaLinux)
-        )
-    ):
-        try:
-            subprocess.run(
-                [cron_cmd],
-                # calling cron spawns a background process, which fails if cron is already running
-                check=False,
-            )
-        except FileNotFoundError:
-            continue
-        break
-    else:
-        raise RuntimeError(f"No cron executable found (tried {','.join(cron_cmds)})")
-    yield
+
+    logger.info("Ensure system cron is running")
+
+    # cron  - Ubuntu, Debian, ...
+    # crond - RHEL (AlmaLinux)
+    cron_cmd = "crond" if Path("/etc/redhat-release").exists() else "cron"
+
+    if not which(cron_cmd):
+        raise RuntimeError(f"No cron executable found (tried {cron_cmd})")
+
+    if run(["pgrep", cron_cmd], check=False, capture_output=True).returncode == 0:
+        return
+
+    # Start cron daemon. It forks an will keep running in the background
+    run([cron_cmd], check=True, sudo=True)

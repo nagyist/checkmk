@@ -59,7 +59,7 @@ OPTIONS:
 #############################################################################
 
 
-def main(sys_argv=None):  # pylint: disable=too-many-branches
+def main(sys_argv=None):
     if sys_argv is None:
         sys_argv = sys.argv[1:]
 
@@ -106,7 +106,7 @@ def main(sys_argv=None):  # pylint: disable=too-many-branches
         "lsnode": {"section_header": "ibm_svc_node", "command": "lsnode -delim :"},
         "lsnodestats": {
             "section_header": "ibm_svc_nodestats",
-            "command": "lsnodestats -delim :",
+            "command": "if [ -f ./bin/shortcuts/lsnodestats ]; then lsnodestats -delim :; else lsnodecanisterstats -delim :; fi",
         },
         "lssystem": {
             "section_header": "ibm_svc_system",
@@ -227,13 +227,7 @@ def _execute_ssh_command(
     host_address: str,
     opt_debug: bool,
 ) -> subprocess.CompletedProcess:
-    cmd = "ssh -o ConnectTimeout={} {} {}@{} '{}'".format(
-        opt_timeout,
-        opt_any_hostkey,
-        shlex.quote(user),
-        shlex.quote(host_address),
-        remote_command,
-    )
+    cmd = f"ssh -o ConnectTimeout={opt_timeout} {opt_any_hostkey} {shlex.quote(user)}@{shlex.quote(host_address)} '{remote_command}'"
 
     if opt_debug:
         sys.stderr.write(f"executing external command: {cmd}\n")
@@ -261,4 +255,4 @@ def _check_ssh_result(result: subprocess.CompletedProcess) -> None:
 
     # Quite strange.. Why not simply print stdout?
     for line in lines:
-        print(line)
+        sys.stdout.write(line + "\n")

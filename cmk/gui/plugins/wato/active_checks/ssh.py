@@ -4,10 +4,12 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 
+from cmk.utils.rulesets.definition import RuleGroup
+
 from cmk.gui.i18n import _
-from cmk.gui.plugins.wato.active_checks.common import RulespecGroupIntegrateOtherServices
 from cmk.gui.plugins.wato.utils import HostRulespec, rulespec_registry
-from cmk.gui.valuespec import Dictionary, Integer, TextInput
+from cmk.gui.valuespec import Dictionary, Integer, NetworkPort, TextInput
+from cmk.gui.wato import RulespecGroupIntegrateOtherServices
 
 
 def _valuespec_active_checks_ssh():
@@ -18,12 +20,12 @@ def _valuespec_active_checks_ssh():
             (
                 "description",
                 TextInput(
-                    title=_("Service Description"),
+                    title=_("Service description"),
                 ),
             ),
             (
                 "port",
-                Integer(
+                NetworkPort(
                     title=_("TCP port number"),
                     default_value=22,
                 ),
@@ -31,7 +33,7 @@ def _valuespec_active_checks_ssh():
             (
                 "timeout",
                 Integer(
-                    title=_("Connect Timeout"),
+                    title=_("Connect timeout"),
                     help=_("Seconds before connection times out"),
                     default_value=10,
                 ),
@@ -60,7 +62,7 @@ rulespec_registry.register(
     HostRulespec(
         group=RulespecGroupIntegrateOtherServices,
         match_type="all",
-        name="active_checks:ssh",
+        name=RuleGroup.ActiveChecks("ssh"),
         valuespec=_valuespec_active_checks_ssh,
     )
 )

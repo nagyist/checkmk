@@ -5,9 +5,7 @@
 
 import pytest
 
-from tests.testlib import Check
-
-from .checktestlib import CheckResult
+from .checktestlib import Check, CheckResult
 
 pytestmark = pytest.mark.checks
 
@@ -34,8 +32,8 @@ pytestmark = pytest.mark.checks
         ),
         (
             [("average_ms", "5"), ("last_ms", "121"), ("flushed", "10000")],
-            0,
-            "Average flush time over 60 minutes: 0.00 ms",
+            2,
+            "Average flush time over 60 minutes: 121.00 ms (warn/crit at 1.00 ms/4.00 ms)",
             [],
             1,
             "Last flush time: 0.12 s (warn/crit at 0.10 s/0.20 s)",

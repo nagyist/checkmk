@@ -2,15 +2,26 @@
 # Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
+"""This module provides a class for managing web sessions with a Checkmk site.
+
+It contains methods for handling HTTP requests, verifying HTML page resources, and
+managing authentication.
+
+Note: this implementation is purely request-based and does not manage cookies or running
+JavaScript scripts.
+"""
 
 import logging
 import os
 import re
 import urllib.parse
 from collections.abc import Collection, Container
+from http.cookiejar import Cookie
 
 import requests
 from bs4 import BeautifulSoup
+
+from tests.testlib.version import edition_from_env
 
 
 class APIError(Exception):
@@ -23,7 +34,6 @@ logger = logging.getLogger()
 class CMKWebSession:
     def __init__(self, site) -> None:  # type: ignore[no-untyped-def]
         super().__init__()
-        self.transids: list = []
         # Resources are only fetched and verified once per session
         self.verified_resources: set = set()
         self.site = site
@@ -34,8 +44,9 @@ class CMKWebSession:
         if expected_target:
             if response.headers["Location"] != expected_target:
                 raise AssertionError(
-                    "REDIRECT FAILED: '%s' != '%s'"
-                    % (response.headers["Location"], expected_target)
+                    "REDIRECT FAILED: '{}' != '{}'".format(
+                        response.headers["Location"], expected_target
+                    )
                 )
             assert response.headers["Location"] == expected_target
 
@@ -50,13 +61,11 @@ class CMKWebSession:
         method: str | bytes,
         path: str,
         expected_code: int = 200,
-        add_transid: bool = False,
+        *,
         allow_redirect_to_login: bool = False,
         **kwargs,
     ) -> requests.Response:
         url = self.site.url_for_path(path)
-        if add_transid:
-            url = self._add_transid(url)
 
         # May raise "requests.exceptions.ConnectionError: ('Connection aborted.', BadStatusLine("''",))"
         # suddenly without known reason. This may be related to some
@@ -66,7 +75,7 @@ class CMKWebSession:
         # Trying to workaround this by trying the problematic request a second time.
         try:
             response = self.session.request(method, url, **kwargs)
-        except requests.ConnectionError as e:
+        except requests.exceptions.ConnectionError as e:
             if "Connection aborted" in "%s" % e:
                 response = self.session.request(method, url, **kwargs)
             else:
@@ -75,21 +84,17 @@ class CMKWebSession:
         self._handle_http_response(response, expected_code, allow_redirect_to_login)
         return response
 
-    def _add_transid(self, url: str) -> str:
-        if not self.transids:
-            raise Exception("Tried to add a transid, but none available at the moment")
-        return url + ("&" if "?" in url else "?") + "_transid=" + self.transids.pop()
-
     def _handle_http_response(
         self, response: requests.Response, expected_code: int, allow_redirect_to_login: bool
     ) -> None:
-        assert (
-            response.status_code == expected_code
-        ), "Got invalid status code (%d != %d) for URL %s (Location: %s)" % (
-            response.status_code,
-            expected_code,
-            response.url,
-            response.headers.get("Location", "None"),
+        assert response.status_code == expected_code, (
+            "Got invalid status code (%d != %d) for URL %s (Location: %s)"
+            % (
+                response.status_code,
+                expected_code,
+                response.url,
+                response.headers.get("Location", "None"),
+            )
         )
 
         if not allow_redirect_to_login and response.history:
@@ -102,27 +107,12 @@ class CMKWebSession:
         if self._get_mime_type(response) == "text/html":
             soup = BeautifulSoup(response.text, "lxml")
 
-            self.transids += self._extract_transids(response.text, soup)
             self._find_errors(response.text)
             self._check_html_page_resources(response.url, soup)
 
     def _get_mime_type(self, response: requests.Response) -> str:
         assert "Content-Type" in response.headers
         return response.headers["Content-Type"].split(";", 1)[0]
-
-    def _extract_transids(self, body: str, soup: BeautifulSoup) -> list:
-        """Extract transids from pages used in later actions issued by tests."""
-
-        transids = set()
-
-        # Extract from form hidden fields
-        for element in soup.findAll(attrs={"name": "_transid"}):
-            transids.add(element["value"])
-
-        # Extract from URLs in the body
-        transids.update(re.findall("_transid=([0-9/]+)", body))
-
-        return list(transids)
 
     def _find_errors(self, body: str) -> None:
         matches = re.search("<div class=error>(.*?)</div>", body, re.M | re.DOTALL)
@@ -135,8 +125,20 @@ class CMKWebSession:
 
         # There might be other resources like iframe, audio, ... but we don't care about them
         self._check_resources(soup, base_url, "img", "src", ["image/png", "image/svg+xml"])
+        # The CSE includes a new onboarding feature. This is loaded from an external source hosted
+        # by checkmk. We do not want to check it in the integration tests
+        script_filters = (
+            [("src", "https://static.saas-dev.cloudsandbox.checkmk.cloud")]
+            if edition_from_env().is_saas_edition()
+            else None
+        )
         self._check_resources(
-            soup, base_url, "script", "src", ["application/javascript", "text/javascript"]
+            soup,
+            base_url,
+            "script",
+            "src",
+            ["application/javascript", "text/javascript"],
+            filters=script_filters,
         )
         self._check_resources(
             soup, base_url, "link", "href", ["text/css"], filters=[("rel", "stylesheet")]
@@ -177,7 +179,7 @@ class CMKWebSession:
     ) -> list:
         urls = []
 
-        for element in soup.findAll(tag):
+        for element in soup.find_all(tag):
             try:
                 skip = False
                 for attr, val in filters or []:
@@ -192,11 +194,24 @@ class CMKWebSession:
 
         return urls
 
-    def login(self, username: str = "cmkadmin", password: str = "cmk") -> None:
-        login_page = self.get("", allow_redirect_to_login=True).text
-        assert "_username" in login_page, "_username not found on login page - page broken?"
-        assert "_password" in login_page
-        assert "_login" in login_page
+    def login(
+        self,
+        username: str = "cmkadmin",
+        password: str = "cmk",
+    ) -> None:
+        r = self.get("", allow_redirect_to_login=True)
+
+        login_page_patterns = ("_username", "_password", "_login")
+        main_page_patterns = ("sidebar", "dashboard.py")
+        logged_in = all(_ in r.text for _ in main_page_patterns) and not any(
+            _ in r.text for _ in login_page_patterns
+        )
+
+        assert not logged_in, "Logged in unexpectedly!"
+
+        login_page = r.text
+        for pattern in login_page_patterns:
+            assert pattern in login_page, f"{pattern} not found in login page - page broken?"
 
         r = self.post(
             "login.py",
@@ -207,13 +222,36 @@ class CMKWebSession:
                 "_login": "Login",
             },
         )
-        auth_cookie = self.session.cookies.get("auth_%s" % self.site.id)
+        auth_cookie = self.session.cookies.get(f"auth_{self.site.id}")
         assert auth_cookie
         assert auth_cookie.startswith("%s:" % username)
 
-        assert "sidebar" in r.text
-        assert "dashboard.py" in r.text
+        main_page = r.text
+        for pattern in main_page_patterns:
+            assert pattern in main_page, f"{pattern} not found in main page - page broken?"
 
     def logout(self) -> None:
         r = self.get("logout.py", allow_redirect_to_login=True)
         assert 'action="login.py"' in r.text
+
+    def is_logged_in(self) -> bool:
+        try:
+            r = self.get("info.py", allow_redirect_to_login=True)
+            return all(x in r.text for x in ("About Checkmk", "Your IT monitoring platform"))
+        except requests.exceptions.ConnectionError:
+            if edition_from_env().is_saas_edition():
+                # with the auth provider running, the get request may fail
+                return self.get_auth_cookie() is not None
+            raise
+
+    def get_auth_cookie(self) -> Cookie | None:
+        """return the auth cookie
+
+        apparently the get on these cookies return a str with only some information, also this is
+        untyped and mypy would need some suppressions.
+        We usually get two cookies so this for loop should not hurt too much"""
+
+        for cookie in self.session.cookies:
+            if cookie.name == f"auth_{self.site.id}":
+                return cookie
+        return None

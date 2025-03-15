@@ -8,6 +8,8 @@
 
 checkname = "msexch_owa"
 
+mock_item_state = {"": {"RequestsPersec_": (0.0, 0)}}
+
 info = [
     [
         "ActiveConversions",
@@ -257,7 +259,7 @@ info = [
     ],
 ]
 
-discovery = {"": [(None, None)]}
+discovery = {"": [(None, {})]}
 
 checks = {
     "": [

@@ -5,13 +5,17 @@
 
 import tarfile
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from pathlib import Path
+
+from pydantic import BaseModel
 
 from livestatus import SiteId
 
+import cmk.ccc.version as cmk_version
+from cmk.ccc.site import omd_site
+
 import cmk.utils.paths
-import cmk.utils.version as cmk_version
 from cmk.utils.diagnostics import (
     CheckmkFileInfo,
     CheckmkFileSensitivity,
@@ -24,6 +28,7 @@ from cmk.utils.diagnostics import (
     get_checkmk_licensing_files_map,
     get_checkmk_log_files_map,
     OPT_CHECKMK_CONFIG_FILES,
+    OPT_CHECKMK_CRASH_REPORTS,
     OPT_CHECKMK_LOG_FILES,
     OPT_CHECKMK_OVERVIEW,
     OPT_COMP_BUSINESS_INTELLIGENCE,
@@ -42,13 +47,16 @@ from cmk.automations.results import CreateDiagnosticsDumpResult
 
 from cmk.gui.background_job import (
     BackgroundJob,
+    BackgroundJobRegistry,
     BackgroundProcessInterface,
     InitialStatusArgs,
-    job_registry,
+    JobTarget,
 )
+from cmk.gui.breadcrumb import Breadcrumb
+from cmk.gui.config import active_config
 from cmk.gui.exceptions import HTTPRedirect, MKAuthException, MKUserError
-from cmk.gui.htmllib.html import html
-from cmk.gui.http import request, response
+from cmk.gui.htmllib.html import html, HTMLGenerator
+from cmk.gui.http import ContentDispositionType, request, response
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
 from cmk.gui.page_menu import (
@@ -59,34 +67,51 @@ from cmk.gui.page_menu import (
     PageMenuEntry,
     PageMenuTopic,
 )
-from cmk.gui.pages import Page, page_registry
-from cmk.gui.plugins.wato.utils import mode_registry, redirect, WatoMode
+from cmk.gui.pages import Page, PageRegistry
 from cmk.gui.site_config import get_site_config, site_is_local
+from cmk.gui.theme import make_theme
 from cmk.gui.type_defs import ActionResult, PermissionName
 from cmk.gui.user_sites import get_activation_site_choices
+from cmk.gui.utils.csrf_token import check_csrf_token
 from cmk.gui.utils.transaction_manager import transactions
-from cmk.gui.utils.urls import DocReference, makeuri, makeuri_contextless
+from cmk.gui.utils.urls import doc_reference_url, DocReference, makeuri, makeuri_contextless
 from cmk.gui.valuespec import (
     CascadingDropdown,
     Dictionary,
     DropdownChoice,
     DualListChoice,
     FixedValue,
+    Integer,
+    MonitoredHostname,
     ValueSpec,
 )
-from cmk.gui.watolib.automation_commands import automation_command_registry, AutomationCommand
+from cmk.gui.watolib.automation_commands import AutomationCommand, AutomationCommandRegistry
 from cmk.gui.watolib.automations import do_remote_automation
 from cmk.gui.watolib.check_mk_automations import create_diagnostics_dump
+from cmk.gui.watolib.mode import ModeRegistry, redirect, WatoMode
 
 _CHECKMK_FILES_NOTE = _(
     "<br>Note: Some files may contain highly sensitive data like"
     " passwords. These files are marked with 'H'."
-    " Other files may include IP adresses, hostnames, usernames,"
-    " mail adresses or phone numbers and are marked with 'M'."
+    " Other files may include IP addresses, host names, user names,"
+    " mail addresses or phone numbers and are marked with 'M'."
 )
 
+timeout_default = 110
 
-@mode_registry.register
+
+def register(
+    page_registry: PageRegistry,
+    mode_registry: ModeRegistry,
+    automation_command_registry: AutomationCommandRegistry,
+    job_registry: BackgroundJobRegistry,
+) -> None:
+    page_registry.register_page("download_diagnostics_dump")(PageDownloadDiagnosticsDump)
+    mode_registry.register(ModeDiagnostics)
+    automation_command_registry.register(AutomationDiagnosticsDumpGetFile)
+    job_registry.register(DiagnosticsDumpBackgroundJob)
+
+
 class ModeDiagnostics(WatoMode):
     @classmethod
     def name(cls) -> str:
@@ -110,16 +135,18 @@ class ModeDiagnostics(WatoMode):
             params = self._vs_diagnostics().from_html_vars("diagnostics")
             return {
                 "site": params["site"],
+                "timeout": params.get("timing", {}).get("timeout", timeout_default),
                 "general": params["general"],
                 "opt_info": params["opt_info"],
                 "comp_specific": params["comp_specific"],
+                "checkmk_server_host": params["checkmk_server_host"],
             }
         return None
 
     def title(self) -> str:
         return _("Support diagnostics")
 
-    def page_menu(self, breadcrumb) -> PageMenu:  # type: ignore[no-untyped-def]
+    def page_menu(self, breadcrumb: Breadcrumb) -> PageMenu:
         menu = make_simple_form_page_menu(
             _("Diagnostics"),
             breadcrumb,
@@ -150,6 +177,8 @@ class ModeDiagnostics(WatoMode):
         return menu
 
     def action(self) -> ActionResult:
+        check_csrf_token()
+
         if not transactions.check_transaction():
             return None
 
@@ -158,7 +187,21 @@ class ModeDiagnostics(WatoMode):
 
         params = self._diagnostics_parameters
         assert params is not None
-        self._job.start(lambda job_interface: self._job.do_execute(params, job_interface))
+        if (
+            result := self._job.start(
+                JobTarget(
+                    callable=diagnostics_dump_entry_point,
+                    args=DiagnosticsDumpArgs(params=params),
+                ),
+                InitialStatusArgs(
+                    title=self._job.gui_title(),
+                    lock_wato=False,
+                    stoppable=False,
+                    user=str(user.id) if user.id else None,
+                ),
+            )
+        ).is_error():
+            raise result.error
 
         return redirect(self._job.detail_url())
 
@@ -166,13 +209,11 @@ class ModeDiagnostics(WatoMode):
         if self._job.is_active():
             raise HTTPRedirect(self._job.detail_url())
 
-        html.begin_form("diagnostics", method="POST")
+        with html.form_context("diagnostics", method="POST"):
+            vs_diagnostics = self._vs_diagnostics()
+            vs_diagnostics.render_input("diagnostics", {})
 
-        vs_diagnostics = self._vs_diagnostics()
-        vs_diagnostics.render_input("diagnostics", {})
-
-        html.hidden_fields()
-        html.end_form()
+            html.hidden_fields()
 
     def _vs_diagnostics(self) -> Dictionary:
         return Dictionary(
@@ -227,6 +268,55 @@ class ModeDiagnostics(WatoMode):
                 #    )
                 # ),
                 (
+                    "timing",
+                    Dictionary(
+                        title=_("Timeout"),
+                        elements=[
+                            (
+                                "timeout",
+                                Integer(
+                                    title=_(
+                                        "If exceeded, an exception will appear. "
+                                        "In extraordinary cases, consider calling "
+                                        "Support Diagnostics from command line "
+                                        "(see inline help)."
+                                    ),
+                                    help=_(
+                                        "The timeout in seconds when gathering the support "
+                                        "diagnostics data. The default is 110 seconds. When "
+                                        "very large files are collected, it's also possible to "
+                                        "call the support diagnostics from the command line "
+                                        "using the command 'cmk --create-diagnostics-dump' with "
+                                        "appropriate parameters in the context of the affected "
+                                        "site. See the %s."
+                                    )
+                                    % html.render_a(
+                                        "user manual",
+                                        href=doc_reference_url(DocReference.DIAGNOSTICS_CLI),
+                                        target="_blank",
+                                    ),
+                                    default_value=timeout_default,
+                                    minvalue=60,
+                                    unit=_("seconds"),
+                                ),
+                            ),
+                        ],
+                    ),
+                ),
+                (
+                    "checkmk_server_host",
+                    MonitoredHostname(
+                        title=_("Checkmk server host"),
+                        help=_(
+                            "Some of the diagnostics data needs to be collected from the host "
+                            "that represents the Checkmk server of the related site. "
+                            "In case your Checkmk server is not monitored by itself, but from "
+                            "a different site (which is actually recommended), please enter "
+                            "the name of that host here."
+                        ),
+                    ),
+                ),
+                (
                     "general",
                     FixedValue(
                         value=True,
@@ -243,6 +333,15 @@ class ModeDiagnostics(WatoMode):
                     Dictionary(
                         title=_("Optional general information"),
                         elements=self._get_optional_information_elements(),
+                        default_keys=[
+                            OPT_LOCAL_FILES,
+                            OPT_OMD_CONFIG,
+                            OPT_CHECKMK_OVERVIEW,
+                            OPT_CHECKMK_CRASH_REPORTS,
+                            OPT_CHECKMK_LOG_FILES,
+                            OPT_CHECKMK_CONFIG_FILES,
+                            OPT_PERFORMANCE_GRAPHS,
+                        ],
                     ),
                 ),
                 (
@@ -250,6 +349,11 @@ class ModeDiagnostics(WatoMode):
                     Dictionary(
                         title=_("Component specific information"),
                         elements=self._get_component_specific_elements(),
+                        default_keys=[
+                            OPT_COMP_BUSINESS_INTELLIGENCE,
+                            OPT_COMP_CMC,
+                            OPT_COMP_LICENSING,
+                        ],
                     ),
                 ),
             ],
@@ -263,7 +367,7 @@ class ModeDiagnostics(WatoMode):
                 FixedValue(
                     value=True,
                     totext="",
-                    title=_("Local Files"),
+                    title=_("Local Files and MKPs"),
                     help=_(
                         "List of installed, unpacked, optional files below OMD_ROOT/local. "
                         "This also includes information about installed MKPs."
@@ -291,11 +395,24 @@ class ModeDiagnostics(WatoMode):
                     totext="",
                     title=_("Checkmk Overview"),
                     help=_(
-                        "Checkmk Agent, Number, version and edition of sites, Cluster host; "
-                        "Number of hosts, services, CMK Helper, Live Helper, "
-                        "Helper usage; State of daemons: Apache, Core, Crontag, "
+                        "Checkmk Agent, Number, version and edition of sites, cluster host; "
+                        "number of hosts, services, CMK Helper, Live Helper, "
+                        "Helper usage; state of daemons: Apache, Core, Crontab, "
                         "DCD, Liveproxyd, MKEventd, MKNotifyd, RRDCached "
-                        "(Agent plugin mk_inventory needs to be installed)"
+                        "(Agent plug-in mk_inventory needs to be installed)"
+                    ),
+                ),
+            ),
+            (
+                OPT_CHECKMK_CRASH_REPORTS,
+                FixedValue(
+                    value=True,
+                    totext="",
+                    title=_("Crash Reports"),
+                    help=_(
+                        "The latest crash reports"
+                        "<br>Note: Some crash reports may contain sensitive data like"
+                        "host names or user names."
                     ),
                 ),
             ),
@@ -315,7 +432,7 @@ class ModeDiagnostics(WatoMode):
             ),
         ]
 
-        if not cmk_version.is_raw_edition():
+        if cmk_version.edition(cmk.utils.paths.omd_root) is not cmk_version.Edition.CRE:
             elements.append(
                 (
                     OPT_PERFORMANCE_GRAPHS,
@@ -389,12 +506,12 @@ class ModeDiagnostics(WatoMode):
             ),
         ]
 
-        if not cmk_version.is_raw_edition():
+        if cmk_version.edition(cmk.utils.paths.omd_root) is not cmk_version.Edition.CRE:
             elements.append(
                 (
                     OPT_COMP_CMC,
                     Dictionary(
-                        title=_("CMC (Checkmk Microcore)"),
+                        title=_("CMC (Checkmk Micro Core)"),
                         help=_("Core files (config, state and history) from var/check_mk/core.%s")
                         % _CHECKMK_FILES_NOTE,
                         elements=self._get_component_specific_checkmk_files_elements(
@@ -410,21 +527,21 @@ class ModeDiagnostics(WatoMode):
                     Dictionary(
                         title=_("Licensing Information"),
                         help=_(
-                            "Licensing files from var/check_mk/licensing and var/log/licensing.log.%s"
+                            "Licensing files from var/check_mk/licensing, etc/check_mk,"
+                            " var/check_mk/core and var/log/licensing.log.%s"
                         )
                         % _CHECKMK_FILES_NOTE,
                         elements=self._get_component_specific_checkmk_files_elements(
                             OPT_COMP_LICENSING,
                         ),
-                        default_keys=["licensing_files"],
+                        default_keys=["licensing_files", "log_files", "config_files"],
                     ),
                 )
             )
         return elements
 
-    def _get_component_specific_checkmk_files_elements(  # type: ignore[no-untyped-def]
-        self,
-        component,
+    def _get_component_specific_checkmk_files_elements(
+        self, component: str
     ) -> list[tuple[str, ValueSpec]]:
         elements = []
         config_files = [
@@ -571,7 +688,16 @@ class ModeDiagnostics(WatoMode):
         ]
 
 
-@job_registry.register
+class DiagnosticsDumpArgs(BaseModel, frozen=True):
+    params: DiagnosticsParameters
+
+
+def diagnostics_dump_entry_point(
+    job_interface: BackgroundProcessInterface, args: DiagnosticsDumpArgs
+) -> None:
+    DiagnosticsDumpBackgroundJob().do_execute(args.params, job_interface)
+
+
 class DiagnosticsDumpBackgroundJob(BackgroundJob):
     job_prefix = "diagnostics_dump"
 
@@ -580,19 +706,20 @@ class DiagnosticsDumpBackgroundJob(BackgroundJob):
         return _("Diagnostics dump")
 
     def __init__(self) -> None:
-        super().__init__(
-            self.job_prefix,
-            InitialStatusArgs(
-                title=self.gui_title(),
-                lock_wato=False,
-                stoppable=False,
-            ),
-        )
+        super().__init__(self.job_prefix)
 
     def _back_url(self) -> str:
         return makeuri(request, [])
 
     def do_execute(
+        self,
+        diagnostics_parameters: DiagnosticsParameters,
+        job_interface: BackgroundProcessInterface,
+    ) -> None:
+        with job_interface.gui_context():
+            self._do_execute(diagnostics_parameters, job_interface)
+
+    def _do_execute(
         self,
         diagnostics_parameters: DiagnosticsParameters,
         job_interface: BackgroundProcessInterface,
@@ -605,13 +732,12 @@ class DiagnosticsDumpBackgroundJob(BackgroundJob):
         # sites = diagnostics_parameters["sites"][1]
         site = diagnostics_parameters["site"]
 
-        timeout = request.request_timeout - 2
         results = []
         for chunk in chunks:
             chunk_result = create_diagnostics_dump(
                 site,
                 chunk,
-                timeout,
+                diagnostics_parameters["timeout"],
             )
             results.append(chunk_result)
 
@@ -626,9 +752,13 @@ class DiagnosticsDumpBackgroundJob(BackgroundJob):
         #        results.append(chunk_result)
 
         if len(results) > 1:
-            result = _merge_results(results)
+            result = _merge_results(site, results, diagnostics_parameters["timeout"])
+            # The remote tarfiles will be downloaded and the link will point to the local site.
+            download_site_id = omd_site()
         elif len(results) == 1:
             result = results[0]
+            # When there is only one chunk, the download link will point to the remote site.
+            download_site_id = site
         else:
             job_interface.send_result_message(_("Got no result to create dump file"))
             return
@@ -639,19 +769,32 @@ class DiagnosticsDumpBackgroundJob(BackgroundJob):
             tarfile_path = result.tarfile_path
             download_url = makeuri_contextless(
                 request,
-                [("site", site), ("tarfile_name", str(Path(tarfile_path).name))],
+                [
+                    ("site", download_site_id),
+                    ("tarfile_name", str(Path(tarfile_path).name)),
+                    ("timeout", diagnostics_parameters["timeout"]),
+                ],
                 filename="download_diagnostics_dump.py",
             )
-            button = html.render_icon_button(download_url, _("Download"), "diagnostics_dump_file")
 
             job_interface.send_progress_update(_("Dump file: %s") % tarfile_path)
-            job_interface.send_result_message(_("%s Retrieve created dump file") % button)
+            job_interface.send_result_message(
+                _("%s Retrieve created dump file")
+                % HTMLGenerator.render_icon_button(
+                    url=download_url,
+                    title=_("Download"),
+                    icon="diagnostics_dump_file",
+                    theme=make_theme(validate_choices=False),
+                )
+            )
 
         else:
             job_interface.send_result_message(_("Creating dump file failed"))
 
 
-def _merge_results(results) -> CreateDiagnosticsDumpResult:  # type: ignore[no-untyped-def]
+def _merge_results(
+    site: SiteId, results: Sequence[CreateDiagnosticsDumpResult], timeout: int
+) -> CreateDiagnosticsDumpResult:
     output: str = ""
     tarfile_created: bool = False
     tarfile_paths: list[str] = []
@@ -659,7 +802,15 @@ def _merge_results(results) -> CreateDiagnosticsDumpResult:  # type: ignore[no-u
         output += result.output
         if result.tarfile_created:
             tarfile_created = True
-            tarfile_paths.append(result.tarfile_path)
+            if site_is_local(active_config, site):
+                tarfile_localpath = result.tarfile_path
+            else:
+                tarfile_localpath = _get_tarfile_from_remotesite(
+                    SiteId(site),
+                    Path(result.tarfile_path).name,
+                    timeout,
+                )
+            tarfile_paths.append(tarfile_localpath)
 
     return CreateDiagnosticsDumpResult(
         output=output,
@@ -668,10 +819,16 @@ def _merge_results(results) -> CreateDiagnosticsDumpResult:  # type: ignore[no-u
     )
 
 
-def _join_sub_tars(tarfile_paths: list[str]) -> str:
-    tarfile_path = str(
-        cmk.utils.paths.diagnostics_dir.joinpath(str(uuid.uuid4())).with_suffix(".tar.gz")
-    )
+def _get_tarfile_from_remotesite(site: SiteId, tarfile_name: str, timeout: int) -> str:
+    cmk.utils.paths.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    tarfile_localpath = _create_file_path()
+    with open(tarfile_localpath, "wb") as file:
+        file.write(_get_diagnostics_dump_file(site, tarfile_name, timeout))
+    return tarfile_localpath
+
+
+def _join_sub_tars(tarfile_paths: Sequence[str]) -> str:
+    tarfile_path = _create_file_path()
     with tarfile.open(name=tarfile_path, mode="w:gz") as dest:
         for filepath in tarfile_paths:
             with tarfile.open(name=filepath, mode="r:gz") as sub_tar:
@@ -683,7 +840,14 @@ def _join_sub_tars(tarfile_paths: list[str]) -> str:
     return tarfile_path
 
 
-@page_registry.register_page("download_diagnostics_dump")
+def _create_file_path() -> str:
+    return str(
+        cmk.utils.paths.diagnostics_dir.joinpath("sddump_" + str(uuid.uuid4())).with_suffix(
+            ".tar.gz"
+        )
+    )
+
+
 class PageDownloadDiagnosticsDump(Page):
     def page(self) -> None:
         if not user.may("wato.diagnostics"):
@@ -693,40 +857,42 @@ class PageDownloadDiagnosticsDump(Page):
 
         site = SiteId(request.get_ascii_input_mandatory("site"))
         tarfile_name = request.get_ascii_input_mandatory("tarfile_name")
-        file_content = self._get_diagnostics_dump_file(site, tarfile_name)
+        timeout = request.get_integer_input_mandatory("timeout")
+        file_content = _get_diagnostics_dump_file(site, tarfile_name, timeout)
 
         response.set_content_type("application/x-tgz")
-        response.headers["Content-Disposition"] = "Attachment; filename=%s" % tarfile_name
+        response.set_content_disposition(ContentDispositionType.ATTACHMENT, tarfile_name)
         response.set_data(file_content)
 
-    def _get_diagnostics_dump_file(self, site: SiteId, tarfile_name: str) -> bytes:
-        if site_is_local(site):
-            return _get_diagnostics_dump_file(tarfile_name)
 
-        raw_response = do_remote_automation(
-            get_site_config(site),
-            "diagnostics-dump-get-file",
-            [
-                ("tarfile_name", tarfile_name),
-            ],
-        )
-        assert isinstance(raw_response, bytes)
-        return raw_response
-
-
-@automation_command_registry.register
-class AutomationDiagnosticsDumpGetFile(AutomationCommand):
+class AutomationDiagnosticsDumpGetFile(AutomationCommand[str]):
     def command_name(self) -> str:
         return "diagnostics-dump-get-file"
 
     def execute(self, api_request: str) -> bytes:
-        return _get_diagnostics_dump_file(api_request)
+        return _get_local_diagnostics_dump_file(api_request)
 
     def get_request(self) -> str:
         return request.get_ascii_input_mandatory("tarfile_name")
 
 
-def _get_diagnostics_dump_file(tarfile_name: str) -> bytes:
+def _get_diagnostics_dump_file(site: SiteId, tarfile_name: str, timeout: int) -> bytes:
+    if site_is_local(active_config, site):
+        return _get_local_diagnostics_dump_file(tarfile_name)
+
+    raw_response = do_remote_automation(
+        get_site_config(active_config, site),
+        "diagnostics-dump-get-file",
+        [
+            ("tarfile_name", tarfile_name),
+        ],
+        timeout=timeout,
+    )
+    assert isinstance(raw_response, bytes)
+    return raw_response
+
+
+def _get_local_diagnostics_dump_file(tarfile_name: str) -> bytes:
     _validate_diagnostics_dump_tarfile_name(tarfile_name)
     tarfile_path = cmk.utils.paths.diagnostics_dir.joinpath(tarfile_name)
     with tarfile_path.open("rb") as f:

@@ -3,15 +3,15 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 """EC UPDATE methods with one or more event IDs"""
+
 import pytest
 
-from tests.testlib import CMKEventConsole
+from tests.unit.cmk.ec.helpers import FakeStatusSocket, new_event
 
-from tests.unit.cmk.ec.helpers import FakeStatusSocket
+from cmk.utils.hostaddress import HostName
 
-from cmk.utils.type_defs import HostName
-
-from cmk.ec.main import Event, EventStatus, StatusServer
+import cmk.ec.export as ec
+from cmk.ec.main import EventStatus, StatusServer
 from cmk.ec.query import MKClientError
 
 
@@ -21,16 +21,16 @@ from cmk.ec.query import MKClientError
 def test_update_event(
     event_status: EventStatus,
     status_server: StatusServer,
-    start_phase: str,
+    start_phase: ec.EventPhase,
     set_phase_to: str,
 ) -> None:
     """Update and acknowledge one event"""
-    event: Event = {
-        "host": "host_1",
-        "phase": start_phase,
-        "core_host": HostName("ABC"),
-    }
-    event_status.new_event(CMKEventConsole.new_event(event))
+    event = ec.Event(
+        host=HostName("host_1"),
+        phase=start_phase,
+        core_host=HostName("ABC"),
+    )
+    event_status.new_event(new_event(event))
     s = FakeStatusSocket(
         bytes(f"COMMAND UPDATE;1;testuser;{set_phase_to};test_comment;test_contact_name", "utf-8")
     )
@@ -45,15 +45,15 @@ def test_update_event(
 def test_update_events_that_cant_be_acked(
     event_status: EventStatus,
     status_server: StatusServer,
-    test_phase: str,
+    test_phase: ec.EventPhase,
 ) -> None:
     """Update and acknowledge an event when the phase is not 'ack' or 'open'"""
-    event: Event = {
-        "host": "host_1",
-        "phase": test_phase,
-        "core_host": HostName("ABC"),
-    }
-    event_status.new_event(CMKEventConsole.new_event(event))
+    event = ec.Event(
+        host=HostName("host_1"),
+        phase=test_phase,
+        core_host=HostName("ABC"),
+    )
+    event_status.new_event(new_event(event))
     s = FakeStatusSocket(b"COMMAND UPDATE;1;testuser;1;test_comment;test_contact_name")
     with pytest.raises(MKClientError) as excinfo:
         status_server.handle_client(s, True, "127.0.0.1")
@@ -63,9 +63,9 @@ def test_update_events_that_cant_be_acked(
 
 def test_update_multiple_evens(event_status: EventStatus, status_server: StatusServer) -> None:
     """Update and acknowledge multiple events"""
-    events: list[Event] = [
+    events: list[ec.Event] = [
         {
-            "host": f"host_{i}",
+            "host": HostName(f"host_{i}"),
             "phase": "open",
             "core_host": HostName("ABC"),
         }
@@ -73,9 +73,9 @@ def test_update_multiple_evens(event_status: EventStatus, status_server: StatusS
     ]
 
     for event in events:
-        event_status.new_event(CMKEventConsole.new_event(event))
+        event_status.new_event(new_event(event))
 
-    event_ids = ",".join([str(n + 1) for n, _ in enumerate(event_status.events())])
+    event_ids = ",".join(str(n + 1) for n, _ in enumerate(event_status.events()))
     s = FakeStatusSocket(
         bytes(f"COMMAND UPDATE;{event_ids};testuser;1;test_comment;test_contact_name", "utf-8")
     )

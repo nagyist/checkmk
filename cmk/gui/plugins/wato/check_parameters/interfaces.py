@@ -4,6 +4,7 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 from collections.abc import Mapping
 
+from cmk.gui import ifaceoper
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.i18n import _
 from cmk.gui.plugins.wato.check_parameters.interface_utils import vs_interface_traffic
@@ -18,7 +19,6 @@ from cmk.gui.plugins.wato.utils import (
 from cmk.gui.valuespec import (
     Alternative,
     CascadingDropdown,
-    defines,
     Dictionary,
     DictionaryEntry,
     DropdownChoice,
@@ -59,7 +59,14 @@ def _vs_item_appearance(title, help_txt):
             ("alias", _("Use alias")),
         ],
         default_value="index",
-        help=help_txt,
+        help=help_txt
+        + _(
+            "<br> <br>  "
+            "<b>Important note</b>: When changing this option, the services "
+            "need to be removed and rediscovered to apply the changes. "
+            "Otherwise there is a risk of mismatch between the discovered "
+            "and checked services."
+        ),
     )
 
 
@@ -130,7 +137,7 @@ def _vs_grouping():
         help=_(
             "Normally, the interface checks create a single service for each interface. By defining "
             "interface groups, multiple interfaces can be combined together. For each group, a "
-            "single service is created. This services reports the total traffic amount summed over "
+            "single service is created. These services report the total traffic amount summed over "
             "all group members."
         ),
         choices=[
@@ -156,7 +163,7 @@ def _vs_grouping():
                                             "group_name",
                                             TextInput(
                                                 title=_("Group name"),
-                                                help=_("Name of group in service description"),
+                                                help=_("Name of group in service name"),
                                                 allow_empty=False,
                                             ),
                                         ),
@@ -218,6 +225,7 @@ def _vs_regex_matching(match_obj):
 
 def _note_for_admin_state_options():
     return _(
+        # xgettext: no-python-format
         "Note: The admin state is in general only available for the 64-bit SNMP interface check. "
         "Additionally, you have to specifically configure Checkmk to fetch this information, "
         "otherwise, using this option will have no effect. To make Checkmk fetch the admin status, "
@@ -269,7 +277,7 @@ def _vs_matching_conditions():
                                     "Apply this rule only to interfaces whose port type is listed "
                                     "below."
                                 ),
-                                choices=defines.interface_port_types(),
+                                choices=ifaceoper.interface_port_types(),
                                 rows=40,
                                 default_value=[
                                     "6",
@@ -295,7 +303,7 @@ def _vs_matching_conditions():
                                     "Apply this rule only to interfaces whose port state is listed "
                                     "below."
                                 ),
-                                choices=defines.interface_oper_states(),
+                                choices=ifaceoper.interface_oper_states(),
                                 toggle_all=True,
                                 default_value=["1"],
                             ),
@@ -398,7 +406,7 @@ vs_elements_if_groups_matches: list[DictionaryEntry] = [
         Transform(
             valuespec=DropdownChoice[int](
                 title=_("Select interface port type"),
-                choices=ListChoice.dict_choices(defines.interface_port_types()),
+                choices=ListChoice.dict_choices(ifaceoper.interface_port_types()),
                 help=_(
                     "Only interfaces with the given port type are put into this group. "
                     "For example 53 (propVirtual)."
@@ -422,7 +430,7 @@ vs_elements_if_groups_group: list[DictionaryEntry] = [
         "group_name",
         TextInput(
             title=_("Group name"),
-            help=_("Name of group in service description"),
+            help=_("Name of group in service name"),
             allow_empty=False,
         ),
     ),
@@ -544,12 +552,10 @@ def _vs_packet_levels(
                         Percentage(
                             label=_("Warning at"),
                             default_value=percent_levels[0],
-                            display_format="%.3f",
                         ),
                         Percentage(
                             label=_("Critical at"),
                             default_value=percent_levels[1],
-                            display_format="%.3f",
                         ),
                     ],
                 ),
@@ -579,7 +585,7 @@ PERC_DISCARD_LEVELS = (10.0, 20.0)
 PERC_PKG_LEVELS = (10.0, 20.0)
 
 
-def _vs_alternative_levels(  # pylint: disable=redefined-builtin
+def _vs_alternative_levels(
     title: str,
     help: str,
     percent_levels: tuple[float, float] = (0.0, 0.0),
@@ -606,7 +612,7 @@ def _vs_alternative_levels(  # pylint: disable=redefined-builtin
                 optional_keys=False,
             ),
             Dictionary(
-                title="Provide seperate levels for in and out",
+                title="Provide separate levels for in and out",
                 elements=[
                     (
                         "in",
@@ -648,7 +654,7 @@ def _vs_state_mappings() -> CascadingDropdown:
                                     orientation="horizontal",
                                     elements=[
                                         ListChoice(
-                                            choices=defines.interface_oper_states(),
+                                            choices=ifaceoper.interface_oper_states(),
                                             allow_empty=False,
                                         ),
                                         MonitoringState(),
@@ -699,7 +705,7 @@ def _vs_state_mappings() -> CascadingDropdown:
                                         str(key),
                                         f"{key} - {value}",
                                     )
-                                    for key, value in defines.interface_oper_states().items()
+                                    for key, value in ifaceoper.interface_oper_states().items()
                                 ],
                                 title=_("Operational state"),
                             ),
@@ -743,6 +749,7 @@ def _parameter_valuespec_if() -> Dictionary:
             "discovered_oper_status",
             "discovered_admin_status",
             "discovered_speed",
+            "item_appearance",
         ],  # Created by discovery
         elements=[
             (
@@ -791,7 +798,7 @@ def _parameter_valuespec_if() -> Dictionary:
                 Optional(
                     valuespec=ListChoice(
                         title=_("Allowed operational states:"),
-                        choices=defines.interface_oper_states(),
+                        choices=ifaceoper.interface_oper_states(),
                         allow_empty=False,
                     ),
                     title=_("Operational state"),
@@ -939,8 +946,8 @@ def _parameter_valuespec_if() -> Dictionary:
                     title=_("Activate total bandwidth metric (sum of in and out)"),
                     help=_(
                         "By activating this item, the sum of incoming and outgoing traffic will "
-                        "be monitored via a seperate metric. Setting levels on the used total bandwidth "
-                        "is optional. If you do set levels you might also consider using averaging."
+                        "be monitored via a separate metric. Setting levels on the used total bandwidth "
+                        "is optional. If you set levels you might also consider using averaging."
                     ),
                     elements=[
                         (
@@ -975,16 +982,18 @@ def _parameter_valuespec_if() -> Dictionary:
             ),
             (
                 "nucasts",
-                Tuple(
-                    title=_("Non-unicast packet rates"),
-                    help=_(
-                        "Setting levels on non-unicast packet rates is optional. This may help "
-                        "to detect broadcast storms and other unwanted traffic."
+                Migrate(
+                    valuespec=_vs_alternative_levels(
+                        title=_("Non-Unicast packet rates"),
+                        help=_(
+                            "Setting levels on non-unicast packet rates is optional. This may help "
+                            "to detect broadcast storms and other unwanted traffic."
+                        ),
+                        percent_levels=PERC_PKG_LEVELS,
+                        percent_detail=_(" (in relation to all successful packets)"),
+                        abs_detail=_(" (in packets per second)"),
                     ),
-                    elements=[
-                        Integer(title=_("Warning at"), unit=_("pkts / sec")),
-                        Integer(title=_("Critical at"), unit=_("pkts / sec")),
-                    ],
+                    migrate=_transform_discards,
                 ),
             ),
             (
@@ -1056,7 +1065,7 @@ def _parameter_valuespec_if() -> Dictionary:
             (
                 "average_bm",
                 Integer(
-                    title=_("Average values for broad- and multicast packet rates"),
+                    title=_("Average values for broadcast and multicast packet rates"),
                     help=_(
                         "By activating the computation of averages, the levels on "
                         "broad- and multicast packet rates are applied to "
@@ -1110,7 +1119,7 @@ def _parameter_valuespec_if() -> Dictionary:
 
 rulespec_registry.register(
     CheckParameterRulespecWithItem(
-        check_group_name="if",
+        check_group_name="interfaces",
         group=RulespecGroupCheckParametersNetworking,
         item_spec=_item_spec_if,
         match_type="dict",

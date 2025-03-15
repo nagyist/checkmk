@@ -7,11 +7,11 @@
 #include <numeric>
 #include <ranges>
 
-#include "agent_controller.h"
-#include "cfg.h"
 #include "common/mailslot_transport.h"
-#include "test_tools.h"
 #include "tools/_raii.h"
+#include "watest/test_tools.h"
+#include "wnx/agent_controller.h"
+#include "wnx/cfg.h"
 
 using namespace std::chrono_literals;
 namespace fs = std::filesystem;
@@ -260,9 +260,9 @@ void CleanArtifacts() {
     fs::remove(ac::ControllerFlagFile(), ec);
 }
 constexpr auto marker_new = "Checkmk monitoring agent service - 2.2, 64-bit";
+// keep value below as is
 constexpr auto marker_old =
-    "Check MK monitoring and management Service, 64-bit";
-
+    "Check MK monitoring and management Service, 64-bit";  // old marker
 }  // namespace
 
 TEST(AgentController, CreateLegacyPullFile) {
@@ -354,7 +354,7 @@ public:
     }
 
     [[nodiscard]] fs::path markerFile() const {
-        return temp_fs_->data() / ac::kCmkAgentUnistall;
+        return temp_fs_->data() / ac::kCmkAgentUninstall;
     }
 
     [[nodiscard]] fs::path flagFile() const {

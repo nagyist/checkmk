@@ -1,0 +1,177 @@
+@charset "UTF-8";
+// Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+// This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+// conditions defined in the file COPYING, which is part of this source code package.
+
+/*-------------------------------------------------------------------------.
+|                               ____ ___                                   |
+|                              | __ )_ _|                                  |
+|                              |  _ \| |                                   |
+|                              | |_) | |                                   |
+|                              |____/___|                                  |
+|                                                                          |
++--------------------------------------------------------------------------+
+| Styles used by the Business-Intelligence module.                         |
+'-------------------------------------------------------------------------*/
+.aggrtree {
+  span.state {
+    padding: 2px 6px 0;
+    margin-right: 4px;
+    border-radius: 2px;
+    font-weight: $font-weight-bold;
+  }
+
+  a.assumption img.icon,
+  img.bi.icon {
+    width: 13px;
+    height: 13px;
+  }
+
+  img.bi.icon {
+    position: relative;
+    top: -1px;
+    margin-right: $spacing-half;
+  }
+}
+
+td.aggrtree .frozen_aggregation,
+.frozen_aggregation {
+  span,
+  a,
+  b.bullet {
+    color: $font-color-white;
+  }
+
+  &.only_in_frozen_aggregation {
+    background: $bi-new-element-dim;
+
+    a,
+    img,
+    span {
+      opacity: 0.8;
+
+      &.frozen_marker {
+        opacity: 1;
+      }
+    }
+  }
+
+  &.missing_in_frozen_aggregation {
+    background: $bi-missing-element-dim;
+  }
+
+  & .frozen_marker {
+    margin-left: -24px;
+    padding: 8px;
+    display: inline-block;
+    width: 8px;
+    font-weight: bolder;
+    text-align: center;
+    vertical-align: top;
+
+    &.missing {
+      background: $bi-missing-element-bright;
+    }
+
+    &.new {
+      background: $bi-new-element-bright;
+    }
+  }
+}
+
+b.bullet {
+  margin: 0 5px;
+  color: $font-color-dimmed;
+}
+
+.state.assumed {
+  background-image: url("images/assume_bg.png");
+  background-repeat: repeat;
+}
+
+table.aggrtree {
+  width: 100%;
+  border-collapse: collapse;
+
+  td.leaf.odd {
+    background-color: $odd-tr-bg-color;
+  }
+
+  td.leaf.even {
+    background-color: $even-tr-bg-color;
+  }
+
+  td.node {
+    background-color: $base-color;
+  }
+}
+
+td.aggrtree {
+  vertical-align: top !important;
+}
+
+.bibox_box {
+  padding: 3px 3px 1px;
+  margin-right: 3px;
+  cursor: pointer;
+  border: 1px solid $bi-box-border-color;
+  border-radius: 2px;
+
+  &.noleaf {
+    &:hover {
+      border-style: dashed;
+    }
+
+    &.open {
+      box-shadow: inset 0.5px 0.5px 3px $grey-3;
+    }
+
+    &.closed {
+      box-shadow: 0.5px 0.5px 3px $black;
+    }
+  }
+}
+
+table.aggrtree.ltr td {
+  padding: 3px;
+}
+
+table.data.table .bi_tree_container .title {
+  padding: 0;
+  font-weight: $font-weight-default;
+  color: $font-color;
+
+  li {
+    padding: 4px 8px;
+    list-style-type: none;
+  }
+
+  ul.subtree {
+    padding: 0 0 0 18px;
+    margin: 8px 0 0 18px;
+    list-style-type: none;
+    border: none;
+    border-left: 1px solid $darkgrey;
+    border-radius: 0;
+
+    li {
+      margin-top: 8px;
+      list-style-type: none;
+    }
+  }
+}
+
+div.node_preview {
+  max-height: 300px;
+  overflow: scroll;
+  padding-right: 2 * $spacing;
+  margin-bottom: 2 * $spacing;
+
+  table {
+    padding: 6px;
+
+    th {
+      padding: 6px;
+    }
+  }
+}

@@ -8,7 +8,7 @@
 
 register_rule(
     "activechecks",
-    "active_checks:flapping",
+    RuleGroup.ActiveChecks("flapping"),
     Tuple(
         title=_("Check Flapping Services"),
         help=_(
@@ -18,7 +18,7 @@ register_rule(
         elements=[
             TextInput(
                 title=_("Name"),
-                help=_("Will be used in the service description"),
+                help=_("Will be used in the service name"),
                 allow_empty=False,
             ),
             ListOfStrings(

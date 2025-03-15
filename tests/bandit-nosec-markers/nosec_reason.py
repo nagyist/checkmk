@@ -11,11 +11,10 @@ It also helps throwing the dice for new Bandit nosec IDs to use in said doc.
 Call with --help for usage.
 """
 
-# pylint: disable=redefined-outer-name  # for argparse set_defaults(run=...)
-
 from __future__ import annotations
 
 import argparse
+import logging
 import random
 import re
 import subprocess
@@ -87,6 +86,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser_check.set_defaults(run=cmd_check)
 
+    # -- local-check --
+
+    parser_local_check = subparsers.add_parser(
+        "local-check",
+        help="Output results as Checkmk local check output",
+    )
+    parser_local_check.add_argument(
+        "src_root", help="Path to the Check_MK repository root directory", type=Path
+    )
+    parser_local_check.set_defaults(run=cmd_local_check)
+
     # -- find --
 
     parser_find = subparsers.add_parser(
@@ -140,7 +150,7 @@ class BnsId:
 
     @staticmethod
     def _random_id() -> BnsId:
-        return BnsId(f'BNS:{hex(random.randint(0, int("F" * ID_LEN, 16)))[2:].rjust(6, "0")}')
+        return BnsId(f"BNS:{hex(random.randint(0, int('F' * ID_LEN, 16)))[2:].rjust(6, '0')}")
 
 
 def existing_ids(exclusions_doc: Path) -> Sequence[BnsId]:
@@ -191,15 +201,17 @@ def find_nosecs(src_root: Path, excluded: Sequence[Path]) -> Sequence[Nosec]:
     if not (src_root / "scripts").is_dir():
         # we need the find-python-files script and this is an easy sanity check
         sys.exit(
-            f"Failed to find folder 'scripts' in '{src_root}'. " "Is this really the check_mk repo?"
+            f"Failed to find folder 'scripts' in '{src_root}'. Is this really the check_mk repo?"
         )
 
     def _format_output(output: bytes) -> Sequence[str]:
         return output.strip().decode("utf-8").split("\n")
 
     run_find_files = "./scripts/find-python-files"
-    files = _format_output(subprocess.check_output(run_find_files, cwd=src_root))
-    print(
+    files = _format_output(
+        subprocess.run(run_find_files, cwd=src_root, check=False, capture_output=True).stdout
+    )
+    logging.info(
         f"Checking {len(files)} python files in '{src_root}'"
         + (f" excluding '{', '.join(map(str, excluded))}'." if excluded else "")
     )
@@ -255,6 +267,8 @@ def cmd_new(args: argparse.Namespace) -> None:
 def cmd_check(args: argparse.Namespace) -> None:
     fail = False
 
+    logging.getLogger().setLevel(logging.INFO)
+
     excluded_paths = (
         []  # exclude nothing (as opposed to src_root/"")
         if args.exclude == ""
@@ -291,6 +305,34 @@ def cmd_check(args: argparse.Namespace) -> None:
 
     if fail:
         sys.exit(1)
+
+
+def cmd_local_check(args: argparse.Namespace) -> None:
+    markers = find_nosecs(args.src_root, [])
+    annotated, not_annotated = _partition(lambda marker: marker.bns_id is not None, markers)
+    bns_ids = existing_ids(args.doc)
+    invalid = [m for m in annotated if m.bns_id not in bns_ids]
+
+    sum_not_annotated = len(not_annotated)
+    sum_annotated = len(annotated)
+    sum_invalid = len(invalid)
+    sum_valid = sum_annotated - sum_invalid
+    print(
+        " ".join(
+            (
+                "P",
+                '"[SecDev] Bandit markers"',
+                "|".join(
+                    (
+                        f"not_annotated={sum_not_annotated};1;5",
+                        f"invalid={sum_invalid};1;5",
+                        f"valid={sum_valid}",
+                    )
+                ),
+                f"Found {sum_annotated} annotations of which {sum_invalid} were invalid and {sum_not_annotated} unnotated nosecs",
+            )
+        )
+    )
 
 
 def cmd_find(args: argparse.Namespace) -> None:

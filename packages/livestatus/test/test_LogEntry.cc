@@ -3,12 +3,6 @@
 // terms and conditions defined in the file COPYING, which is part of this
 // source code package.
 
-// TODO(sp): IWYU claims to need this for "tuple_element<>::type", but the
-// headers <tuple>, <array>, <utility>, and <ranges> are *all* official ways to
-// get this. So we should have a symbol mapping for this in our IWYU mapping
-// files, but I simply can't figure out how to make that work with the template
-// symbol. IWYU bug?
-// IWYU pragma: no_include <utility>
 #include <chrono>
 #include <ctime>
 #include <stdexcept>
@@ -24,9 +18,10 @@
 using namespace std::string_literals;
 
 namespace {
-template <class T>
+template <typename T>
 using table = std::vector<std::tuple<std::string, T>>;
 
+// NOLINTBEGIN(cert-err58-cpp)
 const table<HostState> host_states{{"UP", HostState::up},
                                    {"DOWN", HostState::down},
                                    {"UNREACHABLE", HostState::unreachable}};
@@ -57,6 +52,7 @@ const strings acknowledge_state_types{"STARTED", "EXPIRED", "CANCELLED", "END"};
 const strings reasons{"CUSTOM",      "ACKNOWLEDGEMENT",   "DOWNTIMESTART",
                       "DOWNTIMEEND", "DOWNTIMECANCELLED", "FLAPPINGSTART",
                       "FLAPPINGSTOP"};
+// NOLINTEND(cert-err58-cpp)
 
 std::string parens(const std::string &f, const std::string &arg) {
     return f + " (" + arg + ")";
@@ -67,7 +63,7 @@ std::chrono::system_clock::time_point tp(time_t t) {
 }
 
 // host_or_svc_state | reason (host_or_svc_state) | ALERTHANDLER (exit_code)
-template <class T>
+template <typename T>
 info_table notification_state_types(const table<T> &states) {
     info_table result;
     for (const auto &[state_name, state] : states) {
@@ -81,14 +77,22 @@ info_table notification_state_types(const table<T> &states) {
         }
     }
     for (const auto &[code_name, code, info] : exit_codes) {
-        result.push_back({parens("ALERTHANDLER", code_name),  //
-                          code,                               //
-                          parens("EXIT_CODE", info)});
+        result.emplace_back(parens("ALERTHANDLER", code_name),  //
+                            code,                               //
+                            parens("EXIT_CODE", info));
     }
     return result;
 }
 }  // namespace
 
+TEST(LogEntry, Encode) {
+    EXPECT_EQ("", LogEntry::encode(""));
+    EXPECT_EQ("foo bar", LogEntry::encode("foo bar"));
+    EXPECT_EQ("\nfoo\nbar\n", LogEntry::encode("\nfoo\nbar\n"));
+    EXPECT_EQ("\nfoo\nbar\n", LogEntry::encode("\\nfoo\\nbar\\n"));
+}
+
+// NOLINTBEGIN(readability-function-cognitive-complexity)
 TEST(LogEntry, InitialHostState) {
     // The host state string is directly taken from a log line field.
     for (const auto &[state_name, state] : host_states) {
@@ -1273,3 +1277,4 @@ TEST(LogEntry, ServiceNotificationProgressSwapped) {
         EXPECT_EQ(parens("EXIT_CODE", info), e.state_info());
     }
 }
+// NOLINTEND(readability-function-cognitive-complexity)

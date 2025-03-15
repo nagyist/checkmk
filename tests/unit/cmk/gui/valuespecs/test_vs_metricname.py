@@ -4,7 +4,7 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 
-from cmk.gui.plugins.metrics.utils import MetricName
+from cmk.gui.graphing._valuespecs import MetricName
 
 from .utils import expect_validate_failure, expect_validate_success
 
@@ -18,5 +18,17 @@ class TestValueSpecMetricName:
                 "Metric names must only consist of letters, digits "
                 "and underscores and they must start with a letter."
             ),
+        )
+        expect_validate_failure(
+            MetricName(),
+            "",
+            match=(
+                "Metric names must only consist of letters, digits "
+                "and underscores and they must start with a letter."
+            ),
+        )
+        expect_validate_failure(
+            MetricName(),
+            None,
         )
         expect_validate_success(MetricName(), "asd")

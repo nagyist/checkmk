@@ -16,17 +16,24 @@ import subprocess
 import sys
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
-from typing import Final, TextIO
+from typing import Final
 
-import cmk.utils.debug
+import cmk.ccc.debug
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.ccc.i18n import _
+
 import cmk.utils.paths
-import cmk.utils.tty as tty
-from cmk.utils.check_utils import maincheckify
-from cmk.utils.exceptions import MKGeneralException
-from cmk.utils.i18n import _
+from cmk.utils import tty
+
+# remove with 2.4 / after 2.3 is released
+_LEGACY_MAN_PAGE_PATHS = (
+    str(cmk.utils.paths.local_legacy_check_manpages_dir),
+    cmk.utils.paths.legacy_check_manpages_dir,
+)
 
 
 @dataclass
@@ -65,305 +72,296 @@ ManPageCatalogPath = tuple[str, ...]
 ManPageCatalog = Mapping[ManPageCatalogPath, Sequence[ManPage]]
 
 CATALOG_TITLES: Final = {
-    "hw": "Appliances, other dedicated Hardware",
-    "environment": "Environmental sensors",
     "acme": "ACME",
-    "akcp": "AKCP",
-    "allnet": "ALLNET",
-    "avtech": "AVTECH",
-    "bachmann": "Bachmann",
-    "betternet": "better networks",
-    "bosch": "Bosch",
-    "carel": "CAREL",
-    "climaveneta": "Climaveneta",
-    "didactum": "Didactum",
-    "eaton": "Eaton",
-    "emerson": "EMERSON",
-    "emka": "EMKA Electronic Locking & Monitoring",
-    "eltek": "ELTEK",
-    "epson": "Epson",
-    "hwg": "HW group",
-    "ispro": "Interseptor Pro",
-    "infratec_plus": "Infratec Plus",
-    "kentix": "Kentix",
-    "knuerr": "Knuerr",
-    "maykg": "May KG Elektro-Bauelemente",
-    "nti": "Network Technologies Inc.",
-    "orion": "ORION",
-    "raritan": "Raritan",
-    "rittal": "Rittal",
-    "sensatronics": "Sensatronics",
-    "socomec": "Socomec",
-    "stulz": "STULZ",
-    "teracom": "Teracom",
-    "tinkerforge": "Tinkerforge",
-    "vutlan": "Vutlan EMS",
-    "wagner": "WAGNER Group",
-    "wut": "Wiesemann & Theis",
-    "time": "Clock Devices",
-    "hopf": "Hopf",
-    "meinberg": "Meinberg",
-    "network": "Networking (Switches, Routers, etc.)",
-    "aerohive": "Aerohive Networking",
+    "activemq": "Apache ActiveMQ",
+    "ad": "Active Directory",
     "adva": "ADVA Optical Networking",
+    "aerohive": "Aerohive Networking",
+    "agentless": "Networking checks without agent",
+    "aix": "AIX",
+    "akcp": "AKCP",
     "alcatel": "Alcatel",
+    "alertmanager": "Alertmanager",
+    "allnet": "ALLNET",
+    "apache": "Apache Webserver",
+    "apc": "APC",
+    "app": "Applications",
     "arbor": "Arbor",
     "arista": "Arista Networks",
     "arris": "ARRIS",
+    "artec": "ARTEC",
     "aruba": "Aruba Networks",
+    "atto": "ATTO",
     "avaya": "Avaya",
     "avm": "AVM",
+    "avtech": "AVTECH",
+    "aws": "Amazon Web Services",
+    "aws_status": "Amazon Web Service (AWS) Status",
+    "azure": "Microsoft Azure",
+    "azure_status": "Microsoft Azure Status",
+    "bachmann": "Bachmann",
+    "barracuda": "Barracuda",
+    "bazel_cache": "Bazel Remote Cache",
+    "bdt": "BDT",
+    "betternet": "better networks",
     "bintec": "Bintec",
     "bluecat": "BlueCat Networks",
     "bluecoat": "Blue Coat Systems",
+    "bosch": "Bosch",
+    "brocade": "Brocade",
+    "cadvisor": "cAdvisor",
+    "carel": "CAREL",
     "casa": "Casa",
     "cbl": "Communication by light (CBL)",
-    "checkpoint": "Checkpoint",
-    "cisco": "Cisco Systems (also IronPort)",
+    "checkmk": "Checkmk Monitoring System",
+    "checkpoint": "Check Point",
     "ciena": "Ciena Corporation",
+    "cisco": "Cisco Systems (also IronPort)",
+    "citrix": "Citrix",
+    "climaveneta": "Climaveneta",
+    "cloud": "Cloud Based Environments",
+    "cmk": "Checkmk",
+    "containerization": "Containerization",
+    "couchbase": "Couchbase",
+    "cps": "Cyber Power System Inc.",
+    "datadog": "Datadog",
+    "db2": "IBM DB2",
+    "ddn_s2a": "DDN S2A",
     "decru": "Decru",
     "dell": "DELL",
+    "didactum": "Didactum",
+    "docker": "Docker",
     "docsis": "DOCSIS",
+    "dotnet": "dotNET",
+    "eaton": "Eaton",
+    "elasticsearch": "Elasticsearch",
+    "eltek": "ELTEK",
+    "emc": "EMC",
+    "emerson": "EMERSON",
+    "emka": "EMKA Electronic Locking & Monitoring",
     "enterasys": "Enterasys Networks",
+    "entersekt": "Entersekt",
+    "environment": "Environmental sensors",
+    "epson": "Epson",
     "ewon": "Ewon",
+    "exchange": "Microsoft Exchange",
     "f5": "F5 Networks",
+    "fastlta": "FAST LTA",
+    "files": "Files and Logfiles",
     "fireeye": "FireEye",
     "fortinet": "Fortinet",
+    "freebsd": "FreeBSD",
+    "fujitsu": "Fujitsu",
+    "gcp": "Google Cloud Platform",
+    "gcp_status": "Google Cloud Platform (GCP) Status",
     "geist": "GEIST",
+    "generic": "Generic check plug-ins",
     "genua": "genua",
+    "gerrit": "Gerrit",
+    "graylog": "Graylog",
+    "gude": "Gude",
     "h3c": "H3C Technologies (also 3Com)",
-    "hp": "Hewlett-Packard (HP)",
+    "haproxy": "HAProxy Loadbalancer",
+    "hardware": "Hardware Sensors",
+    "hitachi": "Hitachi",
+    "hopf": "Hopf",
     "hpe": "Hewlett Packard Enterprise",
+    "hp": "Hewlett-Packard (HP)",
+    "hpux": "HP-UX",
     "huawei": "Huawei",
+    "hw": "Appliances, other dedicated Hardware",
+    "hwg": "HW group",
     "hwgroup": "HW Group",
     "ibm": "IBM",
+    "ibm_mq": "IBM MQ",
     "icom": "ICOM",
+    "iis": "Microsoft Internet Information Service",
     "infoblox": "Infoblox",
-    "intel": "Intel",
+    "informix": "IBM Informix",
+    "infratec_plus": "Infratec Plus",
     "innovaphone": "Innovaphone",
+    "intel": "Intel",
+    "ispro": "Interseptor Pro",
+    "ivantineurons": "Ivanti Neurons for MDM (formerly MobileIron Cloud)",
+    "janitza": "Janitza electronics",
+    "java": "Java (Tomcat, Weblogic, JBoss, etc.)",
+    "jenkins": "Jenkins",
+    "jira": "Jira",
     "juniper": "Juniper Networks",
+    "kaspersky": "Kaspersky Lab",
     "kemp": "KEMP",
+    "kentix": "Kentix",
+    "kernel": "CPU, Memory and Kernel Performance",
+    "knuerr": "Knuerr",
+    "kubernetes": "Kubernetes",
     "lancom": "LANCOM Systems GmbH",
+    "libelle": "Libelle Business Shadow",
+    "linux": "Linux",
+    "lotusnotes": "IBM Lotus Domino",
+    "lxc": "Linux Container",
+    "macosx": "Mac OS X",
+    "mail": "Mail appliances",
+    "mailman": "Mailman",
+    "maykg": "May KG Elektro-Bauelemente",
+    "mcafee": "McAfee",
+    "mcdata": "McDATA",
+    "meinberg": "Meinberg",
     "mikrotik": "MikroTik",
+    "misc": "Miscellaneous",
+    "mongodb": "MongoDB",
     "moxa": "MOXA",
+    "mqtt": "MQTT",
+    "msoffice": "MS Office",
+    "mssql": "Microsoft SQL Server",
+    "mysql": "MySQL",
+    "netapp": "NetApp",
+    "netbsd": "NetBSD",
     "netextreme": "Extreme Network",
     "netgear": "Netgear",
+    "netscaler": "Citrix Netscaler",
+    "networking": "Networking",
+    "network": "Networking (Switches, Routers, etc.)",
+    "nginx": "NGINX",
+    "nimble": "Nimble Storage",
+    "nti": "Network Technologies Inc.",
+    "nullmailer": "Nullmailer",
+    "nutanix": "Nutanix",
+    "openbsd": "OpenBSD",
+    "opentextfuse": "OpenText Fuse Management Central",
+    "openvms": "OpenVMS",
+    "oraclehw": "Oracle",
+    "oracle": "ORACLE Database",
+    "orion": "ORION",
+    "os": "Operating Systems",
+    "otel": "OpenTelemetry (Experimental)",
     "palo_alto": "Palo Alto Networks",
     "pandacom": "Pan Dacom",
     "papouch": "PAPOUCH",
     "perle": "PERLE",
-    "qnap": "QNAP Systems",
-    "riverbed": "Riverbed Technology",
-    "safenet": "SafeNet",
-    "salesforce": "Salesforce",
-    "symantec": "Symantec",
-    "seh": "SEH",
-    "servertech": "Server Technology",
-    "siemens": "Siemens",
-    "sophos": "Sophos",
-    "supermicro": "Super Micro Computer",
-    "stormshield": "Stormshield",
-    "tplink": "TP-LINK",
-    "viprinet": "Viprinet",
-    "power": "Power supplies and PDUs",
-    "apc": "APC",
-    "cps": "Cyber Power System Inc.",
-    "gude": "Gude",
-    "janitza": "Janitza electronics",
-    "printer": "Printers",
-    "mail": "Mail appliances",
-    "artec": "ARTEC",
-    "server": "Server hardware, blade enclosures",
-    "storagehw": "Storage (filers, SAN, tape libs)",
-    "atto": "ATTO",
-    "brocade": "Brocade",
-    "bdt": "BDT",
-    "ddn_s2a": "DDN S2A",
-    "emc": "EMC",
-    "fastlta": "FAST LTA",
-    "fujitsu": "Fujitsu",
-    "mcdata": "McDATA",
-    "netapp": "NetApp",
-    "nimble": "Nimble Storage",
-    "hitachi": "Hitachi",
-    "oraclehw": "Oracle",
-    "qlogic": "QLogic",
-    "quantum": "Quantum",
-    "synology": "Synology Inc.",
-    "phone": "Telephony",
-    "app": "Applications",
-    "ad": "Active Directory",
-    "alertmanager": "Alertmanager",
-    "apache": "Apache Webserver",
-    "activemq": "Apache ActiveMQ",
-    "barracuda": "Barracuda",
-    "checkmk": "Checkmk Monitoring System",
-    "citrix": "Citrix",
-    "couchbase": "Couchbase",
-    "db2": "IBM DB2",
-    "dotnet": "dotNET",
-    "elasticsearch": "Elasticsearch",
-    "entersekt": "Entersekt",
-    "exchange": "Microsoft Exchange",
-    "graylog": "Graylog",
-    "haproxy": "HAProxy Loadbalancer",
-    "iis": "Microsoft Internet Information Service",
-    "informix": "IBM Informix",
-    "java": "Java (Tomcat, Weblogic, JBoss, etc.)",
-    "jenkins": "Jenkins",
-    "jira": "Jira",
-    "kaspersky": "Kaspersky Lab",
-    "libelle": "Libelle Business Shadow",
-    "lotusnotes": "IBM Lotus Domino",
-    "mongodb": "MongoDB",
-    "mailman": "Mailman",
-    "mcafee": "McAfee",
-    "mssql": "Microsoft SQL Server",
-    "mysql": "MySQL",
-    "msoffice": "MS Office",
-    "netscaler": "Citrix Netscaler",
-    "nginx": "NGINX",
-    "nullmailer": "Nullmailer",
-    "nutanix": "Nutanix",
-    "cmk": "Checkmk",
-    "opentextfuse": "OpenText Fuse Management Central",
-    "oracle": "ORACLE Database",
-    "plesk": "Plesk",
     "pfsense": "pfsense",
+    "phone": "Telephony",
+    "plesk": "Plesk",
     "postfix": "Postfix",
     "postgresql": "PostgreSQL",
+    "power": "Power supplies and PDUs",
     "primekey": "Primekey",
+    "printer": "Printers",
     "prometheus": "Prometheus",
     "proxmox": "Proxmox",
+    "ps": "Processes, Services and Jobs",
+    "pulse_secure": "Pulse Secure",
+    "pure_storage": "Pure Storage",
+    "qlogic": "QLogic",
     "qmail": "qmail",
+    "qnap": "QNAP Systems",
+    "quanta": "Quanta Cloud Technology",
+    "quantum": "Quantum",
     "rabbitmq": "RabbitMQ",
+    "raritan": "Raritan",
+    "redfish": "Redfish",
     "redis": "Redis",
+    "rittal": "Rittal",
+    "riverbed": "Riverbed Technology",
     "robotframework": "Robot Framework",
     "ruckus": "Ruckus Spot",
-    "sap": "SAP R/3",
-    "sap_hana": "SAP HANA",
+    "safenet": "SafeNet",
+    "salesforce": "Salesforce",
     "sansymphony": "Datacore SANsymphony",
+    "sap_hana": "SAP HANA",
+    "sap": "SAP R/3",
+    "seh": "SEH",
+    "sensatronics": "Sensatronics",
+    "server": "Server hardware, blade enclosures",
+    "servertech": "Server Technology",
+    "services": "Specific Daemons and Operating System Services",
+    "siemens": "Siemens",
     "silverpeak": "Silver Peak",
     "skype": "Skype",
+    "smb_share": "SMB Share",
+    "snmp": "SNMP",
+    "socomec": "Socomec",
+    "solaris": "Solaris",
+    "sophos": "Sophos",
     "splunk": "Splunk",
     "sshd": "SSH Daemon",
+    "storage": "Filesystems, Disks and RAID",
+    "storagehw": "Storage (filers, SAN, tape libs)",
+    "stormshield": "Stormshield",
+    "stulz": "STULZ",
+    "supermicro": "Super Micro Computer",
+    "symantec": "Symantec",
+    "synology": "Synology Inc.",
+    "synthetic_monitoring": "Synthetic Monitoring",
+    "teracom": "Teracom",
+    "time": "Clock Devices",
+    "tinkerforge": "Tinkerforge",
+    "tplink": "TP-LINK",
     "tsm": "IBM Tivoli Storage Manager (TSM)",
     "unitrends": "Unitrends",
-    "vnx": "VNX NAS",
-    "websphere_mq": "WebSphere MQ",
-    "zerto": "Zerto",
-    "ibm_mq": "IBM MQ",
-    "pulse_secure": "Pulse Secure",
-    "os": "Operating Systems",
-    "aix": "AIX",
-    "freebsd": "FreeBSD",
-    "hpux": "HP-UX",
-    "linux": "Linux",
-    "macosx": "Mac OS X",
-    "netbsd": "NetBSD",
-    "openbsd": "OpenBSD",
-    "openvms": "OpenVMS",
-    "snmp": "SNMP",
-    "solaris": "Solaris",
-    "vsphere": "VMware ESX (via vSphere)",
-    "windows": "Microsoft Windows",
-    "z_os": "IBM zOS Mainframes",
-    "hardware": "Hardware Sensors",
-    "kernel": "CPU, Memory and Kernel Performance",
-    "ps": "Processes, Services and Jobs",
-    "files": "Files and Logfiles",
-    "services": "Specific Daemons and Operating System Services",
-    "networking": "Networking",
-    "misc": "Miscellaneous",
-    "storage": "Filesystems, Disks and RAID",
-    "cloud": "Cloud Based Environments",
-    "azure": "Microsoft Azure",
-    "aws": "Amazon Web Services",
-    "quanta": "Quanta Cloud Technology",
-    "datadog": "Datadog",
-    "containerization": "Containerization",
-    "cadvisor": "cAdvisor",
-    "docker": "Docker",
-    "kubernetes": "Kubernetes",
-    "lxc": "Linux Container",
-    "agentless": "Networking checks without agent",
-    "generic": "Generic check plugins",
     "unsorted": "Uncategorized",
-    "zertificon": "Zertificon",
-    "mqtt": "MQTT",
-    "smb_share": "SMB Share",
-    "gcp": "Google Cloud Platform",
-    "mobileiron": "Mobileiron",
-    "azure_status": "Microsoft Azure Status",
-    "aws_status": "Amazon Web Service (AWS) Status",
-    "gcp_status": "Google Cloud Platform (GCP) Status",
+    "viprinet": "Viprinet",
     "virtual": "Virtualization",
+    "vnx": "VNX NAS",
+    "vsphere": "VMware ESX (via vSphere)",
+    "vutlan": "Vutlan EMS",
+    "wagner": "WAGNER Group",
+    "windows": "Microsoft Windows",
+    "wut": "Wiesemann & Theis",
+    "zertificon": "Zertificon",
+    "zerto": "Zerto",
+    "z_os": "IBM zOS Mainframes",
 }
 
 # TODO: Do we need a more generic place for this?
 CHECK_MK_AGENTS: Final = {
-    "vms": "VMS",
-    "linux": "Linux",
     "aix": "AIX",
-    "solaris": "Solaris",
-    "windows": "Windows",
-    "snmp": "SNMP",
-    "openvms": "OpenVMS",
-    "vsphere": "vSphere",
-    "nutanix": "Nutanix",
     "emcvnx": "EMC VNX",
+    "linux": "Linux",
+    "mobileiron": "Ivanti Neurons for MDM (formerly MobileIron Cloud)",
+    "nutanix": "Nutanix",
+    "openvms": "OpenVMS",
+    "redfish": "Redfish",
+    "snmp": "SNMP",
+    "solaris": "Solaris",
+    "vms": "VMS",
     "vnx_quotas": "VNX Quotas",
-    "mobileiron": "Mobileiron",
+    "vsphere": "vSphere",
+    "windows": "Windows",
 }
-
-
-def _get_man_page_dirs() -> Sequence[Path]:
-    # first match wins
-    return [
-        cmk.utils.paths.local_check_manpages_dir,
-        Path(cmk.utils.paths.check_manpages_dir),
-    ]
 
 
 def _is_valid_basename(name: str) -> bool:
     return not name.startswith(".") and not name.endswith("~")
 
 
-def man_page_path(name: str, man_page_dirs: Iterable[Path] | None = None) -> Path | None:
-    if not _is_valid_basename(name):
-        return None
-
-    if man_page_dirs is None:
-        man_page_dirs = _get_man_page_dirs()
-
-    for basedir in man_page_dirs:
-        # check plugins pre 1.7 could have dots in them. be nice and find those.
-        p = basedir / (name if name.startswith("check-mk") else maincheckify(name))
-        if p.exists():
-            return p
-    return None
-
-
-def all_man_pages(man_page_dirs: Iterable[Path] | None = None) -> Mapping[str, str]:
-    if man_page_dirs is None:
-        man_page_dirs = _get_man_page_dirs()
-
-    manuals = {}
-    for basedir in man_page_dirs:
-        if basedir.exists():
-            for file_path in basedir.iterdir():
-                if file_path.name not in manuals and _is_valid_basename(file_path.name):
-                    manuals[file_path.name] = str(file_path)
-    return manuals
+def make_man_page_path_map(
+    plugin_families: Mapping[str, Sequence[str]],
+    group_subdir: str,
+) -> Mapping[str, Path]:
+    families_man_paths = [
+        *(
+            os.path.join(p, group_subdir)
+            for _family, paths in plugin_families.items()
+            for p in paths
+        ),
+        *_LEGACY_MAN_PAGE_PATHS,
+    ]
+    return {
+        name: Path(dir, name)
+        for source in reversed(families_man_paths)
+        for dir, _subdirs, files in os.walk(source)
+        for name in files
+        if _is_valid_basename(name)
+    }
 
 
-def print_man_page_table() -> None:
+def print_man_page_table(man_page_path_map: Mapping[str, Path]) -> None:
     table = []
-    for name, path in sorted(all_man_pages().items()):
+    for name, path in sorted(man_page_path_map.items()):
         try:
-            table.append([name, get_title_from_man_page(Path(path))])
+            table.append([name, get_title_from_man_page(path)])
         except MKGeneralException as e:
-            sys.stderr.write(str("ERROR: %s" % e))
+            sys.stderr.write(str(f"ERROR: {e}"))
 
     tty.print_table(["Check type", "Title"], [tty.bold, tty.normal], table)
 
@@ -376,24 +374,38 @@ def get_title_from_man_page(path: Path) -> str:
     raise MKGeneralException(_("Invalid man page: Failed to get the title"))
 
 
-def load_man_page_catalog() -> ManPageCatalog:
+def load_man_page_catalog(
+    plugin_families: Mapping[str, Sequence[str]], group_subdir: str
+) -> ManPageCatalog:
+    man_page_path_map = make_man_page_path_map(plugin_families, group_subdir)
     catalog: dict[ManPageCatalogPath, list[ManPage]] = defaultdict(list)
-    for name, path in all_man_pages().items():
-        parsed = _parse_man_page(name, Path(path))
-
-        if parsed.catalog[0] == "os":
-            for agent in parsed.agents:
-                catalog[("os", agent, *parsed.catalog[1:])].append(parsed)
-        else:
-            catalog[tuple(parsed.catalog)].append(parsed)
+    for name, path in man_page_path_map.items():
+        parsed = parse_man_page(name, path)
+        for entry in _make_catalog_entries(parsed.catalog, parsed.agents):
+            catalog[entry].append(parsed)
 
     return catalog
 
 
-def print_man_page_browser(cat: ManPageCatalogPath = ()) -> None:
-    catalog = load_man_page_catalog()
+def _make_catalog_entries(
+    pages_catalog: Sequence[str], agents: Sequence[str]
+) -> Sequence[tuple[str, ...]]:
+    if pages_catalog[0] == "os":
+        return [("os", agent, *pages_catalog[1:]) for agent in agents]
 
-    entries = catalog.get(cat, [])
+    # See SUP-20129, e.g. custom mkps can have definitions in wrong format
+    # use 'generic' in this case
+    if len(pages_catalog) == 1 and "generic" not in pages_catalog:
+        return [tuple(["generic"])]
+
+    return [tuple(pages_catalog)]
+
+
+def print_man_page_browser(
+    catalog: ManPageCatalog,
+    cat: ManPageCatalogPath = (),
+) -> None:
+    entries = {man_page.name: man_page for man_page in catalog.get(cat, [])}
     subtree_names = _manpage_catalog_subtree_names(catalog, cat)
 
     if entries and subtree_names:
@@ -411,31 +423,28 @@ def print_man_page_browser(cat: ManPageCatalogPath = ()) -> None:
 def _manpage_catalog_subtree_names(
     catalog: ManPageCatalog, category: ManPageCatalogPath
 ) -> list[str]:
-    subtrees = set()
-    for this_category in catalog.keys():
-        if this_category[: len(category)] == category and len(this_category) > len(category):
-            subtrees.add(this_category[len(category)])
-
+    subtrees = {
+        this_category[len(category)]
+        for this_category in catalog.keys()
+        if this_category[: len(category)] == category and len(this_category) > len(category)
+    }
     return list(subtrees)
 
 
 def _manpage_num_entries(catalog: ManPageCatalog, cat: ManPageCatalogPath) -> int:
-    num = 0
-    for c, e in catalog.items():
-        if c[: len(cat)] == cat:
-            num += len(e)
-    return num
+    return sum(len(e) for c, e in catalog.items() if c[: len(cat)] == cat)
 
 
 def _manpage_browser_folder(
-    catalog: ManPageCatalog, cat: ManPageCatalogPath, subtrees: Iterable[str]
+    catalog: ManPageCatalog,
+    cat: ManPageCatalogPath,
+    subtrees: Iterable[str],
 ) -> None:
     titles = []
     for e in subtrees:
         title = CATALOG_TITLES.get(e, e)
-        count = _manpage_num_entries(catalog, cat + (e,))
-        if count:
-            title += " (%d)" % count
+        if count := _manpage_num_entries(catalog, cat + (e,)):
+            title += f" ({count})"
         titles.append((title, e))
     titles.sort()
 
@@ -453,18 +462,15 @@ def _manpage_browser_folder(
         if x[0]:
             index = int(x[1])
             subcat = titles[index - 1][1]
-            print_man_page_browser(cat + (subcat,))
+            print_man_page_browser(catalog, cat + (subcat,))
         else:
             break
 
 
-def _manpage_browse_entries(cat: Iterable[str], entries: Iterable[ManPage]) -> None:
-    checks: list[tuple[str, str]] = []
-    for e in entries:
-        checks.append((e.title, e.name))
-    checks.sort()
+def _manpage_browse_entries(cat: Iterable[str], entries: Mapping[str, ManPage]) -> None:
+    checks = sorted(entries.values(), key=lambda m: (m.title, m.name))
 
-    choices = [(str(n + 1), c[0]) for n, c in enumerate(checks)]
+    choices = [(str(num), mp.title) for num, mp in enumerate(checks, start=1)]
 
     while True:
         x = _dialog_menu(
@@ -477,8 +483,7 @@ def _manpage_browse_entries(cat: Iterable[str], entries: Iterable[ManPage]) -> N
         )
         if x[0]:
             index = int(x[1]) - 1
-            name = checks[index][1]
-            ConsoleManPageRenderer(name).paint()
+            write_output(ConsoleManPageRenderer(checks[index]).render_page())
         else:
             break
 
@@ -514,7 +519,7 @@ def _run_dialog(args: Sequence[str]) -> tuple[bool, bytes]:
     return completed_process.returncode == 0, completed_process.stderr
 
 
-def _parse_man_page(name: str, path: Path) -> ManPage:
+def parse_man_page(name: str, path: Path) -> ManPage:
     with path.open(encoding="utf-8") as fp:
         content = fp.read()
 
@@ -534,7 +539,7 @@ def _parse_man_page(name: str, path: Path) -> ManPage:
             cluster=parsed.get("cluster"),
         )
     except (KeyError, MKGeneralException) as msg:
-        if cmk.utils.debug.enabled():
+        if cmk.ccc.debug.enabled():
             raise
         return ManPage.fallback(
             name=name,
@@ -542,15 +547,6 @@ def _parse_man_page(name: str, path: Path) -> ManPage:
             content=content,
             msg=str(msg),
         )
-
-
-# TODO: accepting the path here would make things a bit easier.
-def load_man_page(name: str, man_page_dirs: Iterable[Path] | None = None) -> ManPage | None:
-    path = man_page_path(name, man_page_dirs)
-    if path is None:
-        return None
-
-    return _parse_man_page(name, path)
 
 
 def _parse_to_raw(path: Path, content: str) -> Mapping[str, str]:
@@ -563,32 +559,35 @@ def _parse_to_raw(path: Path, content: str) -> Mapping[str, str]:
             continue
 
         try:
-            key, restofline = line.split(":", 1)
+            key, rest = line.split(":", 1)
         except ValueError as exc:
             raise MKGeneralException(f"Syntax error in {path} line {no} ({exc}).\n")
 
         current = parsed[key]
-        current.append(restofline.strip())
+        current.append(rest.strip())
 
     return {k: "\n".join(v).strip() for k, v in parsed.items()}
 
 
-class ManPageRenderer:
-    def __init__(self, name: str) -> None:
-        self.name = name
-        man_page = load_man_page(name)
-        if not man_page:
-            raise MKGeneralException("No manpage for %s. Sorry.\n" % self.name)
+def write_output(rendered_page: str) -> None:
+    if sys.stdout.isatty():
+        with suppress(FileNotFoundError):
+            subprocess.run(
+                ["/usr/bin/less", "-S", "-R", "-Q", "-u", "-L"],
+                input=rendered_page,
+                encoding="utf8",
+                check=False,
+            )
+            return
+    sys.stdout.write(rendered_page)
 
+
+class ManPageRenderer:
+    def __init__(self, man_page: ManPage) -> None:
+        self.name = man_page.name
         self._page = man_page
 
-    def paint(self) -> None:
-        try:
-            self._paint_man_page()
-        except Exception as e:
-            sys.stdout.write(f"ERROR: Invalid check manpage {self.name}: {e}\n")
-
-    def _paint_man_page(self) -> None:
+    def render_page(self) -> str:
         self._print_header()
         self._print_manpage_title(self._page.title)
 
@@ -596,7 +595,7 @@ class ManPageRenderer:
 
         ags = [CHECK_MK_AGENTS.get(agent, agent.upper()) for agent in self._page.agents]
         self._print_info_line(
-            "Distribution:            ", self._format_distribution(self._page.distribution)
+            "Distribution:            ", _format_distribution(self._page.distribution)
         )
         self._print_info_line("License:                 ", self._page.license)
         self._print_info_line("Supported Agents:        ", ", ".join(ags))
@@ -614,16 +613,9 @@ class ManPageRenderer:
             self._print_textbody(self._page.discovery)
 
         self._print_empty_line()
-        self._flush()
+        return self._get_value()
 
-    def _format_distribution(self, distr: str) -> str:
-        if distr == "check_mk":
-            return "Official part of Checkmk"
-        if distr == "check_mk_cloud":
-            return "Official part of Checkmk Cloud Edition"
-        return distr
-
-    def _flush(self) -> None:
+    def _get_value(self) -> str:
         raise NotImplementedError()
 
     def _print_header(self) -> None:
@@ -638,7 +630,7 @@ class ManPageRenderer:
     def _print_subheader(self, line: str) -> None:
         raise NotImplementedError()
 
-    def _print_line(self, line: str, attr: str | None = None, no_markup: bool = False) -> None:
+    def _print_line(self, line: str, *, color: str | None = None, no_markup: bool = False) -> None:
         raise NotImplementedError()
 
     def _print_begin_splitlines(self) -> None:
@@ -654,18 +646,20 @@ class ManPageRenderer:
         raise NotImplementedError()
 
 
-def _console_stream() -> TextIO:
-    if os.path.exists("/usr/bin/less") and sys.stdout.isatty():
-        # NOTE: We actually want to use subprocess.Popen here, but the tty is in
-        # a horrible state after rendering the man page if we do that. Why???
-        return os.popen("/usr/bin/less -S -R -Q -u -L", "w")  # nosec B605 # BNS:f6c1b9
-    return sys.stdout
+def _format_distribution(distr: str) -> str:
+    match distr:
+        case "check_mk":
+            return "Official part of Checkmk"
+        case "check_mk_cloud":
+            return "Official part of Checkmk Cloud Edition"
+        case _:
+            return distr
 
 
 class ConsoleManPageRenderer(ManPageRenderer):
-    def __init__(self, name: str) -> None:
-        super().__init__(name)
-        self.__output = _console_stream()
+    def __init__(self, man_page: ManPage) -> None:
+        super().__init__(man_page)
+        self._buffer: list[str] = []
         # NOTE: We must use instance variables for the TTY stuff because TTY-related
         # stuff might have been changed since import time, consider e.g. pytest.
         self.__width = tty.get_size()[1]
@@ -677,12 +671,20 @@ class ConsoleManPageRenderer(ManPageRenderer):
         self._header_color_left = tty.colorset(0, 2)
         self._header_color_right = tty.colorset(7, 2, 1)
 
-    def _flush(self) -> None:
-        self.__output.flush()
+    def _get_value(self) -> str:
+        return "".join(self._buffer)
 
-    def _markup(self, line: str, attr: str) -> str:
-        # Replaces braces in the line but preserves the inner braces
-        return re.sub("(?<!{){", self._tty_color, re.sub("(?<!})}", tty.normal + attr, line))
+    def _patch_braces(self, line: str, *, color: str) -> str:
+        """Replace braces in the line with a colors
+        { -> self._tty_color
+        } -> cmk.utils.tty.normal + attr
+        All consequent braces except first one are ignored
+        Examples:
+        '{{{TEXT}}}' -> '<self._tty_color>{{TEXT<tty.normal><attr>}}'
+        '{{TEXT}}'   -> '<self._tty_color>{TEXT<tty.normal><attr>}'
+        '{TEXT}'     -> '<self._tty_color>TEXT<tty.normal><attr>'
+        """
+        return re.sub("(?<!{){", self._tty_color, re.sub("(?<!})}", tty.normal + color, line))
 
     def _print_header(self) -> None:
         pass
@@ -697,7 +699,7 @@ class ConsoleManPageRenderer(ManPageRenderer):
 
     def _print_subheader(self, line: str) -> None:
         self._print_empty_line()
-        self.__output.write(
+        self._buffer.append(
             self._subheader_color
             + " "
             + tty.underline
@@ -708,31 +710,31 @@ class ConsoleManPageRenderer(ManPageRenderer):
             + "\n"
         )
 
-    def _print_line(self, line: str, attr: str | None = None, no_markup: bool = False) -> None:
-        if attr is None:
-            attr = self._normal_color
+    def _print_line(self, line: str, *, color: str | None = None, no_markup: bool = False) -> None:
+        if color is None:
+            color = self._normal_color
 
         if no_markup:
             text = line
             l = len(line)
         else:
-            text = self._markup(line, attr)
+            text = self._patch_braces(line, color=color)
             l = self._print_len(line)
 
-        self.__output.write(attr + " ")
-        self.__output.write(text)
-        self.__output.write(" " * (self.__width - 2 - l))
-        self.__output.write(" " + tty.normal + "\n")
+        self._buffer.append(f"{color} ")
+        self._buffer.append(text)
+        self._buffer.append(" " * (self.__width - 2 - l))
+        self._buffer.append(f" {tty.normal}\n")
 
-    def _print_splitline(self, attr1: str, left: str, attr2: str, right: str) -> None:
-        self.__output.write(attr1 + " " + left)
-        self.__output.write(attr2)
-        self.__output.write(self._markup(right, attr2))
-        self.__output.write(" " * (self.__width - 1 - len(left) - self._print_len(right)))
-        self.__output.write(tty.normal + "\n")
+    def _print_splitline(self, attr1: str, left: str, color: str, right: str) -> None:
+        self._buffer.append(f"{attr1} {left}")
+        self._buffer.append(color)
+        self._buffer.append(self._patch_braces(right, color=color))
+        self._buffer.append(" " * (self.__width - 1 - len(left) - self._print_len(right)))
+        self._buffer.append(tty.normal + "\n")
 
     def _print_empty_line(self) -> None:
-        self._print_line("", tty.colorset(7, 4))
+        self._print_line("", color=tty.colorset(7, 4))
 
     def _print_len(self, word: str) -> int:
         # In case of double braces remove only one brace for counting the length
@@ -740,15 +742,14 @@ class ConsoleManPageRenderer(ManPageRenderer):
         netto = re.sub("\033[^m]+m", "", netto)
         return len(netto)
 
-    def _wrap_text(self, text: str, width: int, attr: str = tty.colorset(7, 4)) -> Sequence[str]:
-        wrapped = []
+    def _wrap_text(self, text: str, width: int, color: str = tty.colorset(7, 4)) -> Sequence[str]:
+        wrapped: list[str] = []
         line = ""
         col = 0
         for word in text.split():
             if word == "<br>":
                 if line != "":
-                    wrapped.append(self._fillup(line, width))
-                    wrapped.append(self._fillup("", width))
+                    wrapped.extend((self._fillup(line, width), self._fillup("", width)))
                     line = ""
                     col = 0
             else:
@@ -760,7 +761,7 @@ class ConsoleManPageRenderer(ManPageRenderer):
                 if line != "":
                     line += " "
                     col += 1
-                line += self._markup(word, attr)
+                line += self._patch_braces(word, color=color)
                 col += netto
         if line != "":
             wrapped.append(self._fillup(line, width))
@@ -773,7 +774,6 @@ class ConsoleManPageRenderer(ManPageRenderer):
     def _justify(self, line: str, width: int) -> str:
         need_spaces = float(width - self._print_len(line))
         spaces = float(line.count(" "))
-        newline = ""
         x = 0.0
         s = 0.0
         words = line.split()
@@ -795,61 +795,39 @@ class ConsoleManPageRenderer(ManPageRenderer):
 
     def _print_textbody(self, text: str) -> None:
         wrapped = self._wrap_text(text, self.__width - 2)
-        attr = tty.colorset(7, 4)
+        color = tty.colorset(7, 4)
         for line in wrapped:
-            self._print_line(line, attr)
+            self._print_line(line, color=color)
 
 
 class NowikiManPageRenderer(ManPageRenderer):
-    def __init__(self, name: str) -> None:
-        super().__init__(name)
+    def __init__(self, man_page: ManPage) -> None:
+        super().__init__(man_page)
         self.__output = StringIO()
 
-    def _flush(self) -> None:
-        pass
-
-    def index_entry(self) -> str:
-        return '<tr><td class="tt">{}</td><td>[check_{}|{}]</td></tr>\n'.format(
-            self.name,
-            self.name,
-            self._page.title,
-        )
-
-    def render(self) -> str:
-        self.paint()
+    def _get_value(self) -> str:
         return self.__output.getvalue()
-
-    def _markup(self, line: str, ignored: str | None = None) -> str:
-        # preserve the inner { and } in double braces and then replace the braces left
-        return (
-            line.replace("{{", "{&#123;")
-            .replace("}}", "&#125;}")
-            .replace("{", "<tt>")
-            .replace("}", "</tt>")
-        )
 
     def _print_header(self) -> None:
         self.__output.write("TI:Check manual page of %s\n" % self.name)
         # It does not make much sense to print the date of the HTML generation
         # of the man page here. More useful would be the Checkmk version where
-        # the plugin first appeared. But we have no access to that - alas.
+        # the plug-in first appeared. But we have no access to that - alas.
         # self.__output.write("DT:%s\n" % (time.strftime("%Y-%m-%d")))
         self.__output.write("SA:check_plugins_catalog,check_plugins_list\n")
 
     def _print_manpage_title(self, title: str) -> None:
-        self.__output.write("<b>%s</b>\n" % title)
+        self.__output.write(f"<b>{title}</b>\n")
 
     def _print_info_line(self, left: str, right: str) -> None:
         self.__output.write(f"<tr><td>{left}</td><td>{right}</td></tr>\n")
 
     def _print_subheader(self, line: str) -> None:
-        self.__output.write("H2:%s\n" % line)
+        self.__output.write(f"H2:{line}\n")
 
-    def _print_line(self, line: str, attr: str | None = None, no_markup: bool = False) -> None:
-        if no_markup:
-            self.__output.write("%s\n" % line)
-        else:
-            self.__output.write("%s\n" % self._markup(line))
+    def _print_line(self, line: str, *, color: str | None = None, no_markup: bool = False) -> None:
+        content = line if no_markup else _apply_markup(line)
+        self.__output.write(f"{content}\n")
 
     def _print_begin_splitlines(self) -> None:
         self.__output.write("<table>\n")
@@ -861,29 +839,55 @@ class NowikiManPageRenderer(ManPageRenderer):
         self.__output.write("\n")
 
     def _print_textbody(self, text: str) -> None:
-        self.__output.write("%s\n" % self._markup(text))
+        self.__output.write(f"{_apply_markup(text)}\n")
 
 
-if __name__ == "__main__":
-    import argparse
-
-    _parser = argparse.ArgumentParser(prog="man_pages", description="show manual pages for checks")
-    _parser.add_argument("checks", metavar="NAME", nargs="*", help="name of a check")
-    _parser.add_argument(
-        "-r",
-        "--renderer",
-        choices=["console", "nowiki"],
-        default="console",
-        help="use the given renderer (default: console)",
+def _apply_markup(line: str) -> str:
+    """Replace bracers with markup
+    '{{' -> '<tt>&#123;'
+    '{' -> '<tt>'
+    '}}' -> '&#125;</tt>'
+    '}' -> '</tt>'
+    """
+    return (
+        line.replace("{{", "{&#123;")
+        .replace("}}", "&#125;}")
+        .replace("{", "<tt>")
+        .replace("}", "</tt>")
     )
-    _args = _parser.parse_args()
-    cmk.utils.paths.local_check_manpages_dir = Path(__file__).parent.parent.parent / "checkman"
-    for check in _args.checks:
-        try:
-            print("----------------------------------------", check)
-            if _args.renderer == "console":
-                ConsoleManPageRenderer(check).paint()
-            else:
-                print(NowikiManPageRenderer(check).render())
-        except MKGeneralException as _e:
-            print(_e)
+
+
+_SerializableManPageDerivative = dict[str, str | dict[str, str] | list[dict[str, str]] | None]
+
+
+def man_pages_for_website_export(
+    plugin_families: Mapping[str, Sequence[str]],
+    group_subdir: str,
+) -> dict[str, _SerializableManPageDerivative]:
+    """This is called from `scripts/create_man_pages.py` of the websites-essentials repo!
+
+    The result should be json serializable.
+    """
+    return {
+        name: _extend_categorization_info(parse_man_page(name, path))
+        for name, path in make_man_page_path_map(plugin_families, group_subdir).items()
+    }
+
+
+def _extend_categorization_info(man_page: ManPage) -> _SerializableManPageDerivative:
+    return {
+        "name": man_page.name,
+        "path": man_page.path,
+        "title": man_page.title,
+        "agents": {agent: CHECK_MK_AGENTS.get(agent, agent.title()) for agent in man_page.agents},
+        "catalog": [
+            {category: CATALOG_TITLES.get(category, category.title()) for category in categories}
+            for categories in _make_catalog_entries(man_page.catalog, man_page.agents)
+        ],
+        "license": man_page.license,
+        "distribution": man_page.distribution,
+        "description": man_page.description,
+        "item": man_page.item,
+        "discovery": man_page.discovery,
+        "cluster": man_page.cluster,
+    }

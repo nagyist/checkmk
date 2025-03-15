@@ -30,7 +30,6 @@ KNOWN_WORLD_WRITABLE_FILES = {
     "tmp/run/mkeventd/events",  # So others can write events
 }
 KNOWN_WORLD_READABLE_FILES = {
-    "etc/omd/allocated_ports",  # Other sites use this to check for free ports
     "etc/omd/site.conf",  # Other sites use this to check for free ports
 }
 
@@ -57,13 +56,13 @@ def get_site_file_permission(site: Site) -> list[tuple[int, str]]:
 
 
 @pytest.mark.parametrize(
-    "mode,known_files_set",
+    "mode, known_files_set",
     ((Mode.WORLD_WRITEABLE, KNOWN_WORLD_WRITABLE_FILES),),
 )
 def test_site_file_permissions(site: Site, mode: Mode, known_files_set: set[str]) -> None:
     offenders: set[str] = set()
     for file_mode, rel_path in get_site_file_permission(site):
-        if not bool(file_mode & mode):
+        if (file_mode & mode) == 0:
             continue
 
         if rel_path in known_files_set:
@@ -71,13 +70,15 @@ def test_site_file_permissions(site: Site, mode: Mode, known_files_set: set[str]
 
         offenders.add(rel_path)
 
-    assert not offenders
+    assert not offenders, (
+        f"Incorrect file permissions! Found writable file(s):\n{'\n'.join(offenders)}"
+    )
 
 
 def test_world_accessible_files_parents(site: Site) -> None:
     """files which are supposed to be accessible need their parents to be also accessible"""
     for file in KNOWN_WORLD_WRITABLE_FILES | KNOWN_WORLD_READABLE_FILES:
-        path = Path(site.root) / file
+        path = site.root / file
         assert path.exists()
         for parent in path.parents:
             if not parent.is_relative_to(site.root):
@@ -86,20 +87,20 @@ def test_world_accessible_files_parents(site: Site) -> None:
 
 
 def test_version_file_permissions(site: Site) -> None:
-    """test that there are no writeable files in the version dir
+    """Test that there are no writeable files in the version dir.
 
-    check for world writeable and group writeable
-    only the owner should be allowed to write, the owner is checked in another
-    test"""
-
-    if site.update_from_git:
-        pytest.skip("The f12ed files do not have the proper permissions")
-
-    assert not {
-        p
-        for p in iter_dir(Path(site.version.version_path()))
+    Check for world writeable and group writeable
+    Only the owner should be allowed to write.
+    The ownership is checked in `test_version_file_ownership`.
+    """
+    writable_files = {
+        str(p)
+        for p in iter_dir(Path(site.package.version_path()))
         if has_permission(p, Mode.WORLD_WRITEABLE ^ Mode.GROUP_WRITEABLE)
     }
+    assert not writable_files, (
+        f"Incorrect file permissions! Found writable file(s):\n{'\n'.join(writable_files)}"
+    )
 
 
 def test_version_file_ownership(site: Site) -> None:
@@ -109,10 +110,7 @@ def test_version_file_ownership(site: Site) -> None:
     There are some files with omd as group, because of some caps, these are
     explicitly listed in the end, therefore the set construct"""
 
-    if site.update_from_git:
-        pytest.skip("The f12ed files do not have the proper owner/group")
-
-    path_to_version = Path(site.version.version_path())
+    path_to_version = Path(site.package.version_path())
     non_root_group = set()
     for p in iter_dir(path_to_version):
         assert p.owner() == "root", p
@@ -125,7 +123,7 @@ def test_version_file_ownership(site: Site) -> None:
         "lib/nagios/plugins/check_dhcp",
         "lib/nagios/plugins/check_icmp",
     }
-    if not site.version.is_raw_edition():
+    if not site.edition.is_raw_edition():
         exceptions |= {
             "lib/cmc/icmpsender",
             "lib/cmc/icmpreceiver",

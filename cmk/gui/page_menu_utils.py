@@ -5,12 +5,16 @@
 
 from collections.abc import Iterator
 
-import cmk.utils.version as cmk_version
+import cmk.ccc.version as cmk_version
 
-import cmk.gui.pagetypes as pagetypes
-import cmk.gui.visuals as visuals
+from cmk.utils import paths
+from cmk.utils.user import UserId
+
+from cmk.gui import pagetypes, visuals
 from cmk.gui.bi import is_part_of_aggregation
 from cmk.gui.config import active_config
+from cmk.gui.data_source import ABCDataSource
+from cmk.gui.exceptions import MKUserError
 from cmk.gui.http import request
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
@@ -22,18 +26,13 @@ from cmk.gui.page_menu import (
     PageMenuLink,
     PageMenuTopic,
 )
-from cmk.gui.plugins.visuals.utils import (
-    visual_info_registry,
-    visual_type_registry,
-    VisualInfo,
-    VisualType,
-)
-from cmk.gui.type_defs import HTTPVariables, InfoName, Rows, SingleInfos, Visual
+from cmk.gui.type_defs import InfoName, Rows, SingleInfos, Visual
 from cmk.gui.utils.urls import makeuri, makeuri_contextless
 from cmk.gui.view import View
-from cmk.gui.views.data_source import ABCDataSource
 from cmk.gui.visual_link import get_linked_visual_request_vars, make_linked_visual_url
 from cmk.gui.visuals import view_title
+from cmk.gui.visuals.info import visual_info_registry, VisualInfo
+from cmk.gui.visuals.type import visual_type_registry, VisualType
 
 
 def get_context_page_menu_dropdowns(view: View, rows: Rows, mobile: bool) -> list[PageMenuDropdown]:
@@ -71,18 +70,21 @@ def get_context_page_menu_dropdowns(view: View, rows: Rows, mobile: bool) -> lis
         dropdown_visuals = _get_visuals_for_page_menu_dropdown(linked_visuals, info, is_single_info)
 
         # Special hack for host setup and parent/child topology links
+        host_setup_topic = []
+        parent_child_topic = []
+        service_setup_topic = []
         if info_name == "host" and is_single_info:
             host_setup_topic = _page_menu_host_setup_topic(view)
             parent_child_topic = _page_menu_networking_topic(view)
-        else:
-            host_setup_topic = []
-            parent_child_topic = []
+        elif info_name == "service" and is_single_info:
+            service_setup_topic = _page_menu_service_setup_topic(view)
 
         dropdowns.append(
             PageMenuDropdown(
                 name=ident,
                 title=info.title if is_single_info else info.title_plural,
                 topics=host_setup_topic
+                + service_setup_topic
                 + parent_child_topic
                 + list(
                     _get_context_page_menu_topics(
@@ -101,113 +103,6 @@ def get_context_page_menu_dropdowns(view: View, rows: Rows, mobile: bool) -> lis
     return dropdowns
 
 
-def get_ntop_page_menu_dropdown(view, host_address):
-    return PageMenuDropdown(
-        name="ntop",
-        title="ntop",
-        topics=_get_ntop_page_menu_topics(view, host_address),
-    )
-
-
-def _get_ntop_page_menu_topics(view, host_address):
-    if "host" not in view.spec["single_infos"] or "host" in view.missing_single_infos:
-        return []
-
-    host_name = request.get_ascii_input_mandatory("host")
-    # TODO insert icons when available
-    topics = [
-        PageMenuTopic(
-            title="Network statistics",
-            entries=[
-                PageMenuEntry(
-                    name="overview",
-                    title="Host",
-                    icon_name="folder",
-                    item=_get_ntop_entry_item_link(host_name, host_address, "host_tab"),
-                ),
-                PageMenuEntry(
-                    name="overview",
-                    title="Traffic",
-                    icon_name="trans",
-                    item=_get_ntop_entry_item_link(host_name, host_address, "traffic_tab"),
-                ),
-                PageMenuEntry(
-                    name="overview",
-                    title="Packets",
-                    icon_name="trans",
-                    item=_get_ntop_entry_item_link(host_name, host_address, "packets_tab"),
-                ),
-                PageMenuEntry(
-                    name="overview",
-                    title="Ports",
-                    icon_name="trans",
-                    item=_get_ntop_entry_item_link(host_name, host_address, "ports_tab"),
-                ),
-                PageMenuEntry(
-                    name="overview",
-                    title="Peers",
-                    icon_name="trans",
-                    item=_get_ntop_entry_item_link(host_name, host_address, "peers_tab"),
-                ),
-                PageMenuEntry(
-                    name="overview",
-                    title="Apps",
-                    icon_name="trans",
-                    item=_get_ntop_entry_item_link(host_name, host_address, "applications_tab"),
-                ),
-                PageMenuEntry(
-                    name="overview",
-                    title="Flows",
-                    icon_name="trans",
-                    item=_get_ntop_entry_item_link(host_name, host_address, "flows_tab"),
-                ),
-            ],
-        ),
-        PageMenuTopic(
-            title="Alerts",
-            entries=[
-                PageMenuEntry(
-                    name="overview",
-                    title="Engaged alerts",
-                    icon_name="trans",
-                    item=_get_ntop_entry_item_link(host_name, host_address, "engaged_alerts_tab"),
-                ),
-                PageMenuEntry(
-                    name="overview",
-                    title="Past alerts",
-                    icon_name="trans",
-                    item=_get_ntop_entry_item_link(host_name, host_address, "past_alerts_tab"),
-                ),
-                PageMenuEntry(
-                    name="overview",
-                    title="Flow alerts",
-                    icon_name="trans",
-                    item=_get_ntop_entry_item_link(host_name, host_address, "flow_alerts_tab"),
-                ),
-            ],
-        ),
-    ]
-
-    return topics
-
-
-def _get_ntop_entry_item_link(  # type: ignore[no-untyped-def]
-    host_name: str, host_address: str, tab: str
-):
-    return make_simple_link(
-        makeuri(
-            request,
-            [
-                ("host", host_name),
-                ("host_address", host_address),
-                ("tab", tab),
-            ],
-            filename="ntop_host_details.py",
-            delvars=["view_name"],
-        )
-    )
-
-
 def _get_context_page_menu_topics(
     view: View,
     info: VisualInfo,
@@ -220,17 +115,35 @@ def _get_context_page_menu_topics(
     """Create the page menu topics for the given dropdown from the flat linked visuals list"""
     by_topic: dict[pagetypes.PagetypeTopics, list[PageMenuEntry]] = {}
 
+    host_name = singlecontext_request_vars.get("host")
+    service_description = singlecontext_request_vars.get("service")
+
     for visual_type, visual in sorted(
         dropdown_visuals, key=lambda i: (i[1]["sort_index"], i[1]["title"])
     ):
-        if visual.get("topic") == "bi" and not is_part_of_aggregation(
-            singlecontext_request_vars.get("host"), singlecontext_request_vars.get("service")
+        if visual.get("topic") == "bi" and (
+            host_name is not None
+            and not is_part_of_aggregation(host_name, service_description or "")
         ):
+            continue
+
+        if (
+            visual.get("name", "").startswith("topology_")
+            and visual.get("owner", "") == UserId.builtin()
+        ):
+            # Don't show network topology views
             continue
 
         try:
             topic = topics[visual["topic"]]
         except KeyError:
+            if "other" not in topics:
+                raise MKUserError(
+                    None,
+                    _(
+                        "No permission for fallback topic 'Other'. Please contact your administrator."
+                    ),
+                )
             topic = topics["other"]
 
         entry = _make_page_menu_entry_for_visual(
@@ -340,11 +253,11 @@ def _collect_linked_visuals_of_type(
             continue
 
         # Optional feature of visuals: Make them dynamically available as links or not.
-        # This has been implemented for HW/SW inventory views which are often useless when a host
+        # This has been implemented for HW/SW Inventory views which are often useless when a host
         # has no such information available. For example the "Oracle Tablespaces" inventory view
         # is useless on hosts that don't host Oracle databases.
         vars_values = get_linked_visual_request_vars(visual, singlecontext_request_vars)
-        if not visual_type.link_from(view, rows, visual, vars_values):
+        if not visual_type.link_from(view.spec["single_infos"], rows, visual, vars_values):
             continue
 
         yield visual_type, visual
@@ -399,9 +312,9 @@ def _get_availability_entry(
             makeuri(request, [("mode", "availability")], delvars=["show_checkboxes", "selection"])
         ),
         is_enabled=not view.missing_single_infos,
-        disabled_tooltip=_("Missing required context information")
-        if view.missing_single_infos
-        else None,
+        disabled_tooltip=(
+            _("Missing required context information") if view.missing_single_infos else None
+        ),
     )
 
 
@@ -429,24 +342,31 @@ def _get_combined_graphs_entry(
     if not _show_in_current_dropdown(view, info.ident, is_single_info):
         return None
 
-    httpvars: HTTPVariables = [
-        ("single_infos", ",".join(view.spec["single_infos"])),
-        ("datasource", view.datasource.ident),
-        ("view_title", view_title(view.spec, view.context)),
-    ]
-
-    url = makeuri(
-        request, httpvars, filename="combined_graphs.py", delvars=["show_checkboxes", "selection"]
-    )
     return PageMenuEntry(
         title=_("All metrics of same type in one graph"),
         icon_name="graph",
-        item=make_simple_link(url),
+        item=make_simple_link(
+            makeuri_contextless(
+                request,
+                [
+                    ("single_infos", ",".join(view.spec["single_infos"])),
+                    ("datasource", view.datasource.ident),
+                    ("view_title", view_title(view.spec, view.context)),
+                    *visuals.context_to_uri_vars(
+                        visuals.active_context_from_request(
+                            view.datasource.infos,
+                            view.context,
+                        )
+                    ),
+                ],
+                filename="combined_graphs.py",
+            )
+        ),
     )
 
 
 def _show_combined_graphs_context_button(view: View) -> bool:
-    if cmk_version.is_raw_edition():
+    if cmk_version.edition(paths.omd_root) is cmk_version.Edition.CRE:
         return False
 
     if view.name == "service":
@@ -500,7 +420,7 @@ def _page_menu_networking_topic(view: View) -> list[PageMenuTopic]:
             title=_("Network monitoring"),
             entries=[
                 PageMenuEntry(
-                    title=_("Parent/Child topology"),
+                    title=_("Parent/child topology"),
                     icon_name="aggr",
                     item=make_simple_link(
                         makeuri_contextless(
@@ -534,6 +454,33 @@ def _page_menu_host_setup_topic(view: View) -> list[PageMenuTopic]:
         PageMenuTopic(
             title=_("Setup"),
             entries=list(page_menu_entries_host_setup(host_name)),
+        )
+    ]
+
+
+def _page_menu_service_setup_topic(view: View) -> list[PageMenuTopic]:
+    if "service" not in view.spec["single_infos"] or "service" in view.missing_single_infos:
+        return []
+    if "host" not in view.spec["single_infos"] or "host" in view.missing_single_infos:
+        return []
+
+    if not active_config.wato_enabled:
+        return []
+
+    if not user.may("wato.use"):
+        return []
+
+    if not user.may("wato.hosts") and not user.may("wato.seeall"):
+        return []
+
+    return [
+        PageMenuTopic(
+            title=_("Setup"),
+            entries=list(
+                page_menu_entries_service_setup(
+                    view.context["host"]["host"], view.context["service"]["service"]
+                )
+            ),
         )
     ]
 
@@ -575,8 +522,8 @@ def page_menu_entries_host_setup(host_name: str) -> Iterator[PageMenuEntry]:
     is_cluster = False
     if is_cluster:
         yield PageMenuEntry(
-            title=_("Connection tests"),
-            icon_name="diagnose",
+            title=_("Test connection"),
+            icon_name="analysis",
             item=make_simple_link(
                 makeuri_contextless(
                     request,
@@ -616,3 +563,37 @@ def page_menu_entries_host_setup(host_name: str) -> Iterator[PageMenuEntry]:
                 )
             ),
         )
+    yield PageMenuEntry(
+        title=_("Test notifications"),
+        icon_name="analysis",
+        item=make_simple_link(
+            makeuri_contextless(
+                request,
+                [
+                    ("mode", "test_notifications"),
+                    ("host_name", host_name),
+                    ("_test_host_notifications", 1),
+                ],
+                filename="wato.py",
+            )
+        ),
+    )
+
+
+def page_menu_entries_service_setup(host_name: str, serivce_name: str) -> Iterator[PageMenuEntry]:
+    yield PageMenuEntry(
+        title=_("Test notifications"),
+        icon_name="analysis",
+        item=make_simple_link(
+            makeuri_contextless(
+                request,
+                [
+                    ("mode", "test_notifications"),
+                    ("host_name", host_name),
+                    ("service_name", serivce_name),
+                    ("_test_service_notifications", 1),
+                ],
+                filename="wato.py",
+            )
+        ),
+    )

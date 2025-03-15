@@ -5,9 +5,9 @@
 
 import pytest
 
-from tests.testlib import Check
+from cmk.agent_based.v2 import get_value_store
 
-from .checktestlib import CheckResult
+from .checktestlib import Check, CheckResult
 
 pytestmark = pytest.mark.checks
 
@@ -93,6 +93,13 @@ def test_check_function(
     Checks funny connections values
     """
     check = Check("mongodb_connections")
+
+    # prepare state. scoped to this function by fixture
+    try:
+        get_value_store()["total_created"] = (0.0, int(info[2][1]))
+    except (ValueError, TypeError):
+        pass
+
     check_result = CheckResult(check.run_check(None, {"levels_perc": (80.0, 90.0)}, info))
 
     if len(check_result.subresults) == 0:

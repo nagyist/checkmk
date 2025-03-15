@@ -9,9 +9,9 @@ import sys
 import pytest
 
 if sys.version_info[0] == 2:
-    import agents.plugins.mtr_2 as mtr  # pylint: disable=syntax-error
+    import agents.plugins.mtr_2 as mtr
 else:
-    import agents.plugins.mtr as mtr
+    from agents.plugins import mtr
 
 
 @pytest.mark.parametrize(
@@ -29,5 +29,5 @@ else:
         ),
     ],
 )
-def test_host_to_filename(host, expected_result) -> None:  # type: ignore[no-untyped-def]
+def test_host_to_filename(host: str, expected_result: str) -> None:
     assert mtr.host_to_filename(host) == expected_result

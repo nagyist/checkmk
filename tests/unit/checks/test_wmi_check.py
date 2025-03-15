@@ -3,16 +3,11 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-from collections.abc import Sequence
-
 import pytest
 
-from tests.testlib import Check
+from cmk.agent_based.v2 import IgnoreResultsError, StringTable
 
-from cmk.base.api.agent_based.type_defs import StringTable
-from cmk.base.check_api import MKCounterWrapped
-
-from .checktestlib import CheckResult
+from .checktestlib import Check, CheckResult
 
 pytestmark = pytest.mark.checks
 
@@ -127,48 +122,5 @@ def test_wmi_cpu_load_no_discovery(check_name: str, info: StringTable) -> None:
 )
 def test_wmi_timeout_exceptions(check_name: str, info: StringTable) -> None:
     check = Check(check_name)
-    with pytest.raises(MKCounterWrapped):
+    with pytest.raises(IgnoreResultsError):
         CheckResult(check.run_check(None, {}, check.run_parse(info)))
-
-
-@pytest.mark.usefixtures("initialised_item_state")
-@pytest.mark.parametrize(
-    "check_name, expected",
-    [
-        (
-            "msexch_isclienttype",
-            [
-                (
-                    0,
-                    "Average latency: 0.49 ms",
-                    [("average_latency", 0.48712422193702626, 40.0, 50.0)],
-                ),
-                (0, "RPC Requests/sec: 0.00", [("requests_per_sec", 0.0, 60.0, 70.0)]),
-            ],
-        ),
-        (
-            "msexch_isstore",
-            [
-                (
-                    0,
-                    "Average latency: 0.49 ms",
-                    [("average_latency", 0.48712422193702626, 41.0, 51.0)],
-                ),
-            ],
-        ),
-    ],
-)
-def test_wmi_msexch_isclienttype_wato_params(check_name: str, expected: Sequence[object]) -> None:
-    check = Check(check_name)
-    result = list(
-        check.run_check(
-            item="_total",
-            params={
-                "store_latency": (41.0, 51.0),
-                "clienttype_latency": (40.0, 50.0),
-                "clienttype_requests": (60, 70),
-            },
-            info=check.run_parse(info_msx_info_store_1),
-        )
-    )
-    assert result == expected

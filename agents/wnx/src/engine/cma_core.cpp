@@ -2,7 +2,7 @@
 //
 #include "stdafx.h"
 
-#include "cma_core.h"
+#include "wnx/cma_core.h"
 
 #include <chrono>
 #include <ctime>
@@ -15,16 +15,17 @@
 #include <vector>
 
 #include "common/wtools.h"
-#include "glob_match.h"
-#include "section_header.h"  // we have logging here
-#include "service_processor.h"
 #include "tools/_misc.h"
-#include "windows_service_api.h"
+#include "wnx/glob_match.h"
+#include "wnx/section_header.h"  // we have logging here
+#include "wnx/service_processor.h"
+#include "wnx/windows_service_api.h"
 
 namespace fs = std::filesystem;
 namespace rs = std::ranges;
 using namespace std::chrono_literals;
 using namespace std::string_literals;
+using namespace std::string_view_literals;
 
 namespace cma {
 bool IsValidFile(const fs::path &file_to_exec) {
@@ -65,21 +66,6 @@ std::wstring FindPowershellExe() noexcept {
     return {};
 }
 
-namespace security {
-void ProtectFiles(const fs::path &root, std::vector<std::wstring> &commands) {
-    for (const auto &p : {root / cfg::kAppDataAppName}) {
-        wtools::ProtectPathFromUserAccess(p, commands);
-    }
-}
-
-void ProtectAll(const fs::path &root, std::vector<std::wstring> &commands) {
-    wtools::ProtectPathFromUserWrite(root, commands);
-
-    ProtectFiles(root, commands);
-}
-
-}  // namespace security
-
 // we are counting threads in to have control exit/stop/wait
 std::atomic<int> PluginEntry::g_tread_count = 0;
 
@@ -114,6 +100,32 @@ bool CheckArgvForValue(int argc, const wchar_t *argv[], int pos,
                        std::string_view value) noexcept {
     return argv != nullptr && argc > pos && pos > 0 && argv[pos] != nullptr &&
            std::wstring(argv[pos]) == wtools::ConvertToUtf16(value);
+}
+
+std::pair<std::string_view, std::optional<std::string_view>> SplitView(
+    std::string_view data, std::string_view delimiter) {
+    const auto found = std::ranges::search(data.begin(), data.end(),
+                                           delimiter.begin(), delimiter.end());
+    if (found.empty()) {
+        return std::pair{std::string_view{data.begin(), data.end()},
+                         std::nullopt};
+    }
+    return std::pair{std::string_view{data.begin(), found.end()},
+                     std::string_view{found.end(), data.end()}};
+}
+
+bool IsUtf16BomLe(std::string_view data) noexcept {
+    return data.size() > 1 && data[0] == '\xFF' && data[1] == '\xFE';
+}
+
+void ScanView(std::string_view data, std::string_view delimiter,
+              ScanViewCallback callback) {
+    std::optional left = data;
+    while (left) {
+        auto [work, l] = SplitView(*left, delimiter);
+        left = l;
+        callback(work);
+    }
 }
 
 }  // namespace tools
@@ -314,13 +326,13 @@ cfg::Plugins::ExeUnit *GetEntrySafe(UnitMap &unit_map, const std::string &key) {
     }
 }
 
-void UpdatePluginMapWithUnitMap(PluginMap &out, UnitMap &um,
-                                ExecType exec_type) {
+void UpdatePluginMapWithUnitMap(PluginMap &out, UnitMap &um, ExecType exec_type,
+                                wtools::InternalUsersDb *iu) {
     for (const auto &[name, unit] : um) {
         auto *ptr = GetEntrySafe(out, name);
         if (ptr != nullptr) {
             if (unit.run()) {
-                ptr->applyConfigUnit(unit, exec_type);
+                ptr->applyConfigUnit(unit, exec_type, iu);
             } else {
                 ptr->removeFromExecution();
             }
@@ -329,7 +341,7 @@ void UpdatePluginMapWithUnitMap(PluginMap &out, UnitMap &um,
                 out.try_emplace(name, name);
                 ptr = GetEntrySafe(out, name);
                 if (ptr != nullptr) {
-                    ptr->applyConfigUnit(unit, exec_type);
+                    ptr->applyConfigUnit(unit, exec_type, iu);
                 }
             }
         }
@@ -422,9 +434,10 @@ void RemoveDuplicatedEntriesByName(UnitMap &um, ExecType exec_type) {
 }
 
 namespace {
-std::optional<std::wstring> GetTrustee(const cfg::Plugins::ExeUnit &unit) {
-    if (!unit.group().empty()) {
-        return ObtainInternalUser(wtools::ConvertToUtf16(unit.group())).first;
+std::optional<std::wstring> GetTrustee(const cfg::Plugins::ExeUnit &unit,
+                                       wtools::InternalUsersDb *iu) {
+    if (!unit.group().empty() && iu != nullptr) {
+        return iu->obtainUser(wtools::ConvertToUtf16(unit.group())).first;
     }
     if (unit.user().empty()) {
         return {};
@@ -438,14 +451,16 @@ void AllowAccess(const fs::path &f, std::wstring_view name) {
         STANDARD_RIGHTS_ALL | GENERIC_ALL, GRANT_ACCESS, OBJECT_INHERIT_ACE);
 }
 void ConditionallyAllowAccess(const fs::path &f,
-                              const cfg::Plugins::ExeUnit &unit) {
-    if (const auto trustee = GetTrustee(unit)) {
+                              const cfg::Plugins::ExeUnit &unit,
+                              wtools::InternalUsersDb *iu) {
+    if (const auto trustee = GetTrustee(unit, iu)) {
         AllowAccess(f, *trustee);
     }
 }
 }  // namespace
 
-void ApplyEverythingToPluginMap(PluginMap &plugin_map,
+void ApplyEverythingToPluginMap(wtools::InternalUsersDb *iu,
+                                PluginMap &plugin_map,
                                 const std::vector<cfg::Plugins::ExeUnit> &units,
                                 const std::vector<fs::path> &found_files,
                                 ExecType exec_type) {
@@ -473,7 +488,7 @@ void ApplyEverythingToPluginMap(PluginMap &plugin_map,
                 XLOG::t("To plugin '{}' to be applied rule '{}'", f,
                         it->sourceText());
                 exe->apply(entry_full_name, it->source());
-                ConditionallyAllowAccess(f, *exe);
+                ConditionallyAllowAccess(f, *exe, iu);
             }
 
             ApplyEverythingLogResult(fmt_string, entry_full_name, exec_type);
@@ -499,12 +514,12 @@ void ApplyEverythingToPluginMap(PluginMap &plugin_map,
         }
     }
     // apply config for presented
-    UpdatePluginMapWithUnitMap(plugin_map, um, exec_type);
+    UpdatePluginMapWithUnitMap(plugin_map, um, exec_type, iu);
 }
 
 // Main API
-void UpdatePluginMap(PluginMap &plugin_map, ExecType exec_type,
-                     const PathVector &found_files,
+void UpdatePluginMap(wtools::InternalUsersDb *iu, PluginMap &plugin_map,
+                     ExecType exec_type, const PathVector &found_files,
                      const std::vector<cfg::Plugins::ExeUnit> &units,
                      bool check_exists) {
     if (found_files.empty() || units.empty()) {
@@ -515,7 +530,7 @@ void UpdatePluginMap(PluginMap &plugin_map, ExecType exec_type,
     const auto really_found =
         FilterPathVector(found_files, units, check_exists);
     FilterPluginMap(plugin_map, really_found);
-    ApplyEverythingToPluginMap(plugin_map, units, really_found, exec_type);
+    ApplyEverythingToPluginMap(iu, plugin_map, units, really_found, exec_type);
     RemoveDuplicatedPlugins(plugin_map, check_exists);
 }
 
@@ -592,7 +607,6 @@ bool HackDataWithCacheInfo(std::vector<char> &out,
     auto table = tools::SplitString(stringized, "\n");
 
     size_t data_count = 0;
-    bool hack_allowed = true;
     for (auto &t : table) {
         if constexpr (g_config_remove_slash_r) {
             while (t.back() == '\r') {
@@ -614,17 +628,14 @@ bool HackDataWithCacheInfo(std::vector<char> &out,
         }
 
         // check for piggyback
-        if (auto piggyback_name = GetPiggyBackName(t); piggyback_name) {
-            hack_allowed = piggyback_name->empty();
-            XLOG::t.i("piggyback input {}",
-                      hack_allowed
-                          ? "ended"
-                          : fmt::format("'{}' started", *piggyback_name));
+        if (auto piggyback_name = GetPiggyBackName(t);
+            piggyback_name.has_value()) {
+            XLOG::t.i("skip piggyback input {}", *piggyback_name);
             continue;
         }
 
         // hack code if not piggyback and we have something to patch
-        if (hack_allowed && TryToHackStringWithCachedInfo(t, patch)) {
+        if (TryToHackStringWithCachedInfo(t, patch)) {
             data_count += patch.size();
         }
     }
@@ -638,6 +649,103 @@ bool HackDataWithCacheInfo(std::vector<char> &out,
     }
 
     return true;
+}
+
+namespace {
+constexpr auto CR_16 = "\x0D\x00"sv;
+constexpr auto LF_16 = "\x0A\x00"sv;
+
+/// check we do not have added additional CR
+void EnsureCorrectLastChar(std::string_view input, std::string &output) {
+    if (input.length() >= 2 && input.substr(input.length() - 2) != LF_16 &&
+        !output.empty() && output.back() == '\n') {
+        output.pop_back();
+    }
+}
+
+namespace {
+
+struct DisassembleView {
+    std::string_view s;
+    bool has_cr;
+    bool has_lf;
+};
+
+/// Separate data view from the L'CR' and L'LF'
+/// Info about cr & lf is stored to be used during re-assembling
+DisassembleView DisassembleString(std::string_view s) {
+    const auto has_cr =
+        s.length() >= 4 && s.substr(s.length() - 4, s.length() - 2) == CR_16;
+    const auto has_lf = s.length() >= 2 && s.substr(s.length() - 2) == LF_16;
+    auto sz = s.size();
+    if (has_cr) {
+        sz -= 2;
+    }
+    if (has_lf) {
+        sz -= 2;
+    }
+    return {.s = {s.data(), sz}, .has_cr = has_cr, .has_lf = has_lf};
+}
+
+void AppendDisassembledTail(std::string &data,
+                            const DisassembleView &disassembled) {
+    if (disassembled.has_cr) {
+        data += '\x0D';
+    }
+    if (disassembled.has_lf) {
+        data += '\x0A';
+    }
+}
+
+void AppendDisassembled(std::string &data,
+                        const DisassembleView &disassembled) {
+    data += disassembled.s;
+    AppendDisassembledTail(data, disassembled);
+}
+
+}  // namespace
+
+std::string ConvertWithRepair(std::string_view data_block) {
+    std::string data;
+    if (tools::IsUtf16BomLe(data_block)) {
+        data.reserve(data_block.size());
+        tools::ScanView(data_block.substr(2), LF_16, [&data](auto s) {
+            auto disassembled = DisassembleString(s);
+            if (const auto wide_string = tools::ToWideView(s); wide_string) {
+                if (auto utf8 = wtools::ToUtf8(*wide_string); !utf8.empty()) {
+                    data += utf8;
+                    return;
+                }
+            }
+            AppendDisassembled(data, disassembled);
+        });
+    } else {
+        data.assign(data_block.begin(), data_block.end());
+    }
+    wtools::AddSafetyEndingNull(data);
+    return data;
+}
+
+std::string PostProcessPluginData(const std::vector<char> &datablock,
+                                  tools::UtfConversionMode mode) {
+    auto data = ConvertUtfData(datablock, mode);
+    if (!data.empty() && data.back() == 0) {
+        data.pop_back();  // conditional convert adds 0
+    }
+    return data;
+}
+}  // namespace
+
+std::string ConvertUtfData(const std::vector<char> &data_block,
+                           tools::UtfConversionMode mode) {
+    switch (mode) {
+        case tools::UtfConversionMode::basic:
+            return wtools::ConditionallyConvertFromUtf16(data_block);
+        case tools::UtfConversionMode::repair_by_line:
+            return ConvertWithRepair(tools::ToView(data_block));
+    }
+    // unreachable
+    return {};
 }
 
 // LOOP:
@@ -674,10 +782,8 @@ std::vector<char> PluginEntry::getResultsSync(const std::wstring &id,
         minibox_.processResults([&](const std::wstring &cmd_line, uint32_t pid,
                                     uint32_t code,
                                     const std::vector<char> &datablock) {
-            auto data = wtools::ConditionallyConvertFromUtf16(datablock);
-            if (!data.empty() && data.back() == 0) {
-                data.pop_back();  // conditional convert adds 0
-            }
+            auto data =
+                PostProcessPluginData(datablock, getUtfConversionMode());
             tools::AddVector(accu, data);
             storeData(pid, accu);
             if (cfg::LogPluginOutput()) {
@@ -1089,27 +1195,31 @@ wtools::InternalUser PluginsExecutionUser2Iu(std::string_view user) {
     return {table[0], L""};
 }
 
-void PluginEntry::fillInternalUser() {
-    // reset all to be safe due to possible future errors in logic
-    iu_.first.clear();
-    iu_.second.clear();
+tools::UtfConversionMode PluginEntry::getUtfConversionMode() const {
+    // TODO(sk): add global flag
+    return repair_invalid_utf_ ? tools::UtfConversionMode::repair_by_line
+                               : tools::UtfConversionMode::basic;
+}
 
-    // group is coming first
-    if (!group_.empty()) {
-        iu_ = ObtainInternalUser(wtools::ConvertToUtf16(group_));
+/// try to build user from fields group and user
+wtools::InternalUser PluginEntry::getInternalUser(
+    wtools::InternalUsersDb *user_database) const {
+    if (!group_.empty() && (user_database != nullptr)) {
+        const auto iu =
+            user_database->obtainUser(wtools::ConvertToUtf16(group_));
         XLOG::t("Entry '{}' uses user '{}' as group config", path(),
                 wtools::ToUtf8(iu_.first));
-        return;
+        return iu;
     }
 
     if (user_.empty()) {
-        return;  // situation when both fields are empty
+        return {};
     }
 
-    // user
-    iu_ = PluginsExecutionUser2Iu(user_);
+    const auto iu = PluginsExecutionUser2Iu(user_);
     XLOG::t("Entry '{}' uses user '{}' as direct config", path(),
             wtools::ToUtf8(iu_.first));
+    return iu;
 }
 
 // if thread finished join old and start new thread again
@@ -1213,7 +1323,7 @@ void PluginEntry::restartIfRequired() {
         return;
     }
     XLOG::d.t("Starting '{}'", *filename);
-    if (tools::RunDetachedCommand(*filename)) {
+    if (tools::RunDetachedCommand(*filename).has_value()) {
         XLOG::d.i("Starting '{}' OK!", *filename);
     } else {
         XLOG::l("Starting '{}' FAILED with error [{}]", *filename,
@@ -1388,7 +1498,8 @@ void StartSyncPlugins(PluginMap &plugins,
     }
 }
 
-DataBlock RunSyncPlugins(PluginMap &plugins, int &total, int timeout) {
+std::pair<std::vector<char>, int> RunSyncPlugins(PluginMap &plugins,
+                                                 int timeout) {
     XLOG::d.t("To start [{}] sync plugins", plugins.size());
 
     std::vector<std::future<DataBlock>> results;
@@ -1404,8 +1515,7 @@ DataBlock RunSyncPlugins(PluginMap &plugins, int &total, int timeout) {
         }
     }
 
-    total = delivered_count;
-    return out;
+    return {out, delivered_count};
 }
 
 void RunDetachedPlugins(const PluginMap & /*plugins_map*/,
@@ -1443,39 +1553,34 @@ void PickupAsync0data(int timeout, PluginMap &plugins, std::vector<char> &out,
     }
 }
 
-std::vector<char> RunAsyncPlugins(PluginMap &plugins, int &total,
-                                  bool start_immediately) {
-    total = 0;
-
-    std::vector<char> out;
+std::pair<std::vector<char>, int> RunAsyncPlugins(PluginMap &plugins,
+                                                  bool start_immediately) {
+    std::vector<char> result;
 
     int count = 0;
     for (auto &plugin : plugins | std::views::values) {
         if (!plugin.async() || !provider::config::IsRunAsync(plugin)) {
             continue;
         }
-        auto ret = plugin.getResultsAsync(start_immediately);
-        if (!ret.empty()) {
+        auto data = plugin.getResultsAsync(start_immediately);
+        if (!data.empty()) {
             ++count;
         }
-        tools::AddVector(out, ret);
+        tools::AddVector(result, data);
     }
-    total = count;
-    return out;
+    return {result, count};
 }
 }  // namespace cma
 
 namespace cma {
-std::mutex g_users_lock;
-std::unordered_map<std::wstring, wtools::InternalUser> g_users;
-constexpr bool g_enable_ps1_proxy{true};
+constexpr bool enable_ps1_proxy{true};
 
 std::wstring LocatePs1Proxy() {
-    if constexpr (!g_enable_ps1_proxy) {
+    if constexpr (!enable_ps1_proxy) {
         return L"";
     }
 
-    auto path_to_configure_and_exec =
+    const auto path_to_configure_and_exec =
         fs::path{cfg::GetRootInstallDir()} / cfg::files::kConfigureAndExecPs1;
     std::error_code ec;
     return fs::exists(path_to_configure_and_exec, ec)
@@ -1483,46 +1588,19 @@ std::wstring LocatePs1Proxy() {
                : L"";
 }
 
-std::wstring MakePowershellWrapper() noexcept {
+std::wstring MakePowershellWrapper(const fs::path &script) noexcept {
     try {
-        auto powershell_exe = FindPowershellExe();
+        const auto powershell_exe = FindPowershellExe();
         auto proxy = LocatePs1Proxy();
 
         return powershell_exe +
                fmt::format(
-                   L" -NoLogo -NoProfile -ExecutionPolicy Bypass -File{}",
-                   proxy) +
-               L" \"{}\"";
+                   L" -NoLogo -NoProfile -ExecutionPolicy Bypass -File{} \"{}\"",
+                   proxy, script.wstring());
     } catch (const std::exception &e) {
         XLOG::l("Exception when finding powershell e:{}", e);
         return L"";
     }
-}
-
-wtools::InternalUser ObtainInternalUser(std::wstring_view group) {
-    const std::wstring group_name(group);
-    std::lock_guard lk(g_users_lock);
-
-    if (auto it = g_users.find(group_name); it != g_users.end()) {
-        return it->second;
-    }
-
-    auto iu = wtools::CreateCmaUserInGroup(group_name);
-    if (iu.first.empty()) {
-        return {};
-    }
-
-    g_users[group_name] = iu;
-
-    return iu;
-}
-
-void KillAllInternalUsers() {
-    std::lock_guard lk(g_users_lock);
-    for (const auto &iu : g_users | std::views::values) {
-        wtools::RemoveCmaUser(iu.first);
-    }
-    g_users.clear();
 }
 
 }  // namespace cma

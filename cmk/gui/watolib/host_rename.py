@@ -4,90 +4,110 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
+from enum import auto, StrEnum
+from typing import Any
 
 from pydantic import BaseModel
 
 from livestatus import SiteId
 
+from cmk.ccc import store
+from cmk.ccc.plugin_registry import Registry
+
 import cmk.utils.paths
-import cmk.utils.store as store
 from cmk.utils.agent_registration import get_uuid_link_manager
+from cmk.utils.hostaddress import HostName
+from cmk.utils.notify_types import EventRule
 from cmk.utils.object_diff import make_diff_text
-from cmk.utils.type_defs import HostName
 
 from cmk.gui import userdb
-from cmk.gui.background_job import BackgroundProcessInterface
-from cmk.gui.bi import get_cached_bi_packs
+from cmk.gui.background_job import BackgroundJob, BackgroundProcessInterface
 from cmk.gui.exceptions import MKAuthException
 from cmk.gui.http import request
 from cmk.gui.i18n import _, _l
 from cmk.gui.site_config import get_site_config, site_is_local
-from cmk.gui.watolib.audit_log import log_audit
-from cmk.gui.watolib.automation_commands import AutomationCommand
-from cmk.gui.watolib.automations import do_remote_automation
-from cmk.gui.watolib.changes import add_change
-from cmk.gui.watolib.check_mk_automations import rename_hosts
-from cmk.gui.watolib.hosts_and_folders import (
-    call_hook_hosts_changed,
-    CREFolder,
-    CREHost,
-    Folder,
-    Host,
-)
-from cmk.gui.watolib.notifications import load_notification_rules, save_notification_rules
-from cmk.gui.watolib.rulesets import FolderRulesets
-from cmk.gui.watolib.utils import rename_host_in_list
+from cmk.gui.utils.urls import makeuri
 
-from cmk.bi.packs import BIHostRenamer
+from ..config import active_config
+from .audit_log import log_audit
+from .automation_commands import AutomationCommand
+from .automations import do_remote_automation
+from .changes import add_change
+from .check_mk_automations import rename_hosts
+from .hosts_and_folders import call_hook_hosts_changed, Folder, folder_tree, Host
+from .notifications import NotificationRuleConfigFile
+from .rulesets import FolderRulesets
+from .utils import rename_host_in_list
 
-try:
-    import cmk.gui.cee.plugins.wato.alert_handling as alert_handling
-except ImportError:
-    alert_handling = None  # type: ignore[assignment]
+
+class RenamePhase(StrEnum):
+    SETUP = auto()
+    POST_CMK_BASE = auto()
+
+
+@dataclass(frozen=True)
+class RenameHostHook:
+    phase: RenamePhase
+    title: str
+    func: Callable[[HostName, HostName], list[str]]
+
+
+class RenameHostHookRegistry(Registry[RenameHostHook]):
+    def plugin_name(self, instance: RenameHostHook) -> str:
+        return instance.title
+
+    def hooks_by_phase(self, phase: RenamePhase) -> list[RenameHostHook]:
+        return [h for h in self.values() if h.phase == phase]
+
+
+rename_host_hook_registry = RenameHostHookRegistry()
 
 
 def perform_rename_hosts(
-    renamings: Iterable[tuple[CREFolder, HostName, HostName]],
-    job_interface: BackgroundProcessInterface | None = None,
+    renamings: Iterable[tuple[Folder, HostName, HostName]],
+    job_interface: BackgroundProcessInterface,
 ) -> tuple[dict[str, int], list[tuple[HostName, MKAuthException]]]:
-    """Rename hosts mechanism
-
-    Args:
-        renamings:
-            tuple consisting of folder, oldname, newname
-
-        job_interface:
-            only relevant for Setup interaction, allows to update the interface with the current
-            update info
-    """
-
     def update_interface(message: str) -> None:
-        if job_interface is None:
-            return
         job_interface.send_progress_update(message)
 
     actions: list[str] = []
-    all_hosts = list(Host.all().values())
 
     # 1. Fix Setup configuration itself ----------------
     auth_problems = []
     successful_renamings = []
     update_interface(_("Renaming Setup configuration..."))
-    for folder, oldname, newname in renamings:
+
+    setup_actions: dict[tuple[Folder, HostName, HostName], list[str]] = {}
+    for renaming in renamings:
+        folder, oldname, newname = renaming
         try:
-            this_host_actions = []
             update_interface(_("Renaming host(s) in folders..."))
-            this_host_actions += _rename_host_in_folder(folder, oldname, newname)
+            setup_actions[renaming] = _rename_host_in_folder(folder, oldname, newname)
+        except MKAuthException as e:
+            auth_problems.append((oldname, e))
+
+    # Precompute cluster host list for node renaming due to expensive Host.all()
+    # call. This currently also needs to be done after the host renaming as the
+    # folder_tree cache_invalidation still misses some caches.
+    cluster_hosts = [host for host in Host.all().values() if host.is_cluster()]
+
+    for renaming, this_host_actions in setup_actions.items():
+        folder, oldname, newname = renaming
+        try:
             update_interface(_("Renaming host(s) in cluster nodes..."))
-            this_host_actions += _rename_host_as_cluster_node(all_hosts, oldname, newname)
+            this_host_actions.extend(_rename_host_as_cluster_node(cluster_hosts, oldname, newname))
             update_interface(_("Renaming host(s) in parents..."))
-            this_host_actions += _rename_parents(oldname, newname)
+            this_host_actions.extend(_rename_parents(oldname, newname))
             update_interface(_("Renaming host(s) in rulesets..."))
-            this_host_actions += _rename_host_in_rulesets(oldname, newname)
-            update_interface(_("Renaming host(s) in BI aggregations..."))
-            this_host_actions += _rename_host_in_bi(oldname, newname)
+            this_host_actions.extend(_rename_host_in_rulesets(oldname, newname))
+
+            for hook in rename_host_hook_registry.hooks_by_phase(RenamePhase.SETUP):
+                update_interface(_("Renaming host(s) in %s...") % hook.title)
+                actions += hook.func(oldname, newname)
+
             actions += this_host_actions
             successful_renamings.append((folder, oldname, newname))
         except MKAuthException as e:
@@ -96,7 +116,7 @@ def perform_rename_hosts(
     # 2. Checkmk stuff ------------------------------------------------
     update_interface(_("Renaming host(s) in base configuration, rrd, history files, etc."))
     update_interface(_("This might take some time and involves a core restart..."))
-    renamings_by_site = _group_renamings_by_site(successful_renamings)
+    renamings_by_site = group_renamings_by_site(successful_renamings)
     action_counts = _rename_hosts_in_check_mk(renamings_by_site)
 
     # 3. Notification settings ----------------------------------------------
@@ -106,7 +126,12 @@ def perform_rename_hosts(
         actions += _rename_host_in_event_rules(oldname, newname)
         actions += _rename_host_in_multisite(oldname, newname)
 
-    # 4. Update UUID links
+    # 4. Trigger updates in decoupled (e.g. edition specific) features
+    for hook in rename_host_hook_registry.hooks_by_phase(RenamePhase.POST_CMK_BASE):
+        update_interface(_("Renaming host(s) in %s...") % hook.title)
+        actions += hook.func(oldname, newname)
+
+    # 5. Update UUID links
     update_interface(_("Renaming host(s): Update UUID links..."))
     actions += _rename_host_in_uuid_link_manager(renamings_by_site)
 
@@ -115,28 +140,25 @@ def perform_rename_hosts(
         action_counts[action] += 1
 
     update_interface(_("Calling final hooks"))
-    call_hook_hosts_changed(Folder.root_folder())
+    call_hook_hosts_changed(folder_tree().root_folder())
 
     return action_counts, auth_problems
 
 
-def _rename_host_in_folder(folder: CREFolder, oldname: HostName, newname: HostName) -> list[str]:
+def _rename_host_in_folder(folder: Folder, oldname: HostName, newname: HostName) -> list[str]:
     folder.rename_host(oldname, newname)
-    folder.invalidate_caches()
+    folder_tree().invalidate_caches()
     return ["folder"]
 
 
 def _rename_host_as_cluster_node(
-    all_hosts: Iterable[CREHost], oldname: HostName, newname: HostName
+    cluster_hosts: list[Host], oldname: HostName, newname: HostName
 ) -> list[str]:
-    clusters = []
-    for somehost in all_hosts:
-        if somehost.is_cluster():
-            if somehost.rename_cluster_node(oldname, newname):
-                clusters.append(somehost.name())
-    if clusters:
-        return ["cluster_nodes"] * len(clusters)
-    return []
+    renamed_cluster_nodes = 0
+    for cluster_host in cluster_hosts:
+        if cluster_host.rename_cluster_node(oldname, newname):
+            renamed_cluster_nodes += 1
+    return ["cluster_nodes"] * renamed_cluster_nodes
 
 
 def _rename_parents(
@@ -144,12 +166,12 @@ def _rename_parents(
     newname: HostName,
 ) -> list[str]:
     parent_renamed: list[str]
-    folder_parent_renamed: list[CREFolder]
+    folder_parent_renamed: list[Folder]
     parent_renamed, folder_parent_renamed = _rename_host_in_parents(oldname, newname)
     # Needed because hosts.mk in folders with parent as effective attribute
     # would not be updated
     for folder in folder_parent_renamed:
-        folder.rewrite_hosts_files()
+        folder.recursively_save_hosts()
 
     return parent_renamed
 
@@ -157,13 +179,13 @@ def _rename_parents(
 def _rename_host_in_parents(
     oldname: HostName,
     newname: HostName,
-) -> tuple[list[str], list[CREFolder]]:
-    folder_parent_renamed: list[CREFolder] = []
+) -> tuple[list[str], list[Folder]]:
+    folder_parent_renamed: list[Folder] = []
     parents, folder_parent_renamed = _rename_host_as_parent(
         oldname,
         newname,
         folder_parent_renamed,
-        Folder.root_folder(),
+        folder_tree().root_folder(),
     )
     return ["parents"] * len(parents), folder_parent_renamed
 
@@ -172,7 +194,7 @@ def _rename_host_in_rulesets(oldname: HostName, newname: HostName) -> list[str]:
     # Rules that explicitely name that host (no regexes)
     changed_rulesets = []
 
-    def rename_host_in_folder_rules(folder: CREFolder) -> None:
+    def rename_host_in_folder_rules(folder: Folder) -> None:
         rulesets = FolderRulesets.load_folder_rulesets(folder)
 
         changed_folder_rulesets = []
@@ -197,14 +219,14 @@ def _rename_host_in_rulesets(oldname: HostName, newname: HostName) -> list[str]:
                 object_ref=folder.object_ref(),
                 sites=folder.all_site_ids(),
             )
-            rulesets.save()
+            rulesets.save_folder()
 
         changed_rulesets.extend(changed_folder_rulesets)
 
         for subfolder in folder.subfolders():
             rename_host_in_folder_rules(subfolder)
 
-    rename_host_in_folder_rules(Folder.root_folder())
+    rename_host_in_folder_rules(folder_tree().root_folder())
     if changed_rulesets:
         actions = []
         unique = set(changed_rulesets)
@@ -212,10 +234,6 @@ def _rename_host_in_rulesets(oldname: HostName, newname: HostName) -> list[str]:
             actions += ["wato_rules"] * changed_rulesets.count(varname)
         return actions
     return []
-
-
-def _rename_host_in_bi(oldname: HostName, newname: HostName) -> list[str]:
-    return BIHostRenamer().rename_host(oldname, newname, get_cached_bi_packs())
 
 
 def _rename_hosts_in_check_mk(
@@ -229,7 +247,13 @@ def _rename_hosts_in_check_mk(
 
         # Restart is done by remote automation (below), so don't do it during rename/sync
         # The sync is automatically done by the remote automation call
-        add_change("renamed-hosts", message, sites=[site_id], need_restart=False)
+        add_change(
+            "renamed-hosts",
+            message,
+            sites=[site_id],
+            need_restart=False,
+            prevent_discard_changes=True,
+        )
 
         new_counts = rename_hosts(
             site_id,
@@ -243,38 +267,37 @@ def _rename_hosts_in_check_mk(
 def _rename_host_in_event_rules(oldname: HostName, newname: HostName) -> list[str]:
     actions = []
 
-    def rename_in_event_rules(rules):
-        num_changed = 0
-        for rule in rules:
-            for key in ["match_hosts", "match_exclude_hosts"]:
-                if rule.get(key):
-                    if rename_host_in_list(rule[key], oldname, newname):
-                        num_changed += 1
-        return num_changed
-
     users = userdb.load_users(lock=True)
     some_user_changed = False
-    for user in users.values():
-        if unrules := user.get("notification_rules"):
-            if num_changed := rename_in_event_rules(unrules):
+    for user_ in users.values():
+        if unrules := user_.get("notification_rules"):
+            if num_changed := rename_in_event_rules(unrules, oldname, newname):
                 actions += ["notify_user"] * num_changed
                 some_user_changed = True
 
-    nrules = load_notification_rules()
-    if num_changed := rename_in_event_rules(nrules):
+    nrules = NotificationRuleConfigFile().load_for_modification()
+    if num_changed := rename_in_event_rules(nrules, oldname, newname):
         actions += ["notify_global"] * num_changed
-        save_notification_rules(nrules)
-
-    if alert_handling:
-        if arules := alert_handling.load_alert_handler_rules():
-            if num_changed := rename_in_event_rules(arules):
-                actions += ["alert_rules"] * num_changed
-                alert_handling.save_alert_handler_rules(arules)
+        NotificationRuleConfigFile().save(nrules)
 
     if some_user_changed:
         userdb.save_users(users, datetime.now())
 
     return actions
+
+
+def rename_in_event_rules(
+    rules: list[dict[str, Any]] | list[EventRule], oldname: HostName, newname: HostName
+) -> int:
+    num_changed = 0
+    for rule in rules:
+        if rule.get("match_hosts"):
+            if rename_host_in_list(rule["match_hosts"], oldname, newname):
+                num_changed += 1
+        if rule.get("match_exclude_hosts"):
+            if rename_host_in_list(rule["match_exclude_hosts"], oldname, newname):
+                num_changed += 1
+    return num_changed
 
 
 def _rename_host_in_multisite(oldname: HostName, newname: HostName) -> list[str]:
@@ -314,16 +337,16 @@ def _rename_host_in_multisite(oldname: HostName, newname: HostName) -> list[str]
 def _rename_host_as_parent(
     oldname: HostName,
     newname: HostName,
-    folder_parent_renamed: list[CREFolder],
-    in_folder: CREFolder,
-) -> tuple[list[HostName | str], list[CREFolder]]:
+    folder_parent_renamed: list[Folder],
+    in_folder: Folder,
+) -> tuple[list[HostName | str], list[Folder]]:
     parents: list[HostName | str] = []
     for somehost in in_folder.hosts().values():
-        if somehost.has_explicit_attribute("parents"):
+        if "parents" in somehost.attributes:
             if somehost.rename_parent(oldname, newname):
                 parents.append(somehost.name())
 
-    if in_folder.has_explicit_attribute("parents"):
+    if "parents" in in_folder.attributes:
         if in_folder.rename_parent(oldname, newname):
             if in_folder not in folder_parent_renamed:
                 folder_parent_renamed.append(in_folder)
@@ -344,8 +367,8 @@ def _merge_action_counts(action_counts: dict[str, int], new_counts: Mapping[str,
         action_counts[key] += count
 
 
-def _group_renamings_by_site(
-    renamings: Iterable[tuple[CREFolder, HostName, HostName]]
+def group_renamings_by_site(
+    renamings: Iterable[tuple[Folder, HostName, HostName]],
 ) -> dict[SiteId, list[tuple[HostName, HostName]]]:
     renamings_per_site: dict[SiteId, list[tuple[HostName, HostName]]] = {}
     for folder, oldname, newname in renamings:
@@ -361,13 +384,13 @@ def _rename_host_in_uuid_link_manager(
 ) -> list[str]:
     n_relinked = 0
     for site_id, renamings in renamings_by_site.items():
-        if site_is_local(site_id):
+        if site_is_local(active_config, site_id):
             n_relinked += len(get_uuid_link_manager().rename(renamings))
         else:
             n_relinked += int(
                 str(
                     do_remote_automation(
-                        get_site_config(site_id),
+                        get_site_config(active_config, site_id),
                         "rename-hosts-uuid-link",
                         [
                             (
@@ -385,7 +408,7 @@ class _RenameHostsUUIDLinkRequest(BaseModel):
     renamings: Sequence[tuple[HostName, HostName]]
 
 
-class AutomationRenameHostsUUIDLink(AutomationCommand):
+class AutomationRenameHostsUUIDLink(AutomationCommand[_RenameHostsUUIDLinkRequest]):
     def command_name(self) -> str:
         return "rename-hosts-uuid-link"
 
@@ -394,3 +417,32 @@ class AutomationRenameHostsUUIDLink(AutomationCommand):
 
     def get_request(self) -> _RenameHostsUUIDLinkRequest:
         return _RenameHostsUUIDLinkRequest(renamings=json.loads(request.get_request()["renamings"]))
+
+
+class RenameHostsBackgroundJob(BackgroundJob):
+    job_prefix = "rename-hosts"
+
+    @classmethod
+    def gui_title(cls) -> str:
+        return _("Host renaming")
+
+    @classmethod
+    def status_checks(cls) -> tuple[bool, bool]:
+        instance = cls.__new__(cls)
+        super(RenameHostsBackgroundJob, instance).__init__(instance.job_prefix)
+        return instance.exists(), instance.is_active()
+
+    def __init__(self) -> None:
+        super().__init__(self.job_prefix)
+
+    def _back_url(self) -> str:
+        return makeuri(request, [])
+
+
+class RenameHostBackgroundJob(RenameHostsBackgroundJob):
+    def __init__(self, host: Host) -> None:
+        super().__init__()
+        self._host = host
+
+    def _back_url(self):
+        return self._host.folder().url()

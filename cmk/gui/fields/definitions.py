@@ -2,7 +2,9 @@
 # Copyright (C) 2020 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
+
 """A few upgraded Fields which handle some OpenAPI validation internally."""
+
 import ast
 import json
 import logging
@@ -10,44 +12,52 @@ import re
 import typing
 import uuid
 import warnings
-from collections.abc import Mapping
-from datetime import datetime
+from collections.abc import Callable, Collection, Mapping
+from datetime import datetime, timezone
 from typing import Any, Literal
 
-import pytz
 from cryptography.x509 import CertificateSigningRequest, load_pem_x509_csr
 from cryptography.x509.oid import NameOID
 from marshmallow import fields as _fields
 from marshmallow import post_load, pre_dump, utils, ValidationError
 from marshmallow_oneofschema import OneOfSchema
 
-import cmk.utils.version as version
-from cmk.utils.exceptions import MKException
+from cmk.ccc import version
+from cmk.ccc.exceptions import MKException
+
+from cmk.utils import paths
+from cmk.utils.hostaddress import HostAddress, HostName
 from cmk.utils.livestatus_helpers.expressions import NothingExpression, QueryExpression
 from cmk.utils.livestatus_helpers.queries import Query
 from cmk.utils.livestatus_helpers.tables import Hostgroups, Hosts, Servicegroups
 from cmk.utils.livestatus_helpers.types import Column, Table
+from cmk.utils.regex import regex, REGEX_ID
 from cmk.utils.tags import TagGroupID, TagID
+from cmk.utils.user import UserId
 
 from cmk.gui import sites
+from cmk.gui.config import builtin_role_ids
+from cmk.gui.customer import customer_api, SCOPE_GLOBAL
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.fields.base import BaseSchema, MultiNested, ValueTypedDictSchema
 from cmk.gui.fields.utils import attr_openapi_schema, ObjectContext, ObjectType, tree_to_expr
-from cmk.gui.groups import GroupName, GroupType, load_group_information
+from cmk.gui.groups import GroupName, GroupType
 from cmk.gui.logged_in import user
+from cmk.gui.permissions import permission_registry
 from cmk.gui.site_config import configured_sites
+from cmk.gui.userdb import load_users
+from cmk.gui.watolib import userroles
+from cmk.gui.watolib.groups_io import load_group_information
 from cmk.gui.watolib.host_attributes import host_attribute
-from cmk.gui.watolib.hosts_and_folders import CREFolder, Folder, Host
+from cmk.gui.watolib.hosts_and_folders import Folder, folder_tree, Host
 from cmk.gui.watolib.passwords import contact_group_choices, password_exists
+from cmk.gui.watolib.sites import site_management_registry
 from cmk.gui.watolib.tags import load_tag_group
 
 from cmk.fields import base, DateTime, validators
 
-if version.is_managed_edition():
-    import cmk.gui.cme.managed as managed  # pylint: disable=no-name-in-module
-
-
 _logger = logging.getLogger(__name__)
+_CONNECTION_ID_PATTERN = "^[-a-z0-9A-Z_]+$"
 
 
 class PythonString(base.String):
@@ -92,7 +102,7 @@ class PythonString(base.String):
 
     """
 
-    def _serialize(self, value, attr, obj, **kwargs) -> str | None:  # type: ignore[no-untyped-def]
+    def _serialize(self, value: str, attr: object, obj: object, **kwargs: Any) -> str:
         return repr(value)
 
     def _deserialize(self, value, attr, data, **kwargs):
@@ -124,6 +134,7 @@ class FolderField(base.String):
 
     def __init__(
         self,
+        pattern=FOLDER_PATTERN,
         **kwargs,
     ):
         if "description" not in kwargs:
@@ -133,7 +144,7 @@ class FolderField(base.String):
             "\n\nPath delimiters can be either `~`, `/` or `\\`. Please use the one most "
             "appropriate for your quoting/escaping needs. A good default choice is `~`."
         )
-        super().__init__(pattern=FOLDER_PATTERN, **kwargs)
+        super().__init__(pattern=pattern, **kwargs)
 
     @classmethod
     def _normalize_folder(cls, folder_id):
@@ -180,7 +191,7 @@ class FolderField(base.String):
         return folder_id
 
     @classmethod
-    def load_folder(cls, folder_id: str) -> CREFolder:
+    def load_folder(cls, folder_id: str) -> Folder:
         def _ishexdigit(hex_string: str) -> bool:
             try:
                 int(hex_string, 16)
@@ -188,13 +199,14 @@ class FolderField(base.String):
             except ValueError:
                 return False
 
+        tree = folder_tree()
         if folder_id == "/":
-            folder = Folder.root_folder()
+            folder = tree.root_folder()
         elif _ishexdigit(folder_id):
-            folder = Folder._by_id(folder_id)
+            folder = tree._by_id(folder_id)
         else:
             folder_id = cls._normalize_folder(folder_id)
-            folder = Folder.folder(folder_id[1:])
+            folder = tree.folder(folder_id[1:])
 
         return folder
 
@@ -207,13 +219,13 @@ class FolderField(base.String):
                 raise self.make_error("not_found", folder_id=value)
         return None
 
-    def _serialize(self, value, attr, obj, **kwargs) -> str | None:  # type: ignore[no-untyped-def]
+    def _serialize(self, value: str, attr: object, obj: object, **kwargs: Any) -> str:
         if isinstance(value, str):
             if not value.startswith("/"):
                 value = f"/{value}"
             return value
 
-        if isinstance(value, CREFolder):
+        if isinstance(value, Folder):
             return "/" + value.path()
 
         raise ValueError(f"Unknown type: {value!r}")
@@ -252,7 +264,7 @@ class NotExprSchema(BaseSchema):
 
     op = base.String(description="The operator. In this case `not`.")
     expr = base.Nested(
-        lambda: ExprSchema(),  # pylint: disable=unnecessary-lambda
+        lambda: ExprSchema(),
         description="The query expression to negate.",
     )
 
@@ -264,13 +276,26 @@ class LogicalExprSchema(BaseSchema):
     # many=True does not work here for some reason.
     expr = base.List(
         base.Nested(
-            lambda *a, **kw: ExprSchema(*a, **kw),  # pylint: disable=unnecessary-lambda
+            lambda *a, **kw: ExprSchema(*a, **kw),
             description="A list of query expressions to combine.",
         )
     )
 
 
-class ExprSchema(OneOfSchema):
+class CmkOneOfSchema(OneOfSchema):
+    context: dict[object, object] = {}
+
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ):
+        context = kwargs.pop("context", {})
+        super().__init__(*args, **kwargs)
+        self.context = context
+
+
+class ExprSchema(CmkOneOfSchema):
     """Top level class for query expression schema
 
     Operators can be one of: AND, OR
@@ -352,13 +377,22 @@ class ExprSchema(OneOfSchema):
 
 
 class _ExprNested(base.Nested):
-    def _load(self, value, data, partial=None):
-        _data = super()._load(value, data, partial=partial)
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ):
+        context = kwargs.pop("context", {})
+        super().__init__(*args, **kwargs)
+        self.context = context
+
+    def _load(self, value, partial=None):
+        _data = super()._load(value, partial=partial)
         return tree_to_expr(_data, table=self.metadata["table"])
 
 
-def query_field(  # type: ignore[no-untyped-def]
-    table: type[Table], required: bool = False, example=None
+def query_field(
+    table: type[Table], required: bool = False, example: str | None = None
 ) -> base.Nested:
     """Returns a Nested ExprSchema Field which validates a Livestatus query.
 
@@ -400,7 +434,7 @@ def query_field(  # type: ignore[no-untyped-def]
     )
 
 
-ColumnTypes = typing.Union[Column, str]
+ColumnTypes = Column | str
 
 
 def column_field(
@@ -408,6 +442,7 @@ def column_field(
     example: list[str],
     required: bool = False,
     mandatory: list[ColumnTypes] | None = None,
+    default: list[Column] | None = None,
 ) -> "_ListOfColumns":
     column_names: list[str] = []
     if mandatory is not None:
@@ -416,13 +451,15 @@ def column_field(
                 column_names.append(col.name)
             else:
                 column_names.append(col)
+    if default is None:
+        default = [getattr(table, col) for col in column_names]
 
     return _ListOfColumns(
         _LiveStatusColumn(table=table, required=required),
         table=table,
         required=required,
         mandatory=column_names,
-        load_default=[getattr(table, col) for col in column_names],
+        load_default=default,
         description=f"The desired columns of the `{table.__tablename__}` table. If left empty, a "
         "default set of columns is used.",
         example=example,
@@ -465,12 +502,12 @@ class _ListOfColumns(base.List):
         "unknown_column": "Unknown default column: {table_name}.{column_name}",
     }
 
-    def __init__(  # type: ignore[no-untyped-def]
+    def __init__(
         self,
         cls_or_instance: _fields.Field | type,
         table: type[Table],
         mandatory: list[str] | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(cls_or_instance, **kwargs)
         self.table = table
@@ -522,7 +559,7 @@ class _LiveStatusColumn(base.String):
         return value
 
 
-HOST_NAME_REGEXP = "^[-0-9a-zA-Z_.]+$"
+HOST_NAME_REGEXP = r"^[-0-9a-zA-Z_.]+\Z"
 
 
 class HostField(base.String):
@@ -531,9 +568,9 @@ class HostField(base.String):
     default_error_messages = {
         "should_exist": "Host not found: {host_name!r}",
         "should_not_exist": "Host {host_name!r} already exists.",
-        "should_be_monitored": "Host {host_name!r} exists, but is not monitored. "
+        "should_be_monitored": "Host {host_name!r} should be monitored but it's not. "
         "Activate the configuration?",
-        "should_not_be_monitored": "Host {host_name!r} exists, but should not be monitored. "
+        "should_not_be_monitored": "Host {host_name!r} should not be monitored but it is. "
         "Activate the configuration?",
         "should_be_cluster": "Host {host_name!r} is not a cluster host, but needs to be.",
         "should_not_be_cluster": "Host {host_name!r} may not be a cluster host, but is.",
@@ -541,23 +578,27 @@ class HostField(base.String):
         "invalid_name": "The provided name for host {host_name!r} is invalid: {invalid_reason!r}",
     }
 
-    def __init__(  # type: ignore[no-untyped-def]
+    def __init__(
         self,
-        example="example.com",
-        pattern=HOST_NAME_REGEXP,
-        required=True,
-        validate=None,
+        example: str = "example.com",
+        pattern: str = HOST_NAME_REGEXP,
+        required: bool = True,
+        validate: Callable[[object], bool] | Collection[Callable[[object], bool]] | None = None,
         should_exist: bool | None = True,
         should_be_monitored: bool | None = None,
         should_be_cluster: bool | None = None,
-        **kwargs,
-    ):
+        skip_validation_on_view: bool = False,
+        permission_type: Literal["setup_write", "setup_read", "monitor"] = "monitor",
+        **kwargs: Any,
+    ) -> None:
         if not should_exist and should_be_cluster is not None:
             raise ValueError("Can't be missing and checking for cluster status!")
 
         self._should_exist = should_exist
         self._should_be_monitored = should_be_monitored
         self._should_be_cluster = should_be_cluster
+        self._skip_validation_on_view = skip_validation_on_view
+        self._permission_type = permission_type
         super().__init__(
             example=example,
             pattern=pattern,
@@ -566,12 +607,43 @@ class HostField(base.String):
             **kwargs,
         )
 
+    def _confirm_user_has_permission(self, host: Host | None) -> None:
+        if self._permission_type == "monitor":
+            return
+
+        if host:
+            host._user_needs_permission("read")
+            if self._permission_type == "setup_write":
+                host._user_needs_permission("write")
+
+        return
+
+    def _deserialize(
+        self,
+        value: Any,
+        attr: str | None,
+        data: typing.Mapping[str, Any] | None,
+        **kwargs: Any,
+    ) -> HostAddress:
+        value = super()._deserialize(value, attr, data, **kwargs)
+        try:
+            return HostAddress(value)
+        except ValueError as e:
+            raise ValidationError(str(e)) from e
+
     def _validate(self, value):
         super()._validate(value)
+        host = Host.host(value)
+        self._confirm_user_has_permission(host)
+
+        if (
+            self._skip_validation_on_view
+            and self.context is not None
+            and self.context.get("object_context") == "view"
+        ):
+            return
 
         # Regex gets checked through the `pattern` of the String instance
-
-        host = Host.host(value)
 
         if self._should_exist is not None:
             if self._should_exist and host is None:
@@ -591,9 +663,6 @@ class HostField(base.String):
                 raise self.make_error("should_not_be_cluster", host_name=value)
 
         if self._should_be_monitored is not None:
-            if host is None:
-                raise self.make_error("should_exist", host_name=value)
-
             monitored = host_is_monitored(value)
             if self._should_be_monitored and not monitored:
                 raise self.make_error("should_be_monitored", host_name=value)
@@ -759,7 +828,7 @@ class HostnameOrIP(base.String):
     def _validate_hostname(self, value: str) -> ValidationError | Literal["pass"]:
         try:
             if self.presence != "ignore" or self.should_be_cluster or self.should_be_monitored:
-                if host := Host.host(value):
+                if host := Host.host(HostName(value)):
                     if self.presence == "should_not_exist":
                         raise self.make_error("should_not_exist", host_name=value)
 
@@ -808,14 +877,12 @@ class CustomHostAttributes(ValueTypedDictSchema):
     )
 
     @post_load
-    def _valid(  # type: ignore[no-untyped-def]
-        self, data: dict[str, Any], **kwargs
-    ) -> dict[str, Any]:
+    def _valid(self, data: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         # NOTE
         # If an attribute gets deleted AFTER it has already been set to a host or a folder,
         # then this would break here. We therefore can't validate outbound data as thoroughly
         # because our own data can be inherently inconsistent.
-        if self.context["direction"] == "outbound":  # pylint: disable=no-else-return
+        if self.context["direction"] == "outbound":
             return validate_custom_host_attributes(data, "warn")
         else:
             return validate_custom_host_attributes(data, "raise")
@@ -825,7 +892,6 @@ class TagGroupAttributes(ValueTypedDictSchema):
     """Schema to validate tag groups
 
     Examples:
-
         >>> schema = TagGroupAttributes()
         >>> schema.load({"foo": "bar"})
         Traceback (most recent call last):
@@ -890,9 +956,7 @@ class TagGroupAttributes(ValueTypedDictSchema):
         return allowed_ids
 
     @pre_dump
-    def _pre_dump(  # type: ignore[no-untyped-def]
-        self, data: dict[str, str], **kwargs
-    ) -> dict[str, str]:
+    def _pre_dump(self, data: dict[str, str], **kwargs: Any) -> dict[str, str]:
         rv: dict[str, str] = {}
         for key, value in data.items():
             allowed_ids = self._validate_tag_group(key)
@@ -905,9 +969,7 @@ class TagGroupAttributes(ValueTypedDictSchema):
         return rv
 
     @post_load
-    def _post_load(  # type: ignore[no-untyped-def]
-        self, data: dict[str, str], **kwargs
-    ) -> dict[str, str]:
+    def _post_load(self, data: dict[str, str], **kwargs: Any) -> dict[str, str]:
         rv: dict[str, str] = {}
         for key, value in data.items():
             allowed_ids = self._validate_tag_group(key)
@@ -964,7 +1026,7 @@ def host_attributes_field(
 
     return MultiNested(
         [
-            attr_openapi_schema(object_type, object_context),
+            lambda: attr_openapi_schema(object_type, object_context),
             CustomHostAttributes,
             TagGroupAttributes,
         ],
@@ -989,7 +1051,7 @@ class SiteField(base.String):
     def __init__(
         self,
         presence: Literal[
-            "should_exist", "should_not_exist", "might_not_exist", "ignore"
+            "should_exist", "should_not_exist", "might_not_exist_on_view", "ignore"
         ] = "should_exist",
         allow_all_value: bool = False,
         **kwargs: Any,
@@ -1002,10 +1064,14 @@ class SiteField(base.String):
         if self.allow_all_value and value == "all":
             return
 
-        if self.presence == "might_not_exist":
+        if (
+            self.presence == "might_not_exist_on_view"
+            and self.context is not None
+            and self.context["object_context"] == "view"
+        ):
             return
 
-        if self.presence == "should_exist":
+        if self.presence in ["should_exist", "might_not_exist_on_view"]:
             if value not in configured_sites().keys():
                 raise self.make_error("should_exist", site=value)
 
@@ -1014,15 +1080,9 @@ class SiteField(base.String):
                 raise self.make_error("should_not_exist", site=value)
 
     def _serialize(self, value, attr, obj, **kwargs):
-        if self.presence == "might_not_exist" and value not in configured_sites().keys():
+        if self.presence == "might_not_exist_on_view" and value not in configured_sites().keys():
             return "Unknown Site: " + value
         return super()._serialize(value, attr, obj, **kwargs)
-
-
-def customer_field(**kw):
-    if version.is_managed_edition():
-        return _CustomerField(**kw)
-    return None
 
 
 class _CustomerField(base.String):
@@ -1034,16 +1094,16 @@ class _CustomerField(base.String):
         "should_not_exist": "Customer {customer!r} already exists.",
     }
 
-    def __init__(  # type: ignore[no-untyped-def]
+    def __init__(
         self,
-        example="provider",
-        description="By specifying a customer, you configure on which sites the user object will be "
+        example: str = "provider",
+        description: str = "By specifying a customer, you configure on which sites the user object will be "
         "available. 'global' will make the object available on all sites.",
-        required=True,
-        validate=None,
-        allow_global=True,
+        required: bool = True,
+        validate: Callable[[object], bool] | Collection[Callable[[object], bool]] | None = None,
+        allow_global: bool = True,
         should_exist: bool = True,
-        **kwargs,
+        **kwargs: Any,
     ):
         self._should_exist = should_exist
         self._allow_global = allow_global
@@ -1058,20 +1118,32 @@ class _CustomerField(base.String):
     def _validate(self, value):
         super()._validate(value)
         if value == "global":
-            value = managed.SCOPE_GLOBAL
+            value = SCOPE_GLOBAL
 
         if not self._allow_global and value is None:
             raise self.make_error("invalid_global")
 
-        included = value in managed.customer_collection()
+        included = value in customer_api().customer_collection()
         if self._should_exist and not included:
-            raise self.make_error("should_exist", host_name=value)
+            raise self.make_error("should_exist", customer=value)
         if not self._should_exist and included:
-            raise self.make_error("should_not_exist", host_name=value)
+            raise self.make_error("should_not_exist", customer=value)
 
     def _deserialize(self, value, attr, data, **kwargs):
         value = super()._deserialize(value, attr, data, **kwargs)
         return None if value == "global" else value
+
+
+def customer_field(**kw: Any) -> _CustomerField | None:
+    if version.edition(paths.omd_root) is version.Edition.CME:
+        return _CustomerField(**kw)
+    return None
+
+
+def customer_field_response(**kw: Any) -> _CustomerField | None:
+    if "description" not in kw:
+        kw["description"] = "The customer for which the object is configured."
+    return customer_field(**kw)
 
 
 def verify_group_exists(group_type: GroupType, name: GroupName) -> bool:
@@ -1089,17 +1161,18 @@ class GroupField(base.String):
         "Activate the configuration?",
         "should_not_be_monitored": "Group {host_name!r} exists, but should not be monitored. "
         "Activate the configuration?",
+        "invalid_name": "The provided name {name!r} is invalid",
     }
 
-    def __init__(  # type: ignore[no-untyped-def]
+    def __init__(
         self,
-        group_type,
-        example,
-        required=True,
-        validate=None,
+        group_type: Literal["host", "service", "contact"],
+        example: str,
+        required: bool = True,
+        validate: Callable[[object], bool] | Collection[Callable[[object], bool]] | None = None,
         should_exist: bool = True,
         should_be_monitored: bool | None = None,
-        **kwargs,
+        **kwargs: Any,
     ):
         self._group_type = group_type
         self._should_exist = should_exist
@@ -1137,18 +1210,19 @@ class PasswordIdent(base.String):
     """A field representing a password identifier"""
 
     default_error_messages = {
+        "pattern": "{name!r} does not match pattern. An identifier must only consist of letters, digits, dash and underscore and it must start with a letter or underscore.",
         "should_exist": "Identifier missing: {name!r}",
         "should_not_exist": "Identifier {name!r} already exists.",
         "contains_colon": "Identifier {name!r} contains a colon.",
     }
 
-    def __init__(  # type: ignore[no-untyped-def]
+    def __init__(
         self,
-        example,
-        required=True,
-        validate=None,
+        example: str,
+        required: bool = True,
+        validate: Callable[[object], bool] | Collection[Callable[[object], bool]] | None = None,
         should_exist: bool = True,
-        **kwargs,
+        **kwargs: Any,
     ):
         self._should_exist = should_exist
         super().__init__(
@@ -1158,11 +1232,12 @@ class PasswordIdent(base.String):
             **kwargs,
         )
 
-    def _validate(self, value: str):  # type: ignore[no-untyped-def]
+    def _validate(self, value: str) -> None:
         super()._validate(value)
 
-        if ":" in value:
-            raise self.make_error("contains_colon", name=value)
+        pattern: re.Pattern[str] = regex(REGEX_ID, re.ASCII)
+        if pattern.match(value) is None:
+            raise self.make_error("pattern", name=value)
 
         exists = password_exists(value)
         if self._should_exist and not exists:
@@ -1172,11 +1247,11 @@ class PasswordIdent(base.String):
             raise self.make_error("should_not_exist", name=value)
 
 
-class PasswordOwner(base.String):
-    """A field representing a password owner group"""
+class PasswordEditableBy(base.String):
+    """A field representing which group can edit a password"""
 
     default_error_messages = {
-        "invalid": "Specified owner value is not valid: {name!r}",
+        "invalid": "Specified contact group does not exist or you do not have the necessary permissions: {name!r}",
     }
 
     def __init__(
@@ -1194,17 +1269,18 @@ class PasswordOwner(base.String):
         )
 
     def _validate(self, value):
-        """Verify if the specified owner is valid for the logged-in user
+        """Verify if the specified editor is valid for the logged-in user
 
-        Non-admin users cannot specify admin as the owner
-
+        Non-admin users cannot specify admin as the editor
         """
         super()._validate(value)
-        permitted_owners = [group[0] for group in contact_group_choices(only_own=True)]
         if user.may("wato.edit_all_passwords"):
-            permitted_owners.append("admin")
+            permitted_group_ids = [group[0] for group in contact_group_choices(only_own=False)]
+            permitted_group_ids.append("admin")
+        else:
+            permitted_group_ids = [group[0] for group in contact_group_choices(only_own=True)]
 
-        if value not in permitted_owners:
+        if value not in permitted_group_ids:
             raise self.make_error("invalid", name=value)
 
 
@@ -1237,8 +1313,7 @@ class PasswordShare(base.String):
 
 
 def from_timestamp(value: float) -> datetime:
-    stamp = datetime.utcfromtimestamp(value)
-    return stamp.replace(tzinfo=pytz.utc)
+    return datetime.fromtimestamp(value, tz=timezone.utc)
 
 
 def to_timestamp(value: datetime) -> float:
@@ -1308,6 +1383,8 @@ class X509ReqPEMFieldUUID(base.String):
             raise self.make_error("invalid")
         try:
             cn = value.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+            if isinstance(cn, bytes):
+                cn = cn.decode()
         except IndexError:
             raise self.make_error("no_cn")
         try:
@@ -1318,8 +1395,8 @@ class X509ReqPEMFieldUUID(base.String):
         except ValueError:
             raise self.make_error("cn_no_uuid", cn=cn)
 
-    def _deserialize(  # type: ignore[no-untyped-def]
-        self, value, attr, data, **kwargs
+    def _deserialize(
+        self, value: object, attr: object, data: object, **kwargs: Any
     ) -> CertificateSigningRequest:
         try:
             return load_pem_x509_csr(
@@ -1336,24 +1413,227 @@ class X509ReqPEMFieldUUID(base.String):
             raise self.make_error("malformed")
 
 
+class UserRoleID(base.String):
+    default_error_messages = {
+        "should_not_exist": "The role should not exist but it does: {role!r}",
+        "should_exist": "The role should exist but it doesn't: {role!r}",
+        "should_be_custom": "The role should be a custom role but it's not: {role!r}",
+        "should_be_builtin": "The role should be a builtin role but it's not: {role!r}",
+    }
+
+    def __init__(
+        self,
+        presence: Literal["should_exist", "should_not_exist", "ignore"] = "ignore",
+        userrole_type: Literal["should_be_custom", "should_be_builtin", "ignore"] = "ignore",
+        required: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(required=required, **kwargs)
+        self.presence = presence
+        self.userrole_type = userrole_type
+
+    def _validate(self, value: str) -> None:
+        super()._validate(value)
+
+        if self.presence == "should_not_exist":
+            if userroles.role_exists(userroles.RoleID(value)):
+                raise self.make_error("should_not_exist", role=value)
+
+        elif self.presence == "should_exist":
+            if not userroles.role_exists(userroles.RoleID(value)):
+                raise self.make_error("should_exist", role=value)
+
+        if self.userrole_type == "should_be_builtin":
+            if value not in builtin_role_ids:
+                raise self.make_error("should_be_builtin", role=value)
+
+        elif self.userrole_type == "should_be_custom":
+            if value in builtin_role_ids:
+                raise self.make_error("should_be_custom", role=value)
+
+
+class PermissionField(base.String):
+    default_error_messages = {
+        "invalid_permission": "The specified permission name doesn't exist: {value!r}",
+    }
+
+    def __init__(
+        self,
+        required: bool = True,
+        validate: Callable[[object], bool] | Collection[Callable[[object], bool]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            example="general.edit_profile",
+            description="The name of a permission",
+            required=required,
+            validate=validate,
+            **kwargs,
+        )
+
+    def _validate(self, value: str) -> None:
+        super()._validate(value)
+        if value not in permission_registry:
+            raise self.make_error("invalid_permission", value=value)
+
+
+class Username(base.String):
+    default_error_messages = {
+        "should_exist": "Username missing: {username!r}",
+        "should_not_exist": "Username {username!r} already exists",
+        "invalid_name": "Username {username!r} is not a valid checkmk username",
+    }
+
+    def __init__(
+        self,
+        example: str,
+        required: bool = True,
+        validate: Callable[[object], bool] | Collection[Callable[[object], bool]] | None = None,
+        should_exist: bool = True,
+        **kwargs: Any,
+    ):
+        self._should_exist = should_exist
+        super().__init__(
+            example=example,
+            required=required,
+            validate=validate,
+            **kwargs,
+        )
+
+    def _validate(self, value):
+        super()._validate(value)
+        user.need_permission("wato.users")
+
+        try:
+            UserId(value)
+        except ValueError:
+            raise self.make_error("invalid_name", username=value)
+
+        # TODO: change to names list only
+        usernames = load_users()
+        if self._should_exist and value not in usernames:
+            raise self.make_error("should_exist", username=value)
+        if not self._should_exist and value in usernames:
+            raise self.make_error("should_not_exist", username=value)
+
+
+class ConnectionIdentifier(base.String):
+    default_error_messages = {
+        "should_exist": "ConnectionId missing: {connection_id!r}",
+        "should_not_exist": "ConnectionId {connection_id!r} already exists",
+        "invalid_name": "ConnectionId {connection_id!r} is not a valid checkmk ConnectionId",
+    }
+
+    def __init__(
+        self,
+        example: str,
+        required: bool = True,
+        validate: Callable[[object], bool] | Collection[Callable[[object], bool]] | None = None,
+        presence: Literal["should_exist", "should_not_exist", "ignore"] = "ignore",
+        **kwargs: Any,
+    ):
+        self._presence = presence
+        super().__init__(
+            example=example,
+            required=required,
+            validate=validate,
+            pattern=_CONNECTION_ID_PATTERN,
+            **kwargs,
+        )
+
+    def _validate(self, value):
+        super()._validate(value)
+        user.need_permission("wato.sites")
+
+        site_mgmt = site_management_registry["site_management"]
+        exists = site_mgmt.broker_connection_id_exists(value)
+        if self._presence == "should_exist" and not exists:
+            raise self.make_error("should_exist", connection_id=value)
+        if self._presence == "should_not_exist" and exists:
+            raise self.make_error("should_not_exist", connection_id=value)
+
+
+class FolderIDField(FolderField):
+    """This field represents a folder's path.
+
+    On deserialize, it will also check if the folder exists and will return
+    the path with format 'path/to/folder' or in the case of the main folder,
+    it will return ''.
+
+    e.g.
+    'path~to~folder' -> 'path/to/folder
+    '~' -> ''
+
+    On serialize, it will take the folder path str and replace all / for
+    a ~. The root folder will be returned as '~'.
+
+    e.g.
+    'path/to/folder' -> 'path~to~folder
+    '' -> '~'
+
+    """
+
+    default_error_messages = {
+        "should_exist": "The folder id {folder_id!r} should exist but it doesn't.",
+        "should_not_exist": "The folder id {folder_id!r} should not exist but it does.",
+    }
+
+    def __init__(
+        self,
+        presence: Literal[
+            "should_exist",
+            "should_not_exist",
+            "ignore",
+        ] = "ignore",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.presence = presence
+
+    def _deserialize(self, value: str, attr: object, data: object, **kwargs: Any) -> str | None:
+        folder: Folder | None = None
+        try:
+            folder = super()._deserialize(value, attr, data)
+        except ValidationError:
+            if self.presence == "should_exist":
+                raise self.make_error("should_exist", folder_id=value)
+
+        if self.presence == "should_not_exist" and folder is not None:
+            raise self.make_error("should_not_exist", folder_id=value)
+
+        if folder is None:
+            return None
+
+        return folder.path()
+
+    def _serialize(self, value: str, attr: object, obj: object, **kwargs: Any) -> str:
+        folder_path = super()._serialize(value, attr, obj, **kwargs)
+        return folder_path.replace("/", "~")
+
+
 __all__ = [
     "host_attributes_field",
     "column_field",
     "customer_field",
+    "customer_field_response",
     "DateTime",
     "ExprSchema",
     "FolderField",
+    "FolderIDField",
     "FOLDER_PATTERN",
     "GroupField",
     "HostField",
     "HostnameOrIP",
     "MultiNested",
+    "PasswordEditableBy",
     "PasswordIdent",
-    "PasswordOwner",
     "PasswordShare",
+    "PermissionField",
     "PythonString",
     "query_field",
     "SiteField",
     "Timestamp",
+    "Username",
+    "UserRoleID",
     "X509ReqPEMFieldUUID",
 ]

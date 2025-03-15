@@ -24,7 +24,7 @@ version of pymongo (at least 2.8).
 
 """
 
-__version__ = "2.3.0b1"
+__version__ = "2.5.0b1"
 
 import argparse
 import configparser
@@ -38,13 +38,8 @@ from collections import defaultdict
 from urllib.parse import quote_plus
 
 try:
-    from typing import (  # noqa: F401 # pylint: disable=unused-import
-        Any,
-        Dict,
-        Iterable,
-        List,
-        Union,
-    )
+    from collections.abc import Iterable  # noqa: F401
+    from typing import Any  # noqa: F401
 except ImportError:
     pass
 
@@ -74,7 +69,7 @@ def get_database_info(client):
     else:
         db_names = []
 
-    databases = defaultdict(dict)  # type: Dict[str, Dict[str, Any]]
+    databases = defaultdict(dict)  # type: dict[str, dict[str, Any]]
     for name in db_names:
         database = client[name]
         databases[name]["collections"] = list(get_collection_names(database))
@@ -87,7 +82,7 @@ def get_database_info(client):
 
 def get_collection_names(database):  # type:(pymongo.database.Database) -> Iterable[str]
     if PYMONGO_VERSION <= (3, 6, 0):
-        collection_names = database.collection_names()  # type: List[str]
+        collection_names = database.collection_names()  # type: list[str]
     else:
         collection_names = database.list_collection_names()
 
@@ -799,7 +794,7 @@ class MongoDBConfigParser(configparser.ConfigParser):
         else:
             with open(filename, "r") as cfg:
                 if sys.version_info[0] == 2:
-                    self.readfp(cfg)  # pylint: disable=deprecated-method
+                    self.readfp(cfg)
                 else:
                     self.read_file(cfg)
             LOGGER.info("read configuration file %r", filename)
@@ -837,7 +832,7 @@ class Config:
         self.password = config.get_mongodb_str("password")
 
     def get_pymongo_config(self):
-        # type:() -> Dict[str, Union[str, bool]]
+        # type:() -> dict[str, str | bool]
         """
         return config for latest pymongo (3.12.X)
         """
@@ -901,7 +896,7 @@ class PyMongoConfigTransformer:
         return pymongo_config
 
     def _transform_tls_to_ssl(self, pymongo_config):
-        # type:(Dict[str, Union[str, bool]]) -> Dict[str, Union[str, bool]]
+        # type:(dict[str, str | bool]) -> dict[str, str | bool]
         if pymongo_config.get("tlsInsecure") is True:
             sys.stdout.write("<<<mongodb_instance:sep(9)>>>\n")
             sys.stdout.write(
@@ -924,7 +919,7 @@ class PyMongoConfigTransformer:
         return pymongo_config
 
     def _transform_credentials_to_uri(self, pymongo_config):
-        # type:(Dict[str, Union[str, bool]]) -> Dict[str, Union[str, bool]]
+        # type:(dict[str, str | bool]) -> dict[str, str | bool]
         username = pymongo_config.pop("username", None)
         password = pymongo_config.pop("password", None)
         host = pymongo_config.pop("host", "localhost")
@@ -970,7 +965,7 @@ def main(argv=None):
     client = pymongo.MongoClient(**pymongo_config)  # type: pymongo.MongoClient
     try:
         # connecting is lazy, it might fail only now
-        server_status = client.admin.command("serverStatus")  # type: Dict
+        server_status = client.admin.command("serverStatus")  # type: dict
     except (pymongo.errors.OperationFailure, pymongo.errors.ConnectionFailure) as e:
         sys.stdout.write("<<<mongodb_instance:sep(9)>>>\n")
         sys.stdout.write("error\tFailed to connect\n")

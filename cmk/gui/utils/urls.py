@@ -10,6 +10,8 @@ from enum import Enum
 from functools import lru_cache
 from typing import assert_never, Literal
 
+from flask import session
+
 from cmk.gui.exceptions import MKNotFound
 from cmk.gui.http import Request
 from cmk.gui.i18n import _
@@ -20,9 +22,7 @@ from cmk.gui.utils.transaction_manager import TransactionManager
 
 QueryVars = Mapping[str, Sequence[str]]
 
-_ALWAYS_SAFE = frozenset(
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZ" b"abcdefghijklmnopqrstuvwxyz" b"0123456789" b"_.-~" b" "
-)
+_ALWAYS_SAFE = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-~ ")
 _ALWAYS_SAFE_BYTES = bytes(_ALWAYS_SAFE)
 _QUOTED = {b: chr(b) if b in _ALWAYS_SAFE else f"%{b:02X}" for b in range(256)}
 
@@ -147,14 +147,12 @@ def _file_name_from_path(
         # If we have a "normal" url and not an excessive amount of paths (probably a duplication)
         # and the last part is empty, we have an "index" URL.
         result = "index"
+    elif on_error == "raise":
+        raise MKNotFound("Not found")
+    elif on_error == "ignore":
+        result = default
     else:
-        if on_error == "raise":  # pylint: disable=no-else-raise
-            raise MKNotFound("Not found")
-        elif on_error == "ignore":
-            result = default
-        else:
-            assert_never(on_error)
-            raise RuntimeError("To make pylint happy")
+        assert_never(on_error)
 
     return result
 
@@ -173,16 +171,15 @@ def requested_file_name(
 
     Examples:
 
-        >>> from unittest.mock import Mock
-        >>> requested_file_name(Mock(path="/dev/check_mk/foo_bar.py"))
+        >>> requested_file_name(Request({"PATH_INFO": "/dev/check_mk/foo_bar.py"}))
         'foo_bar'
 
-        >>> requested_file_name(Mock(path="/dev/check_mk/foo_bar.py/"), on_error="raise")
+        >>> requested_file_name(Request({"PATH_INFO": "/dev/check_mk/foo_bar.py/"}), on_error="raise")
         Traceback (most recent call last):
         ...
         cmk.gui.exceptions.MKNotFound: Not found
 
-        >>> requested_file_name(Mock(path="/dev/check_mk/foo_bar.py/foo"), on_error="raise")
+        >>> requested_file_name(Request({"PATH_INFO": "/dev/check_mk/foo_bar.py/foo"}), on_error="raise")
         Traceback (most recent call last):
         ...
         cmk.gui.exceptions.MKNotFound: Not found
@@ -194,7 +191,7 @@ def requested_file_name(
 def requested_file_with_query(request: Request) -> str:
     """Returns a string containing the requested file name and query to be used in hyperlinks"""
     file_name = requested_file_name(request)
-    query = request.query_string.decode(request.charset)
+    query = request.query_string.decode("utf-8")
     return f"{file_name}.py?{query}"
 
 
@@ -240,12 +237,11 @@ def makeactionuri(
     filename: str | None = None,
     delvars: Sequence[str] | None = None,
 ) -> str:
-    return makeuri(
-        request,
-        addvars + [("_transid", transaction_manager.get())],
-        filename=filename,
-        delvars=delvars,
-    )
+    session_vars: HTTPVariables = [("_transid", transaction_manager.get())]
+    if session and hasattr(session, "session_info"):
+        session_vars.append(("_csrf_token", session.session_info.csrf_token))
+
+    return makeuri(request, addvars + session_vars, filename=filename, delvars=delvars)
 
 
 def makeactionuri_contextless(
@@ -254,11 +250,11 @@ def makeactionuri_contextless(
     addvars: HTTPVariables,
     filename: str | None = None,
 ) -> str:
-    return makeuri_contextless(
-        request,
-        addvars + [("_transid", transaction_manager.get())],
-        filename=filename,
-    )
+    session_vars: HTTPVariables = [("_transid", transaction_manager.get())]
+    if session and hasattr(session, "session_info"):
+        session_vars.append(("_csrf_token", session.session_info.csrf_token))
+
+    return makeuri_contextless(request, addvars + session_vars, filename=filename)
 
 
 def makeuri_contextless_rulespec_group(
@@ -326,11 +322,10 @@ def _make_customized_confirm_link(
 ) -> str:
     return "javascript:cmk.forms.confirm_link({}, {}, {}),cmk.popup_menu.close_popup()".format(
         json.dumps(quote_plus(url)),
-        json.dumps(escape_text(message)),
+        json.dumps(escape_text(message, escape_links=True)),
         json.dumps(
             {
-                "title": title,
-                "html": message,
+                "title": escape_text(title, escape_links=True),
                 "confirmButtonText": confirm_button,
                 "cancelButtonText": cancel_button,
                 "icon": icon if icon else "question",
@@ -399,7 +394,9 @@ class DocReference(Enum):
     AGENT_WINDOWS = "agent_windows"
     ALERT_HANDLERS = "alert_handlers"
     ANALYZE_CONFIG = "analyze_configuration"
+    ANALYZE_NOTIFICATIONS = "notifications#_rule_evaluation_by_the_notification_module"
     AWS = "monitoring_aws"
+    AWS_MANUAL_VM = "monitoring_aws#_manually_creating_hosts_for_ec2_instances"
     AZURE = "monitoring_azure"
     BACKUPS = "backup"
     BI = "bi"  # Business Intelligence
@@ -411,26 +408,29 @@ class DocReference(Enum):
     DASHBOARD_HOST_PROBLEMS = "dashboards#host_problems"
     DASHBOARDS = "dashboards"
     DCD = "dcd"  # dynamic host configuration
-    DEVEL_CHECK_PLUGINS = "devel_check_plugins"
+    DEVEL_CHECK_PLUGINS = "devel_intro"
     DIAGNOSTICS = "support_diagnostics"
+    DIAGNOSTICS_CLI = "support_diagnostics#commandline"
     DISTRIBUTED_MONITORING = "distributed_monitoring"
     EVENTCONSOLE = "ec"
     FORECAST_GRAPH = "forecast_graphs"
     GCP = "monitoring_gcp"
+    GCP_MANUAL_VM = "monitoring_gcp#_manually_creating_hosts_for_vm_instances"
     GRAPHING_RRDS = "graphing#rrds"
     HOST_TAGS = "host_tags"
     INFLUXDB_CONNECTIONS = "metrics_exporter"
-    # TODO: Check whether these anchors on the intro page exist and fix/remove broken ones.
-    INTRO_CREATING_FOLDERS = "intro#Creating folders"
-    INTRO_FOLDERS = "intro#folders"
-    INTRO_LINUX = "intro#linux"
-    INTRO_SERVICES = "intro#services"
-    INTRO_WELCOME = "intro_welcome"
+    INTRO_CREATING_FOLDERS = "intro_setup_monitor#folders"
+    INTRO_FOLDERS = "intro_setup_monitor#folders"
+    INTRO_LINUX = "intro_setup_monitor#linux"
+    INTRO_SERVICES = "intro_setup_monitor#services"
+    INTRO_WELCOME = "welcome"
+    INTRO_SETUP = "intro_setup"
     KUBERNETES = "monitoring_kubernetes"
     LICENSING = "license"
     LDAP = "ldap"
     MKPS = "mkps"
     NOTIFICATIONS = "notifications"
+    NTOPNG_CONNECT = "ntop#ntop_connect"
     PIGGYBACK = "piggyback"
     PROMETHEUS = "monitoring_prometheus"
     REGEXES = "regexes"
@@ -438,15 +438,17 @@ class DocReference(Enum):
     REPORTS = "reporting"
     SLA_CONFIGURATION = "sla"
     TIMEPERIODS = "timeperiods"
+    TEST_NOTIFICATIONS = "notifications#notification_testing"
     USER_INTERFACE = "user_interface"
     VIEWS = "views"
     VMWARE = "monitoring_vmware"
     WATO_AGENTS = "wato_monitoringagents"
     WATO_HOSTS = "wato_hosts"
     WATO_RULES = "wato_rules"
-    WATO_RULES_DEPCRECATED = "wato_rules#_obsolete_rule_sets"
-    WATO_RULES_INEFFECTIVE = "wato_rules#_ineffective_rules"
+    WATO_RULES_DEPCRECATED = "wato_rules#obsolete_rule_sets"
     WATO_RULES_IN_USE = "wato_rules#_rule_sets_in_use"
+    WATO_RULES_INEFFECTIVE = "wato_rules#ineffective_rules"
+    WATO_RULES_LABELS = "wato_rules#_labels"
     WATO_SERVICES = "wato_services"
     WATO_SERVICES_ENFORCED_SERVICES = "wato_services#enforced_services"
     WATO_USER = "wato_user"
@@ -459,11 +461,12 @@ class DocReference(Enum):
 
 def doc_reference_url(doc_ref: DocReference | None = None) -> str:
     base = user.get_docs_base_url()
+    origin = "?origin=checkmk"
     if doc_ref is None:
-        return base
+        return base + origin
     if "#" not in doc_ref.value:
-        return f"{base}/{doc_ref.value}.html"
-    return f"{base}/{doc_ref.value.replace('#', '.html#', 1)}"
+        return f"{base}/{doc_ref.value}.html{origin}"
+    return f"{base}/{doc_ref.value.replace('#', f'.html{origin}#', 1)}"
 
 
 class YouTubeReference(Enum):
@@ -483,3 +486,14 @@ def youtube_reference_url(youtube_ref: YouTubeReference | None = None) -> str:
     if youtube_ref is None:
         return "https://youtube.com/@checkmk-channel"
     return "https://youtu.be/%s" % youtube_ref.value
+
+
+class WerkReference(Enum):
+    DECOMMISSION_V1_API = 17201
+
+    def ref(self) -> str:
+        return f"Werk #{self.value}"
+
+
+def werk_reference_url(werk: WerkReference) -> str:
+    return f"https://checkmk.com/werk/{werk.value}"

@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator, Mapping, Sequence
-from typing import NamedTuple, NewType, TypedDict
+from typing import NamedTuple, NewType, NotRequired, TypedDict
 
-from cmk.utils.exceptions import MKGeneralException
-from cmk.utils.i18n import _
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.ccc.i18n import _
 
 TagID = NewType("TagID", str)
 TagGroupID = NewType("TagGroupID", str)
+TAG_GROUP_NAME_PATTERN = r"^\A[-a-z0-9A-Z_]*\Z"
 
 
 class GroupedTagSpec(TypedDict):
@@ -23,25 +24,19 @@ class GroupedTagSpec(TypedDict):
     aux_tags: list[TagID]
 
 
-class _AuxTagSpecOpt(TypedDict, total=False):
-    topic: str
-    help: str
-
-
-class AuxTagSpec(_AuxTagSpecOpt):
+class AuxTagSpec(TypedDict):
     id: TagID
     title: str
+    topic: NotRequired[str]
+    help: NotRequired[str]
 
 
-class _TagGroupSpecOpt(TypedDict, total=False):
-    topic: str
-    help: str
-
-
-class TagGroupSpec(_TagGroupSpecOpt):
+class TagGroupSpec(TypedDict):
     id: TagGroupID
     title: str
     tags: list[GroupedTagSpec]
+    topic: NotRequired[str]
+    help: NotRequired[str]
 
 
 class TagConfigSpec(TypedDict):
@@ -61,14 +56,13 @@ def get_effective_tag_config(tag_config: TagConfigSpec) -> TagConfig:
 
 
 def _validate_tag_id(tag_id: TagID | TagGroupID) -> None:
-    if not re.match("^[-a-z0-9A-Z_]*$", tag_id):
+    if not re.match(TAG_GROUP_NAME_PATTERN, tag_id):
         raise MKGeneralException(
             _("Invalid tag ID. Only the characters a-z, A-Z, 0-9, _ and - are allowed.")
         )
 
 
-class AuxTagInUseError(Exception):
-    ...
+class AuxTagInUseError(Exception): ...
 
 
 class AuxTag:
@@ -86,7 +80,7 @@ class AuxTag:
         tag_id: TagID,
         title: str,
         topic: str | None,
-        help: str | None,  # pylint: disable=redefined-builtin
+        help: str | None,
     ) -> None:
         self.id = tag_id
         self.title = title
@@ -103,9 +97,7 @@ class AuxTag:
 
     @property
     def choice_title(self) -> str:
-        if self.topic:
-            return f"{self.topic} / {self.title}"
-        return self.title
+        return f"{self.topic} / {self.title}" if self.topic else self.title
 
     def validate(self) -> None:
         if not self.id:
@@ -167,6 +159,11 @@ class AuxTagList:
                     _('You can not override the builtin auxiliary tag "%s".') % aux_tag.id
                 )
 
+            if builtin_config.tag_group_exists(TagGroupID(aux_tag.id)):
+                raise MKGeneralException(
+                    _('You can not override the builtin tag group "%s".') % aux_tag.id
+                )
+
             if aux_tag.id in seen:
                 raise MKGeneralException(_('Duplicate tag ID "%s" in auxiliary tags') % aux_tag.id)
 
@@ -189,10 +186,7 @@ class AuxTagList:
         return {tag.id for tag in self._tags}
 
     def get_dict_format(self) -> list[AuxTagSpec]:
-        response = []
-        for tag in self._tags:
-            response.append(tag.to_config())
-        return response
+        return [tag.to_config() for tag in self._tags]
 
     def get_choices(self) -> Sequence[tuple[str, str]]:
         return [(aux_tag.id, aux_tag.title) for aux_tag in self._tags]
@@ -243,7 +237,7 @@ class TagGroup:
         group_id: TagGroupID,
         title: str,
         topic: str | None,
-        help: str | None,  # pylint: disable=redefined-builtin
+        help: str | None,
         tags: list[GroupedTag],
     ) -> None:
         self.id = group_id
@@ -254,9 +248,7 @@ class TagGroup:
 
     @property
     def choice_title(self) -> str:
-        if self.topic:
-            return f"{self.topic} / {self.title}"
-        return self.title
+        return f"{self.topic} / {self.title}" if self.topic else self.title
 
     @property
     def is_checkbox_tag_group(self) -> bool:
@@ -285,10 +277,7 @@ class TagGroup:
         return response
 
     def get_tag_choices(self) -> Sequence[tuple[TagID | None, str]]:
-        choices = []
-        for tag in self.tags:
-            choices.append((tag.id, tag.title))
-        return choices
+        return [(tag.id, tag.title) for tag in self.tags]
 
     def get_tag_group_config(self, value: TagID | None) -> Mapping[TagGroupID, TagID]:
         """Return the set of tag groups which should be set for a host based on the given value"""
@@ -301,7 +290,7 @@ class TagGroup:
         for grouped_tag in self.tags:
             if grouped_tag.id == value:
                 # We need to convert here.  Typing smell?
-                tag_groups.update({TagGroupID(t): t for t in grouped_tag.aux_tag_ids})
+                tag_groups |= {TagGroupID(t): t for t in grouped_tag.aux_tag_ids}
 
         return tag_groups
 
@@ -340,13 +329,11 @@ class TagConfig:
     def get_topic_choices(self) -> Sequence[tuple[str, str]]:
         names = set()
         for tag_group in self.tag_groups:
-            topic = tag_group.topic or _("Tags")
-            if topic:
+            if topic := tag_group.topic or _("Tags"):
                 names.add((topic, topic))
 
         for aux_tag in self.aux_tag_list.get_tags():
-            topic = aux_tag.topic or _("Tags")
-            if topic:
+            if topic := aux_tag.topic or _("Tags"):
                 names.add((topic, topic))
 
         return sorted(list(names), key=lambda x: x[1])
@@ -362,10 +349,7 @@ class TagConfig:
         return self.get_tag_group(tag_group_id) is not None
 
     def get_tag_group(self, tag_group_id: TagGroupID) -> TagGroup | None:
-        for group in self.tag_groups:
-            if group.id == tag_group_id:
-                return group
-        return None
+        return next((group for group in self.tag_groups if group.id == tag_group_id), None)
 
     def remove_tag_group(self, tag_group_id: TagGroupID) -> None:
         group = self.get_tag_group(tag_group_id)
@@ -395,12 +379,11 @@ class TagConfig:
         self.aux_tag_list.update(aux_tag_id, aux_tag)
 
     def remove_aux_tag(self, tag_id: TagID) -> None:
-        tag_groups_using_aux_tag = []
+        tag_groups_using_aux_tag: list[str] = []
         for group in self.tag_groups:
-            for grouped_tag in group.tags:
-                if tag_id in grouped_tag.aux_tag_ids:
-                    tag_groups_using_aux_tag.append(group.title)
-
+            tag_groups_using_aux_tag.extend(
+                group.title for grouped_tag in group.tags if tag_id in grouped_tag.aux_tag_ids
+            )
         if tag_groups_using_aux_tag:
             raise AuxTagInUseError(
                 _(
@@ -437,11 +420,10 @@ class TagConfig:
                 if grouped_tag.id == tag_id:
                     return grouped_tag
 
-        for aux_tag in self.aux_tag_list.get_tags():
-            if aux_tag.id == tag_id:
-                return aux_tag
-
-        return None
+        return next(
+            (aux_tag for aux_tag in self.aux_tag_list.get_tags() if aux_tag.id == tag_id),
+            None,
+        )
 
     # TODO: Change API to use __add__/__setitem__?
     def insert_tag_group(self, tag_group: TagGroup) -> None:
@@ -484,17 +466,15 @@ class TagConfig:
     def valid_id(self, tag_aux_id: TagID | TagGroupID) -> bool:
         """Verify if the proposed id is not already in use"""
         # Back to str, the code is untyped.
-        if str(tag_aux_id) in [str(tag_group.id) for tag_group in self.tag_groups]:
-            return False
+        tag_aux_id_str = str(tag_aux_id)
 
-        if str(tag_aux_id) in [str(aux_tag.id) for aux_tag in self.aux_tag_list.get_tags()]:
-            return False
-
-        return True
+        return all(tag_aux_id_str != str(tag_group.id) for tag_group in self.tag_groups) and all(
+            tag_aux_id_str != str(aux_tag.id) for aux_tag in self.aux_tag_list.get_tags()
+        )
 
     # TODO: cleanup this mess
     # This validation is quite gui specific, I do not want to introduce this into the base classes
-    def _validate_group(self, tag_group: TagGroup) -> None:  # pylint: disable=too-many-branches
+    def _validate_group(self, tag_group: TagGroup) -> None:
         if not tag_group.id:
             raise MKGeneralException(_("Please specify an ID for your tag group."))
         _validate_tag_id(tag_group.id)
@@ -508,6 +488,11 @@ class TagConfig:
         if builtin_config.tag_group_exists(tag_group.id):
             raise MKGeneralException(
                 _('You can not override the builtin tag group "%s".') % tag_group.id
+            )
+
+        if builtin_config.aux_tag_list.exists(TagID(tag_group.id)):
+            raise MKGeneralException(
+                _('You can not override the builtin auxiliary tag "%s".') % tag_group.id
             )
 
         if not tag_group.title:

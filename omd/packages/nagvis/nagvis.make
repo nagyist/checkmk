@@ -1,5 +1,5 @@
 NAGVIS := nagvis
-NAGVIS_VERS := 1.9.34
+NAGVIS_VERS := 1.9.44
 NAGVIS_DIR := $(NAGVIS)-$(NAGVIS_VERS)
 
 NAGVIS_PATCHING := $(BUILD_HELPER_DIR)/$(NAGVIS_DIR)-patching
@@ -21,24 +21,24 @@ $(NAGVIS_INSTALL): $(NAGVIS_BUILD)
 	 -W /WILL_BE_REPLACED/nagvis \
 	 -b $(DESTDIR)/usr/bin \
 	 -p $(DESTDIR)$(OMD_ROOT)/share/nagvis
-	
+
 	# Relocate the NagVis shared directory to have the same path as all the other packages
 	$(TEST) -d $(DESTDIR)$(OMD_ROOT)/share/nagvis/share && \
 	  $(MV) $(DESTDIR)$(OMD_ROOT)/share/nagvis/share $(DESTDIR)$(OMD_ROOT)/share/nagvis/htdocs
-	
+
 	$(MKDIR) $(DESTDIR)$(OMD_ROOT)/skel/var/nagvis/profiles
-	
+
 	# Move package documentations to have these files in the binary packages
 	$(MKDIR) $(DESTDIR)$(OMD_ROOT)/share/doc/$(NAGVIS)
 	for file in COPYING README ; do \
 	  $(MV) $(DESTDIR)$(OMD_ROOT)/share/nagvis/$$file $(DESTDIR)$(OMD_ROOT)/share/doc/$(NAGVIS); \
 	done
-	
-	# Take the sample main configuration file from source package and overwrite the one 
+
+	# Take the sample main configuration file from source package and overwrite the one
 	# installed by the installer.
 	$(MKDIR) $(DESTDIR)$(OMD_ROOT)/skel/etc/nagvis
 	cp $(NAGVIS_BUILD_DIR)/etc/nagvis.ini.php-sample $(DESTDIR)$(OMD_ROOT)/skel/etc/nagvis/nagvis.ini.php
-	
+
 	# Move demo config files
 	$(MKDIR) $(DESTDIR)$(OMD_ROOT)/skel/etc/nagvis/conf.d
 	$(MKDIR) $(DESTDIR)$(OMD_ROOT)/skel/etc/nagvis/maps
@@ -46,7 +46,14 @@ $(NAGVIS_INSTALL): $(NAGVIS_BUILD)
 	$(RM) $(DESTDIR)$(OMD_ROOT)/share/nagvis/etc/maps/*.cfg
 	$(MV) $(DESTDIR)$(OMD_ROOT)/share/nagvis/etc/conf.d/*.ini.php $(DESTDIR)$(OMD_ROOT)/skel/etc/nagvis/conf.d
 	$(MV) $(DESTDIR)$(OMD_ROOT)/share/nagvis/etc/geomap/demo-*.csv $(DESTDIR)$(OMD_ROOT)/skel/etc/nagvis/geomap
-	
+	chmod 640 $(DESTDIR)$(OMD_ROOT)/skel/etc/nagvis/geomap/demo-locations.csv
+	chmod 755 $(DESTDIR)$(OMD_ROOT)/share/nagvis/htdocs/userfiles/images/maps
+	chmod 755 $(DESTDIR)$(OMD_ROOT)/share/nagvis/htdocs/userfiles/images/maps
+	chmod 644 $(DESTDIR)$(OMD_ROOT)/share/nagvis/htdocs/userfiles/images/maps/*.png
+	chmod 755 $(DESTDIR)$(OMD_ROOT)/share/nagvis/htdocs/userfiles/images/shapes
+	chmod 644 $(DESTDIR)$(OMD_ROOT)/share/nagvis/htdocs/userfiles/images/shapes/*.png
+	chmod 755 $(DESTDIR)$(OMD_ROOT)/share/nagvis/htdocs/var
+
 	# Delete files/directories we do not want to pack
 	$(RM) -rf $(DESTDIR)$(OMD_ROOT)/share/nagvis/var
 	$(RM) -rf $(DESTDIR)$(OMD_ROOT)/share/nagvis/etc

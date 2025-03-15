@@ -8,8 +8,10 @@ from pathlib import Path
 import pytest
 from pytest import MonkeyPatch
 
+from cmk.ccc.exceptions import MKGeneralException
+
 import cmk.utils.paths
-from cmk.utils.exceptions import MKGeneralException
+from cmk.utils.hostaddress import HostName
 from cmk.utils.labels import (
     _Label,
     DiscoveredHostLabelsStore,
@@ -17,9 +19,7 @@ from cmk.utils.labels import (
     HostLabelValueDict,
     ServiceLabel,
 )
-from cmk.utils.type_defs import HostName, SectionName
-
-import cmk.base.config as config
+from cmk.utils.sectionname import SectionName
 
 
 class TestServiceLabel:
@@ -40,6 +40,14 @@ def test_host_labels_to_dict() -> None:
         "value": "123",
         "plugin_name": "plugin_1",
     }
+
+
+def test_discovered_host_labels_serialization() -> None:
+    for hl in (
+        HostLabel("äbc", "123", SectionName("sectionname")),
+        HostLabel("äbc", "123", None),
+    ):
+        assert hl == HostLabel.deserialize(hl.serialize())
 
 
 def test_host_labels_from_dict() -> None:
@@ -67,15 +75,13 @@ def discovered_host_labels_dir_fixture(tmp_path: Path, monkeypatch: MonkeyPatch)
 def test_discovered_host_labels_store_save(discovered_host_labels_dir: Path) -> None:
     store = DiscoveredHostLabelsStore(HostName("host"))
 
-    label_dict: dict[str, HostLabelValueDict] = {  # save below expects Dict[Any, Any] :-|
-        "xyz": {"value": "äbc", "plugin_name": "sectionname"}
-    }
+    labels = [HostLabel("xyz", "äbc", SectionName("sectionname"))]
 
     assert not store.file_path.exists()
 
-    store.save(label_dict)
+    store.save(labels)
     assert store.file_path.exists()
-    assert store.load() == label_dict
+    assert store.load() == labels
 
 
 def test_label() -> None:
@@ -96,14 +102,8 @@ def test_label_validation() -> None:
 
 def test_discovered_host_labels_path(discovered_host_labels_dir: Path) -> None:
     hostname = "test.host.de"
-    config.get_config_cache().initialize()
     assert not (discovered_host_labels_dir / hostname).exists()
     DiscoveredHostLabelsStore(HostName(hostname)).save(
-        {
-            "something": {
-                "value": "wonderful",
-                "plugin_name": "norris",
-            }
-        }
+        [HostLabel("something", "wonderful", SectionName("norris"))]
     )
     assert (discovered_host_labels_dir / (hostname + ".mk")).exists()

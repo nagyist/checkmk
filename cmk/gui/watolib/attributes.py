@@ -3,8 +3,10 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-from cmk.utils.exceptions import MKGeneralException
+from cmk.ccc.exceptions import MKGeneralException
 
+from cmk.gui.form_specs.converter import SimplePassword
+from cmk.gui.form_specs.private import not_empty
 from cmk.gui.i18n import _
 from cmk.gui.valuespec import (
     Alternative,
@@ -18,6 +20,8 @@ from cmk.gui.valuespec import (
     ValueSpec,
     ValueSpecHelp,
 )
+
+from cmk.rulesets.v1 import form_specs, Title
 
 
 def IPMIParameters() -> Dictionary:
@@ -43,7 +47,27 @@ def IPMIParameters() -> Dictionary:
     )
 
 
-def SNMPCredentials(  # pylint: disable=redefined-builtin
+def create_ipmi_parameters() -> form_specs.Dictionary:
+    return form_specs.Dictionary(
+        title=Title("IPMI credentials"),
+        elements={
+            "username": form_specs.DictElement(
+                required=True,
+                parameter_form=form_specs.String(
+                    title=Title("Username"),
+                ),
+            ),
+            "password": form_specs.DictElement(
+                required=True,
+                parameter_form=SimplePassword(
+                    title=Title("Password"), custom_validate=[not_empty()]
+                ),
+            ),
+        },
+    )
+
+
+def SNMPCredentials(
     title: str | None = None,
     help: ValueSpecHelp | None = None,
     only_v3: bool = False,
@@ -71,7 +95,7 @@ def SNMPCredentials(  # pylint: disable=redefined-builtin
                 return 3  # authPriv
         raise MKGeneralException("invalid SNMP credential format %s" % x)
 
-    def allow_none_match(x) -> int:  # type: ignore[no-untyped-def]
+    def allow_none_match(x: object) -> int:
         return 0 if x is None else (alternative_match(x) + 1)
 
     if allow_none:
@@ -158,6 +182,8 @@ def _snmpv3_auth_priv_credentials_element(for_ec: bool = False) -> ValueSpec:
     priv_protocol_choices = [
         ("DES", _("CBC-DES")),
         ("AES", _("AES-128")),
+        ("AES-192", _("AES-192")),
+        ("AES-256", _("AES-256")),
     ]
     if for_ec:
         # EC uses pysnmp which supports these protocols
@@ -165,8 +191,6 @@ def _snmpv3_auth_priv_credentials_element(for_ec: bool = False) -> ValueSpec:
         priv_protocol_choices.extend(
             [
                 ("3DES-EDE", _("3DES-EDE")),
-                ("AES-192", _("AES-192")),
-                ("AES-256", _("AES-256")),
                 ("AES-192-Blumenthal", _("AES-192-Blumenthal")),
                 ("AES-256-Blumenthal", _("AES-256-Blumenthal")),
             ]

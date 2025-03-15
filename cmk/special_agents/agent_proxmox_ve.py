@@ -25,24 +25,24 @@ information about VMs and nodes:
 import logging
 import re
 import sys
-from collections.abc import Iterable, Mapping, MutableMapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, MutableMapping, Sequence
 from datetime import datetime, timedelta
 from json import JSONDecodeError
 from typing import Any
+from zoneinfo import ZoneInfo
 
-import pytz
 import requests
 
 from cmk.utils.paths import tmp_dir
 
-from cmk.special_agents.utils.agent_common import (
+from cmk.special_agents.v0_unstable.agent_common import (
     CannotRecover,
     ConditionalPiggybackSection,
     SectionWriter,
     special_agent_main,
 )
-from cmk.special_agents.utils.argument_parsing import Args, create_default_argument_parser
-from cmk.special_agents.utils.misc import JsonCachedData, to_bytes
+from cmk.special_agents.v0_unstable.argument_parsing import Args, create_default_argument_parser
+from cmk.special_agents.v0_unstable.misc import JsonCachedData, to_bytes
 
 LOGGER = logging.getLogger("agent_proxmox_ve")
 
@@ -124,8 +124,7 @@ class BackupTask:
         if errors and dump_erroneous_logs:
             with (LogCacheFilePath / (f"erroneous-{task['upid']}.log")).open("w") as file:
                 LOGGER.error(
-                    "Parsing the log for UPID=%r resulted in a error(s) - "
-                    "write log content to %r",
+                    "Parsing the log for UPID=%r resulted in a error(s) - write log content to %r",
                     task["upid"],
                     file.name,
                 )
@@ -141,10 +140,10 @@ class BackupTask:
         """
         # this has been true all the time and is left here for documentation
         # assert all((int(elem["n"]) - 1 == i) for i, elem in enumerate(lines_with_numbers))
-        return (  #
-            line  #
-            for elem in lines_with_numbers  #
-            for line in (elem["t"],)  #
+        return (
+            line
+            for elem in lines_with_numbers
+            for line in (elem["t"],)
             if isinstance(line, str) and line.strip()
         )
 
@@ -156,10 +155,10 @@ class BackupTask:
         )
 
     @staticmethod
-    def _extract_logs(  # pylint: disable=too-many-branches
+    def _extract_logs(
         logs: Iterable[str],
         strict: bool,
-    ) -> tuple[Mapping[str, BackupInfo], Iterable[tuple[int, str]]]:
+    ) -> tuple[Mapping[str, BackupInfo], Collection[tuple[int, str]]]:
         log_line_pattern = {
             key: re.compile(pat, flags=re.IGNORECASE)
             for key, pat in (
@@ -199,7 +198,7 @@ class BackupTask:
                 ),
                 (
                     "transferred",
-                    r"^INFO: transferred (.*) in (\d+) seconds \(.*\)$",
+                    r"^INFO: transferred (.*) in <?(\d+) seconds(.*)$",
                 ),
                 (
                     "uploaded",
@@ -211,7 +210,7 @@ class BackupTask:
                 ),
                 (
                     "backuped",
-                    r"^INFO: (.*): had to backup (.*) of (.*) \(compressed (.*)\) in (.*)s",
+                    r"^INFO: (.*): had to backup (.*) of (.*) \(compressed (.*)\) in ([\d.]+)[\s]*s.*",
                 ),
             )
         }
@@ -220,6 +219,7 @@ class BackupTask:
             {"started_time", "total_duration", "transfer_size", "transfer_time"},
             {"started_time", "total_duration", "upload_amount", "upload_time", "upload_total"},
             {"started_time", "total_duration", "backup_amount", "backup_time", "backup_total"},
+            {"started_time", "total_duration", "archive_name", "archive_size"},
         )
 
         result: dict[str, dict[str, Any]] = {}  # mutable Mapping[str, Mapping[str, Any]]
@@ -249,29 +249,23 @@ class BackupTask:
 
         for linenr, line in enumerate(logs):
             try:
-                # TODO: use assignment expressions together with elif and w/o continue
-                start_vmid = extract_single_value(line, "start_vm")
-                if start_vmid:
+                if start_vmid := extract_single_value(line, "start_vm"):
                     if current_vmid:
                         # this is a consistency problem - we have to abort parsing this log file
                         raise BackupTask.LogParseError(
                             linenr,
-                            "Captured start of rocessing VM %r while VM %r is still active"
-                            % (start_vmid, current_vmid),
+                            f"Captured start of rocessing VM {start_vmid!r} while VM {current_vmid!r} is still active",
                         )
                     current_vmid = start_vmid
                     current_dataset = {}
-                    continue
 
-                finish_vm = extract_tuple(line, "finish_vm", 2)
-                if finish_vm:
+                elif finish_vm := extract_tuple(line, "finish_vm", 2):
                     stop_vmid, duration_str = finish_vm
                     if stop_vmid != current_vmid:
                         # this is a consistency problem - we have to abort parsing this log file
                         raise BackupTask.LogParseError(
                             linenr,
-                            "Found end of VM %r while another VM %r was active"
-                            % (stop_vmid, current_vmid),
+                            f"Found end of VM {stop_vmid!r} while another VM {current_vmid!r} was active",
                         )
                     current_dataset["total_duration"] = duration_from_string(duration_str)
 
@@ -279,58 +273,46 @@ class BackupTask:
                     if all(r - set(current_dataset.keys()) for r in required_keys):
                         raise BackupTask.LogParseWarning(
                             linenr,
-                            "End of VM %r while still information is missing (we have: %r)"
-                            % (current_vmid, set(current_dataset.keys())),
+                            f"End of VM {current_vmid!r} while still information is missing (we have: {set(current_dataset.keys())!r})",
                         )
                     result[current_vmid] = current_dataset
                     current_vmid = ""
-                    continue
 
-                error_vm = extract_tuple(line, "error_vm", 2)
-                if error_vm:
+                elif error_vm := extract_tuple(line, "error_vm", 2):
                     error_vmid, error_msg = error_vm
                     if current_vmid and error_vmid != current_vmid:
                         # this is a consistency problem - we have to abort parsing this log file
                         raise BackupTask.LogParseError(
                             linenr,
-                            "Error for VM %r while another VM %r was active"
-                            % (error_vmid, current_vmid),
+                            f"Error for VM {error_vmid!r} while another VM {current_vmid!r} was active",
                         )
                     LOGGER.warning("Found error for VM %r: %r", error_vmid, error_msg)
                     result[error_vmid] = {**current_dataset, **{"error": error_msg}}
                     current_vmid = ""
-                    continue
 
-                started_time = extract_single_value(line, "started_time")
-                if started_time:
+                elif started_time := extract_single_value(line, "started_time"):
                     if not current_vmid:
                         raise BackupTask.LogParseWarning(
                             linenr,
                             "Found start date while no VM was active",
                         )
                     current_dataset["started_time"] = started_time
-                    continue
 
-                failed_at_time = extract_single_value(line, "failed_job")
-                if failed_at_time:
+                elif failed_at_time := extract_single_value(line, "failed_job"):
                     # in case a backup job fails we store the time it failed as
                     # 'started_time' in order to be able to sort backup jobs
                     for backup_data in result.values():
                         backup_data.setdefault("started_time", failed_at_time)
-                    continue
 
-                bytes_written = extract_tuple(line, "bytes_written", 2)
-                if bytes_written:
+                elif bytes_written := extract_tuple(line, "bytes_written", 2):
                     if not current_vmid:
                         raise BackupTask.LogParseWarning(
                             linenr, "Found bandwidth information while no VM was active"
                         )
                     current_dataset["bytes_written_size"] = int(bytes_written[0])
                     current_dataset["bytes_written_bandwidth"] = to_bytes(bytes_written[1])
-                    continue
 
-                transferred = extract_tuple(line, "transferred", 2)
-                if transferred:
+                elif transferred := extract_tuple(line, "transferred", 2):
                     transfer_size, transfer_time = transferred
                     if not current_vmid:
                         raise BackupTask.LogParseWarning(
@@ -338,29 +320,23 @@ class BackupTask:
                         )
                     current_dataset["transfer_size"] = to_bytes(transfer_size)
                     current_dataset["transfer_time"] = int(transfer_time)
-                    continue
 
-                archive_name = extract_single_value(line, "create_archive")
-                if archive_name:
+                elif archive_name := extract_single_value(line, "create_archive"):
                     if not current_vmid:
                         raise BackupTask.LogParseWarning(
                             linenr,
                             "Found archive name without active VM",
                         )
                     current_dataset["archive_name"] = archive_name
-                    continue
 
-                archive_size = extract_single_value(line, "archive_size")
-                if archive_size:
+                elif archive_size := extract_single_value(line, "archive_size"):
                     if not current_vmid:
                         raise BackupTask.LogParseWarning(
                             linenr, "Found archive size information without active VM"
                         )
                     current_dataset["archive_size"] = to_bytes(archive_size)
-                    continue
 
-                uploaded = extract_tuple(line, "uploaded", 5)
-                if uploaded:
+                elif uploaded := extract_tuple(line, "uploaded", 5):
                     _, upload_amount, upload_total, upload_time, _ = uploaded
                     if not current_vmid:
                         raise BackupTask.LogParseWarning(
@@ -369,10 +345,8 @@ class BackupTask:
                     current_dataset["upload_amount"] = to_bytes(upload_amount)
                     current_dataset["upload_total"] = to_bytes(upload_total)
                     current_dataset["upload_time"] = float(upload_time)
-                    continue
 
-                backuped = extract_tuple(line, "backuped", 5)
-                if backuped:
+                elif backuped := extract_tuple(line, "backuped", 5):
                     _, backup_amount, backup_total, _, backup_time = backuped
                     if not current_vmid:
                         raise BackupTask.LogParseWarning(
@@ -381,7 +355,6 @@ class BackupTask:
                     current_dataset["backup_amount"] = to_bytes(backup_amount)
                     current_dataset["backup_total"] = to_bytes(backup_total)
                     current_dataset["backup_time"] = float(backup_time)
-                    continue
 
             except BackupTask.LogParseWarning as exc:
                 if strict:
@@ -447,9 +420,9 @@ def fetch_backup_data(
             BackupTask(task, backup_log, strict=args.debug, dump_logs=args.dump_logs)
             for node in nodes
             for task in node["tasks"]
-            if (task["type"] == "vzdump" and int(task["starttime"]) >= cutoff_date)  #
+            if (task["type"] == "vzdump" and int(task["starttime"]) >= cutoff_date)
             for _timestamp, backup_log in (fetch_backup_log(task, node["node"]),)
-        )
+        )  #
 
 
 def agent_proxmox_ve_main(args: Args) -> int:
@@ -513,13 +486,13 @@ def agent_proxmox_ve_main(args: Args) -> int:
         "scheduled_vmids": sorted(
             list(
                 {
-                    vmid  #
+                    vmid
                     for backup in data["cluster"]["backup"]
                     if "vmid" in backup and backup["enabled"] == "1"
                     for vmid in backup["vmid"].split(",")
                 }
             )
-        ),
+        ),  #
         # add data of actually logged VMs
         "logged_vmids": logged_backup_data,
     }
@@ -541,9 +514,9 @@ def agent_proxmox_ve_main(args: Args) -> int:
         Adds timezone information to a date string.
         Returns a timezone-aware string
         """
-        local_tz = pytz.timezone(tz)
+        local_tz = ZoneInfo(tz)
         timezone_unaware = datetime.strptime(naive_string, "%Y-%m-%d %H:%M:%S")
-        timezone_aware = local_tz.localize(timezone_unaware)
+        timezone_aware = timezone_unaware.replace(tzinfo=local_tz)
         return timezone_aware.strftime("%Y-%m-%d %H:%M:%S%z")
 
     #  overwrite all the start time strings with timezone aware start strings
@@ -667,8 +640,9 @@ class ProxmoxVeSession:
 
             if response is None:
                 raise CannotRecover(
-                    "Couldn't authenticate %r @ %r"
-                    % (credentials.get("username", "no-username"), ticket_url)
+                    "Couldn't authenticate {!r} @ {!r}".format(
+                        credentials.get("username", "no-username"), ticket_url
+                    )
                 )
 
             self.pve_auth_cookie = response["ticket"]
@@ -716,39 +690,69 @@ class ProxmoxVeSession:
 
     def close(self) -> None:
         """close connection to Proxmox VE endpoint"""
-        if self._session:
-            self._session.close()
+        self._session.close()
 
-    def get_raw(self, sub_url: str) -> requests.Response:
-        return self._session.request(
-            method="GET",
-            url=self._base_url + sub_url,
-            # todo: generic
-            params={"limit": "5000"}
-            if (sub_url.endswith("/log") or sub_url.endswith("/tasks"))
-            else {},
-            verify=self._verify_ssl,
-            timeout=self._timeout,
-        )
-
-    def get_api_element(self, path: str) -> Any:
+    def get_api_element(self, path: str) -> object:
         """do an API GET request"""
         try:
-            response = self.get_raw("api2/json/" + path)
-            if response.status_code != requests.codes.ok:
-                return []
-            response_json = response.json()
-            if "errors" in response_json:
-                raise CannotRecover(
-                    "Could not fetch {!r} ({!r})".format(path, response_json["errors"])
-                )
-            return response_json.get("data")
+            return self._get_raw("api2/json/" + path)
         except requests.exceptions.ReadTimeout:
             raise CannotRecover(f"Read timeout after {self._timeout}s when trying to GET {path}")
         except requests.exceptions.ConnectionError as exc:
             raise CannotRecover(f"Could not GET element {path} ({exc})") from exc
         except JSONDecodeError as e:
             raise CannotRecover("Couldn't parse API element %r" % path) from e
+
+    def _get_raw(self, sub_url: str) -> object:
+        return (
+            self._get_logs_or_tasks_paginated(sub_url)
+            if (sub_url.endswith("/log") or sub_url.endswith("/tasks"))
+            else self._validate_response(
+                self._session.get(
+                    url=self._base_url + sub_url,
+                    verify=self._verify_ssl,
+                    timeout=self._timeout,
+                ),
+                sub_url,
+            )
+        )
+
+    def _get_logs_or_tasks_paginated(self, sub_url: str) -> list[object]:
+        url = self._base_url + sub_url
+        data: list[object] = []
+        start = 0
+        page_size = 5000
+
+        while True:
+            response_data = self._validate_response(
+                self._session.get(
+                    url=url,
+                    verify=self._verify_ssl,
+                    timeout=self._timeout,
+                    params={"start": start, "limit": page_size},
+                ),
+                sub_url,
+            )
+            assert isinstance(response_data, Sequence)
+            data += response_data
+
+            if len(response_data) < page_size:
+                break
+
+            start += page_size
+
+        return data
+
+    @staticmethod
+    def _validate_response(response: requests.Response, sub_url: str) -> object:
+        if not response.ok:
+            return []
+        response_json = response.json()
+        if "errors" in response_json:
+            raise CannotRecover(
+                "Could not fetch {!r} ({!r})".format(sub_url, response_json["errors"])
+            )
+        return response_json.get("data")
 
 
 class ProxmoxVeAPI:
@@ -805,9 +809,9 @@ class ProxmoxVeAPI:
                 return (
                     request_tree
                     if isinstance(request_tree, Mapping)
-                    else next(iter(request_tree))  #
+                    else next(iter(request_tree))
                     if len(request_tree) > 0
-                    else {}  #
+                    else {}
                 )
 
             def extract_variable(st: RequestStructure) -> Mapping[str, Any] | None:
@@ -860,10 +864,10 @@ class ProxmoxVeAPI:
                     if variable is None:
                         assert isinstance(subtree, Mapping)
                         return (
-                            {key: rec_get_tree(key, subtree[key], next_path) for key in subtree}  #
+                            {key: rec_get_tree(key, subtree[key], next_path) for key in subtree}
                             if isinstance(requested_structure, Mapping)
                             else response
-                        )
+                        )  #
 
                     assert isinstance(requested_structure, Sequence)
                     return [

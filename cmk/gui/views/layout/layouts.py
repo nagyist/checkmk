@@ -6,26 +6,29 @@
 import abc
 import re
 from collections.abc import Hashable, Iterator, Sequence
-from typing import Any
+from functools import partial
+from typing import Any, override
 
-from cmk.utils.exceptions import MKGeneralException
+from cmk.ccc.exceptions import MKGeneralException
 
-import cmk.gui.utils as utils
+from cmk.gui import utils
 from cmk.gui.config import active_config
+from cmk.gui.data_source import row_id
+from cmk.gui.exporter import output_csv_headers
 from cmk.gui.htmllib.html import html
+from cmk.gui.http import request
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
+from cmk.gui.painter.v0 import Cell, EmptyCell
+from cmk.gui.painter.v1.helpers import is_stale
+from cmk.gui.painter_options import PainterOptions
 from cmk.gui.table import init_rowselect, table_element
+from cmk.gui.theme.current_theme import theme
 from cmk.gui.type_defs import GroupSpec, Row, Rows, ViewSpec
-from cmk.gui.utils.theme import theme
 from cmk.gui.visual_link import render_link_to_view
 
-from ..data_source import row_id
-from ..painter.v0.base import Cell, EmptyCell
-from ..painter.v1.helpers import is_stale
-from ..painter_options import PainterOptions
 from .base import Layout
-from .helpers import group_value, output_csv_headers
+from .helpers import group_value
 from .registry import LayoutRegistry
 
 
@@ -69,17 +72,21 @@ class LayoutSingleDataset(Layout):
     more than on dataset however."""
 
     @property
+    @override
     def ident(self) -> str:
         return "dataset"
 
     @property
+    @override
     def title(self) -> str:
         return _("Single dataset")
 
     @property
+    @override
     def can_display_checkboxes(self) -> bool:
         return False
 
+    @override
     def render(
         self,
         rows: Rows,
@@ -89,6 +96,7 @@ class LayoutSingleDataset(Layout):
         num_columns: int,
         show_checkboxes: bool,
     ) -> None:
+        link_renderer = partial(render_link_to_view, request=request)
         html.open_table(class_="data single")
         rownum = 0
         odd = "odd"
@@ -105,7 +113,7 @@ class LayoutSingleDataset(Layout):
                     html.td(cell.title(use_short=False), class_="left")
 
                 for row in thispart:
-                    cell.paint(row, render_link_to_view)
+                    cell.paint(row, link_renderer)
 
                 if len(thispart) < num_columns:
                     html.td(
@@ -124,6 +132,7 @@ class GroupedBoxesLayout(Layout):
     def _css_class(self) -> str | None:
         raise NotImplementedError()
 
+    @override
     def render(
         self,
         rows: Rows,
@@ -176,7 +185,7 @@ class GroupedBoxesLayout(Layout):
         html.close_tr()
         html.close_table()
 
-    def _render_group(  # pylint: disable=too-many-branches
+    def _render_group(
         self,
         rows_with_ids: list[tuple[str, Row]],
         view: ViewSpec,
@@ -228,7 +237,7 @@ class GroupedBoxesLayout(Layout):
 
             css_classes = []
 
-            if is_stale(row):
+            if is_stale(row, config=active_config):
                 css_classes.append("stale")
 
             hide = ""
@@ -249,8 +258,9 @@ class GroupedBoxesLayout(Layout):
             if show_checkboxes:
                 render_checkbox_td(view, row, num_cells)
 
+            link_renderer = partial(render_link_to_view, request=request)
             for cell in cells:
-                cell.paint(row, render_link_to_view)
+                cell.paint(row, link_renderer)
 
             html.close_tr()
 
@@ -267,10 +277,11 @@ class GroupedBoxesLayout(Layout):
         html.open_table(class_="groupheader", cellspacing="0", cellpadding="0", border="0")
         html.open_tr(class_="groupheader")
         painted = False
+        link_renderer = partial(render_link_to_view, request=request)
         for cell in group_cells:
             if painted:
                 html.td(",&nbsp;")
-            painted = cell.paint(first_row, render_link_to_view)
+            painted = cell.paint(first_row, link_renderer)
         html.close_tr()
         html.close_table()
 
@@ -280,7 +291,7 @@ class GroupedBoxesLayout(Layout):
             render_group_checkbox_th()
         for cell in cells:
             cell.paint_as_header()
-            html.write_text("\n")
+            html.write_text_permissive("\n")
         html.close_tr()
 
     def _balance(
@@ -322,7 +333,7 @@ def grouped_row_title(
         align="absbottom",
         class_=["treeangle", "nform", "open" if is_open else "closed"],
     )
-    html.write_text("%s (%d)" % (group_spec["title"], num_rows))
+    html.write_text_permissive("%s (%d)" % (group_spec["title"], num_rows))
 
     html.close_td()
     html.close_tr()
@@ -375,13 +386,13 @@ def calculate_view_grouping_of_services(
 
         # When the service is not OK and should not be grouped, move it's row
         # in front of the group.
-        if row.get("service_state", -1) != 0 or is_stale(row):
+        if row.get("service_state", -1) != 0 or is_stale(row, config=active_config):
             if current_group is None or current_group != group_spec:
                 continue  # skip grouping first row
 
             if current_group == group_spec:
-                row = rows_with_ids.pop(index)
-                rows_with_ids.insert(index - len(groups[group_id][1]), row)
+                r = rows_with_ids.pop(index)
+                rows_with_ids.insert(index - len(groups[group_id][1]), r)
                 continue
 
         current_group = group_spec
@@ -396,12 +407,26 @@ def calculate_view_grouping_of_services(
     return groupings, rows_with_ids
 
 
+def get_group_spec(group_spec: GroupSpec, service_name: str) -> GroupSpec:
+    if re.findall(r"\\\d", group_spec["title"]):
+        return GroupSpec(
+            title=re.sub(
+                pattern=group_spec["pattern"],
+                repl=group_spec["title"],
+                string=service_name,
+            ),
+            pattern=group_spec["pattern"],
+            min_items=group_spec["min_items"],
+        )
+    return group_spec
+
+
 def try_to_match_group(row: Row) -> GroupSpec | None:
     for group_spec in active_config.service_view_grouping:
         if row.get("service_description") and re.match(
             group_spec["pattern"], row["service_description"]
         ):
-            return group_spec
+            return get_group_spec(group_spec, row["service_description"])
 
     return None
 
@@ -411,36 +436,49 @@ class LayoutBalancedBoxes(GroupedBoxesLayout):
     stacked in columns and can have different sizes."""
 
     @property
+    @override
     def ident(self) -> str:
         return "boxed"
 
     @property
+    @override
     def title(self) -> str:
         return _("Balanced boxes")
 
     @property
+    @override
     def can_display_checkboxes(self) -> bool:
         return True
 
+    @override
     def _css_class(self) -> str | None:
         return None
+
+    @property
+    @override
+    def hide_entries_per_row(self) -> bool:
+        return True
 
 
 class LayoutBalancedGraphBoxes(GroupedBoxesLayout):
     """Same as balanced boxes layout but adds a CSS class graph to the box"""
 
     @property
+    @override
     def ident(self) -> str:
         return "boxed_graph"
 
     @property
+    @override
     def title(self) -> str:
         return _("Balanced graph boxes")
 
     @property
+    @override
     def can_display_checkboxes(self) -> bool:
         return True
 
+    @override
     def _css_class(self) -> str | None:
         return "graph"
 
@@ -449,18 +487,22 @@ class LayoutTiled(Layout):
     """The tiled layout puts each dataset into one box with a fixed size"""
 
     @property
+    @override
     def ident(self) -> str:
         return "tiled"
 
     @property
+    @override
     def title(self) -> str:
         return _("Tiles")
 
     @property
+    @override
     def can_display_checkboxes(self) -> bool:
         return True
 
-    def render(  # pylint: disable=too-many-branches
+    @override
+    def render(
         self,
         rows: Rows,
         view: ViewSpec,
@@ -471,6 +513,7 @@ class LayoutTiled(Layout):
     ) -> None:
         html.open_table(class_="data tiled")
 
+        link_renderer = partial(render_link_to_view, request=request)
         last_group = None
         group_open = False
         for row in rows:
@@ -491,7 +534,7 @@ class LayoutTiled(Layout):
                     for cell in group_cells:
                         if painted:
                             html.td(",&nbsp;")
-                        painted = cell.paint(row, render_link_to_view)
+                        painted = cell.paint(row, link_renderer)
 
                     html.close_tr()
                     html.close_table()
@@ -532,40 +575,40 @@ class LayoutTiled(Layout):
             # We need at least five cells
             render_cells = list(cells)
             if len(render_cells) < 5:
-                render_cells += [EmptyCell(None, None)] * (5 - len(render_cells))
+                render_cells += [EmptyCell(None, None, None)] * (5 - len(render_cells))
 
-            rendered = [cell.render(row, render_link_to_view) for cell in render_cells]
+            rendered = [cell.render(row, link_renderer) for cell in render_cells]
 
             html.open_tr()
             html.open_td(class_=["tl", rendered[1][0]])
             if show_checkboxes:
                 render_checkbox(view, row, len(render_cells) - 1)
-            html.write_text(rendered[1][1])
+            html.write_text_permissive(rendered[1][1])
             html.close_td()
             html.open_td(class_=["tr", rendered[2][0]])
-            html.write_text(rendered[2][1])
+            html.write_text_permissive(rendered[2][1])
             html.close_td()
             html.close_tr()
 
             html.open_tr()
             html.open_td(colspan=2, class_=["center", rendered[0][0]])
-            html.write_text(rendered[0][1])
+            html.write_text_permissive(rendered[0][1])
             html.close_td()
             html.close_tr()
 
             for css, cont in rendered[5:]:
                 html.open_tr()
                 html.open_td(colspan=2, class_=["cont", css])
-                html.write_text(cont)
+                html.write_text_permissive(cont)
                 html.close_td()
                 html.close_tr()
 
             html.open_tr()
             html.open_td(class_=["bl", rendered[3][0]])
-            html.write_text(rendered[3][1])
+            html.write_text_permissive(rendered[3][1])
             html.close_td()
             html.open_td(class_=["br", rendered[4][0]])
-            html.write_text(rendered[4][1])
+            html.write_text_permissive(rendered[4][1])
             html.close_td()
             html.close_tr()
 
@@ -589,18 +632,22 @@ class LayoutTable(Layout):
     width of the columns."""
 
     @property
+    @override
     def ident(self) -> str:
         return "table"
 
     @property
+    @override
     def title(self) -> str:
         return _("Table")
 
     @property
+    @override
     def can_display_checkboxes(self) -> bool:
         return True
 
-    def render(  # pylint: disable=too-many-branches
+    @override
+    def render(
         self,
         rows: Rows,
         view: ViewSpec,
@@ -628,6 +675,7 @@ class LayoutTable(Layout):
             rows_with_ids, row_group_cells=group_cells
         )
 
+        link_renderer = partial(render_link_to_view, request=request)
         visible_row_number = 0
         group_hidden, num_grouped_rows = None, 0
         for index, row in rows_with_ids:
@@ -649,7 +697,7 @@ class LayoutTable(Layout):
                     # paint group header, but only if it is non-empty
                     header_is_empty = True
                     for cell in group_cells:
-                        _tdclass, content = cell.render(row, render_link_to_view)
+                        _tdclass, content = cell.render(row, link_renderer)
                         if content:
                             header_is_empty = False
                             break
@@ -668,7 +716,7 @@ class LayoutTable(Layout):
                         for cell in group_cells:
                             if painted:
                                 html.td(",&nbsp;")
-                            painted = cell.paint(row, render_link_to_view)
+                            painted = cell.paint(row, link_renderer)
 
                         html.close_tr()
                         html.close_table()
@@ -743,7 +791,7 @@ class LayoutTable(Layout):
                 render_checkbox_td(view, row, num_cells)
 
             for cell in cells:
-                cell.paint(row, render_link_to_view)
+                cell.paint(row, link_renderer)
 
             column += 1
 
@@ -789,21 +837,26 @@ class LayoutMatrix(Layout):
     The columns are hosts and the rows are services."""
 
     @property
+    @override
     def ident(self) -> str:
         return "matrix"
 
     @property
+    @override
     def title(self) -> str:
         return _("Matrix")
 
     @property
+    @override
     def can_display_checkboxes(self) -> bool:
         return False
 
     @property
+    @override
     def has_individual_csv_export(self) -> bool:
         return True
 
+    @override
     def csv_export(
         self, rows: Rows, view: ViewSpec, group_cells: Sequence[Cell], cells: Sequence[Cell]
     ) -> None:
@@ -816,11 +869,12 @@ class LayoutMatrix(Layout):
 
         painter_options = PainterOptions.get_instance()
         with table_element(output_format="csv") as table:
+            link_renderer = partial(render_link_to_view, request=request)
             for cell_nr, cell in enumerate(group_cells):
                 table.row()
                 table.cell("", cell.title(use_short=False))
                 for _group, group_row in groups:
-                    _tdclass, content = cell.render(group_row, render_link_to_view)
+                    _tdclass, content = cell.render(group_row, link_renderer)
                     table.cell("", content)
 
             for rid in unique_row_ids:
@@ -836,7 +890,7 @@ class LayoutMatrix(Layout):
 
                 table.row()
                 _tdclass, content = cells[0].render(
-                    list(matrix_cells[rid].values())[0], render_link_to_view
+                    list(matrix_cells[rid].values())[0], link_renderer
                 )
                 table.cell("", content)
 
@@ -845,12 +899,13 @@ class LayoutMatrix(Layout):
                     cell_row = matrix_cells[rid].get(group_id)
                     if cell_row is not None:
                         for cell_nr, cell in enumerate(cells[1:]):
-                            _tdclass, content = cell.render(cell_row, render_link_to_view)
+                            _tdclass, content = cell.render(cell_row, link_renderer)
                             if cell_nr:
-                                html.write_text(",")
-                            html.write_text(content)
+                                html.write_text_permissive(",")
+                            html.write_text_permissive(content)
 
-    def render(  # pylint: disable=too-many-branches
+    @override
+    def render(
         self,
         rows: Rows,
         view: ViewSpec,
@@ -863,6 +918,7 @@ class LayoutMatrix(Layout):
         value_counts, row_majorities = self._matrix_find_majorities(rows, cells)
 
         painter_options = PainterOptions.get_instance()
+        link_renderer = partial(render_link_to_view, request=request)
         for groups, unique_row_ids, matrix_cells in create_matrices(
             rows, group_cells, cells, num_columns
         ):
@@ -873,17 +929,17 @@ class LayoutMatrix(Layout):
                 odd = "even" if odd == "odd" else "odd"
                 html.open_tr(class_="data %s0" % odd)
                 html.open_td(class_="matrixhead")
-                html.write_text(cell.title(use_short=False))
+                html.write_text_permissive(cell.title(use_short=False))
                 html.close_td()
                 for _group, group_row in groups:
-                    tdclass, content = cell.render(group_row, render_link_to_view)
+                    tdclass, content = cell.render(group_row, link_renderer)
                     if cell_nr > 0:
                         gv = group_value(group_row, [cell])
                         majority_value = header_majorities.get(cell_nr - 1, None)
                         if majority_value is not None and majority_value != gv:
                             tdclass += " minority"
                     html.open_td(class_=["left", tdclass])
-                    html.write_text(content)
+                    html.write_text_permissive(content)
                     html.close_td()
                 html.close_tr()
 
@@ -902,10 +958,10 @@ class LayoutMatrix(Layout):
                 odd = "even" if odd == "odd" else "odd"
                 html.open_tr(class_="data %s0" % odd)
                 tdclass, content = cells[0].render(
-                    list(matrix_cells[rid].values())[0], render_link_to_view
+                    list(matrix_cells[rid].values())[0], link_renderer
                 )
                 html.open_td(class_=["left", tdclass])
-                html.write_text(content)
+                html.write_text_permissive(content)
                 html.close_td()
 
                 # Now go through the groups and paint the rest of the
@@ -920,7 +976,7 @@ class LayoutMatrix(Layout):
                             html.open_table()
 
                         for cell_nr, cell in enumerate(cells[1:]):
-                            tdclass, content = cell.render(cell_row, render_link_to_view)
+                            tdclass, content = cell.render(cell_row, link_renderer)
 
                             gv = group_value(cell_row, [cell])
                             majority_value = row_majorities[rid].get(cell_nr, None)
@@ -987,6 +1043,7 @@ class LayoutMatrix(Layout):
         return counts, majorities
 
     @property
+    @override
     def painter_options(self) -> list[str]:
         return ["matrix_omit_uniform"]
 

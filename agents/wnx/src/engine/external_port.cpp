@@ -1,17 +1,17 @@
 #include "stdafx.h"
 
-#include "external_port.h"
+#include "wnx/external_port.h"
 
 #include <chrono>
 #include <filesystem>
 #include <iostream>
 
-#include "agent_controller.h"
-#include "asio.h"
-#include "cfg.h"
 #include "common/mailslot_transport.h"
-#include "encryption.h"
-#include "realtime.h"
+#include "wnx/agent_controller.h"
+#include "wnx/asio.h"
+#include "wnx/cfg.h"
+#include "wnx/encryption.h"
+#include "wnx/realtime.h"
 
 using asio::ip::tcp;
 using namespace std::chrono_literals;
@@ -525,7 +525,8 @@ void ExternalPort::ioThreadProc(const ReplyFunc &reply_func, uint16_t port,
 
     } catch (std::exception &e) {
         registerAsioContext(nullptr);  // cleanup
-        std::cerr << "Exception: " << e.what() << "\n";
+        std::cerr << "Exception in IO/ip: " << e.what() << "port " << port
+                  << " \n";
         XLOG::l(XLOG::kCritError)("IO broken with exception {}", e.what());
     }
 }
@@ -544,7 +545,7 @@ void ExternalPort::mailslotThreadProc(const ReplyFunc &reply_func,
         XLOG::l.i("IO ends...");
 
     } catch (std::exception &e) {
-        std::cerr << "Exception: " << e.what() << "\n";
+        std::cerr << "Exception in IO/ms: " << e.what() << "\n";
         XLOG::l(XLOG::kCritError)("IO broken with exception {}", e.what());
     }
 }

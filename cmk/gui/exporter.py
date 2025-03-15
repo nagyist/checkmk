@@ -9,14 +9,13 @@ from collections.abc import Callable, Sequence
 from html import unescape
 from typing import NamedTuple
 
-from cmk.utils.plugin_registry import Registry
+from cmk.ccc.plugin_registry import Registry
 
-import cmk.gui.utils.escaping as escaping
-from cmk.gui.http import request, response
+from cmk.gui.http import ContentDispositionType, request, response
+from cmk.gui.painter.v0 import Cell, join_row
 from cmk.gui.type_defs import Rows, ViewSpec
+from cmk.gui.utils import escaping
 from cmk.gui.utils.html import HTML
-from cmk.gui.views.layout import output_csv_headers
-from cmk.gui.views.painter.v0.base import Cell, join_row
 
 
 class Exporter(NamedTuple):
@@ -27,6 +26,15 @@ class Exporter(NamedTuple):
 class ViewExporterRegistry(Registry[Exporter]):
     def plugin_name(self, instance):
         return instance.name
+
+
+def output_csv_headers(view: ViewSpec) -> None:
+    filename = "{}-{}.csv".format(
+        view["name"],
+        time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(time.time())),
+    )
+    response.set_content_type("text/csv")
+    response.set_content_disposition(ContentDispositionType.ATTACHMENT, filename)
 
 
 exporter_registry = ViewExporterRegistry()
@@ -145,7 +153,11 @@ def _export_json_export(
         view_name,
         time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(time.time())),
     )
-    response.headers["Content-Disposition"] = 'Attachment; filename="%s"' % filename
+    response.set_content_type("application/json")
+    response.set_content_disposition(
+        ContentDispositionType.ATTACHMENT,
+        filename,
+    )
 
     response.set_data(_get_json_body(row_cells, group_cells, rows, view_name, view_spec))
 

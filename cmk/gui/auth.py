@@ -6,16 +6,20 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import contextlib
 import hmac
-import traceback
+import re
 import uuid
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
-from cmk.utils.crypto.password import Password
-from cmk.utils.crypto.secrets import AutomationUserSecret
-from cmk.utils.type_defs import UserId
+import cmk.utils.paths
+from cmk.utils.local_secrets import SiteInternalSecret
+from cmk.utils.log.security_event import log_security_event
+from cmk.utils.user import UserId
 
 from cmk.gui import userdb
 from cmk.gui.config import active_config
@@ -23,16 +27,25 @@ from cmk.gui.exceptions import MKAuthException, MKUserError
 from cmk.gui.http import request
 from cmk.gui.i18n import _
 from cmk.gui.log import logger
+from cmk.gui.pseudo_users import PseudoUserId, RemoteSitePseudoUser, SiteInternalPseudoUser
+from cmk.gui.site_config import enabled_sites
 from cmk.gui.type_defs import AuthType
-from cmk.gui.userdb.session import auth_cookie_name, generate_auth_hash
+from cmk.gui.userdb.session import generate_auth_hash
+from cmk.gui.utils.htpasswd import Htpasswd
+from cmk.gui.utils.security_log_events import AuthenticationFailureEvent
 from cmk.gui.utils.urls import requested_file_name
+
+from cmk.crypto import password_hashing
+from cmk.crypto.password import Password
+from cmk.crypto.secrets import Secret
 
 auth_logger = logger.getChild("auth")
 
-AuthFunction = Callable[[], UserId | None]
+
+AuthFunction = Callable[[], UserId | PseudoUserId | None]
 
 
-def check_auth() -> tuple[UserId, AuthType]:
+def check_auth() -> tuple[UserId | PseudoUserId, AuthType]:
     """Try to authenticate a user from the current request.
 
     This will attempt to authenticate the user via all possible authentication types.
@@ -42,33 +55,43 @@ def check_auth() -> tuple[UserId, AuthType]:
     if not active_config.user_login and not is_site_login():
         raise MKAuthException("Site can't be logged into.")
 
-    # NOTE: To push this list into the global namespace, the ordering of the methods need to
-    #       be taken into account.
     auth_methods: list[tuple[AuthFunction, AuthType]] = [
         # NOTE: This list is sorted from the more general to the most specific auth methods.
         #       The most specific to succeed will be used in the end.
-        (_check_auth_by_cookie, "cookie"),
         (_check_auth_by_custom_http_header, "http_header"),
         (_check_auth_by_remote_user, "web_server"),
         (_check_auth_by_basic_header, "basic_auth"),
         (_check_auth_by_bearer_header, "bearer"),
-        # Automation authentication via _username and _secret overrules everything else.
-        (_check_auth_by_automation_credentials_in_request_values, "automation"),
+        (_check_internal_token, "internal_token"),
+        (_check_remote_site, "remote_site"),
     ]
 
-    selected: tuple[UserId, AuthType] | None = None
+    selected: tuple[UserId | PseudoUserId, AuthType] | None = None
+    user_id = None
     for auth_method, auth_type in auth_methods:
         # NOTE: It's important for these methods to always raise an exception whenever something
         # strange is happening. This will abort the whole process, regardless of which auth method
         # succeeded or not.
-        if user_id := auth_method():
-            # The last auth_method is the most specific one, use that.
-            selected = (user_id, auth_type)
+        try:
+            if user_id := auth_method():
+                # The last auth_method is the most specific one, use that.
+                selected = (user_id, auth_type)
+        except Exception as e:
+            log_security_event(
+                AuthenticationFailureEvent(
+                    user_error=str(e),
+                    auth_method=auth_type,
+                    username=user_id if isinstance(user_id, UserId) else None,
+                    remote_ip=request.remote_ip,
+                )
+            )
+            raise
 
     if not selected:
         raise MKAuthException("Couldn't log in.")
 
-    _check_cme_login(selected[0])
+    if not isinstance(selected[0], PseudoUserId):
+        _check_cme_login(selected[0])
 
     return selected
 
@@ -76,7 +99,13 @@ def check_auth() -> tuple[UserId, AuthType]:
 def is_site_login() -> bool:
     """Determine if login is a site login for connecting central and remote
     site. This login has to be allowed even if site login on remote site is not
-    permitted by rule "Direct login to Web GUI allowed" """
+    permitted by rule "Direct login to web GUI allowed".  This also applies to
+    all rest-api requests, they should also be allowed in this scenario otherwise
+    the agent-receiver won't work."""
+
+    if re.match("/[^/]+/check_mk/api/", request.path) is not None:
+        return True
+
     if requested_file_name(request) == "login":
         if (origtarget_var := request.var("_origtarget")) is None:
             return False
@@ -178,11 +207,16 @@ def _check_auth_by_header(
     try:
         password = Password(passwd)
     except ValueError as e:
+        # Note: not wrong, invalid. E.g. contains null bytes or is empty
         raise MKAuthException(f"Invalid password: {e}")
 
     # Could be an automation user or a regular user
     if _verify_automation_login(user_id, password.raw) or _verify_user_login(user_id, password):
         return user_id
+
+    # At this point: invalid credentials. Could be user, password or both.
+    # on_failed_login wants to be informed about non-existing users as well.
+    userdb.on_failed_login(user_id, datetime.now())
 
     raise MKAuthException(f"Wrong credentials ({token_name} header)")
 
@@ -249,6 +283,39 @@ def _check_auth_by_bearer_header() -> UserId | None:
     return _check_auth_by_header("Bearer", _parse_bearer_token)
 
 
+def _check_internal_token() -> SiteInternalPseudoUser | None:
+    if not (auth_header := request.environ.get("HTTP_AUTHORIZATION", "")).startswith(
+        "InternalToken "
+    ):
+        return None
+
+    _tokenname, token = auth_header.split("InternalToken ", maxsplit=1)
+
+    with contextlib.suppress(binascii.Error):  # base64 decoding failure
+        if SiteInternalSecret().check(Secret.from_b64(token)):
+            return SiteInternalPseudoUser()
+
+    return None
+
+
+def _check_remote_site() -> RemoteSitePseudoUser | None:
+    if not (auth_header := request.environ.get("HTTP_AUTHORIZATION", "")).startswith("RemoteSite "):
+        return None
+
+    _tokenname, token = auth_header.split("RemoteSite ", maxsplit=1)
+
+    if (page_name := requested_file_name(request)) != "register_agent":
+        raise MKAuthException(f"RemoteSite auth for invalid page: {page_name}")
+
+    with contextlib.suppress(binascii.Error):  # base64 decoding failure
+        for enabled_site in enabled_sites().values():
+            if "secret" not in enabled_site:
+                continue
+            if Secret.from_b64(token).compare(Secret(enabled_site["secret"].encode())):
+                return RemoteSitePseudoUser(enabled_site["id"])
+    raise MKAuthException("RemoteSite auth for unknown remote site")
+
+
 def _parse_bearer_token(token: str) -> tuple[str, str]:
     """Read username and password from a Bearer token ("<username> <password>").
 
@@ -278,56 +345,6 @@ def _parse_bearer_token(token: str) -> tuple[str, str]:
     return user_id, password
 
 
-def _check_auth_by_cookie() -> UserId | None:
-    """Check if session cookie exists and if it is valid
-
-    Returns:
-        a UserId if a user was successfully authenticated
-        None if not authenticated or no auth cookie is found
-    """
-
-    cookie_name = auth_cookie_name()
-    if not (cookie := _get_request_cookie(cookie_name)):
-        return None
-
-    try:
-        username, session_id, _cookie_hash = parse_and_check_cookie(cookie)
-        userdb.on_access(username, session_id, datetime.now())
-        return username
-    except MKAuthException:
-        # Why and how does this happen and why we can't do it another way.
-        # Suppress cookie validation errors from other sites cookies
-        auth_logger.debug(
-            f"Exception while checking cookie {cookie_name}: {traceback.format_exc()}"
-        )
-
-    return None
-
-
-def _get_request_cookie(cookie_name: str) -> str | None:
-    """Get the cookie from the request.
-
-    This is an internal method extracted for ease of unit testing parse_and_check_cookie().
-    """
-    return request.cookies.get(cookie_name, default=None, type=str)
-
-
-def _check_auth_by_automation_credentials_in_request_values() -> UserId | None:
-    """Check credentials either in query string or form encoded POST body
-
-    Raises:
-        MKAuthException: whenever an illegal username is detected.
-    """
-    if (username := request.values.get("_username")) and (
-        password := request.values.get("_secret")
-    ):
-        user_id = _try_user_id(username)
-        if _verify_automation_login(user_id, password):
-            return user_id
-
-    return None
-
-
 def _check_cme_login(user_id: UserId) -> None:
     """In case of CME, check that the customer is allowed to log in at this site"""
     if not userdb.is_customer_user_allowed_to_login(user_id):
@@ -351,10 +368,15 @@ def _verify_automation_login(user_id: UserId, secret: str) -> bool:
     Returns:
         True if user_id is an automation user and the secret matches.
     """
+
+    htpwd_entries = Htpasswd(Path(cmk.utils.paths.htpasswd_file)).load(allow_missing_file=True)
+    password_hash = htpwd_entries.get(user_id)
+
     return (
         secret != ""
-        and (stored_secret := AutomationUserSecret(user_id)).exists()
-        and stored_secret.read() == secret
+        and password_hash is not None
+        and not password_hash.startswith("!")  # user is locked
+        and password_hashing.matches(Password(secret), password_hash)
     )
 
 

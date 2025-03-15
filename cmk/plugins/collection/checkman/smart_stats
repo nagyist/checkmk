@@ -1,0 +1,25 @@
+title: HDD Health Statistics Using S.M.A.R.T
+agents: linux
+catalog: os/hardware
+license: GPLv2
+distribution: check_mk
+description:
+ This check monitors health statistics like error counters of HDDs using the
+ information reported by S.M.A.R.T. This check works only for HDDs which
+ report the value {Temperature_Celsius} via {smartctl -A <device>}.
+
+ The check uses information provided by the Checkmk linux agent which are
+ available when the agent has been extended with the {smart} agent plugin.
+ The {smart} agent plugins has been superseded by the {smart_posix} plugin.
+
+ During inventory the current value of all counters is being
+ snapshotted into the check's parameters. If later one of the value increases
+ the check gets critical. It will become green again if the check is
+ being reinventorized.
+
+item:
+ Name of the disk
+
+discovery:
+ One service is created if there is at least one supported value
+ available for a HDD.

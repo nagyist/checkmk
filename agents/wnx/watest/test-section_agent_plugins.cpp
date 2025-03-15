@@ -6,10 +6,10 @@
 #include <filesystem>
 #include <ranges>
 
-#include "cfg.h"
 #include "common/wtools.h"
 #include "providers/agent_plugins.h"
-#include "test_tools.h"
+#include "watest/test_tools.h"
+#include "wnx/cfg.h"
 
 namespace fs = std::filesystem;
 
@@ -55,6 +55,27 @@ TEST_F(AgentPluginsTest, File) {
     EXPECT_TRUE(std::ranges::any_of(rows, [&](const std::string &row) {
         return row == fmt::format("{}:CMK_VERSION = \"2.2.0i1\"", ps_file);
     }));
+}
+
+TEST_F(AgentPluginsTest, JustExe) {
+    auto ps_file = fs::path{cfg::GetUserPluginsDir()} / "empty.exe";
+    tst::CreateTextFile(ps_file, "");
+    auto rows = getRows();
+    ASSERT_EQ(rows.size(), 4);
+    EXPECT_TRUE(std::ranges::any_of(rows, [&](const std::string &row) {
+        return row == fmt::format("{}:CMK_VERSION = n/a", ps_file);
+    }));
+}
+
+TEST_F(AgentPluginsTest, DISABLED_Exe) {
+    // Test is disabled because we need a binary to build: not appropriate for
+    // unit testing. You may enable this test manually
+    auto v_file = tst::GetSolutionRoot() / "test_files" / "tools" / "v" /
+                  "target" / "release" / "v.exe";
+    fs::copy(v_file, fs::path{cfg::GetUserPluginsDir()} / "mk-sql.exe");
+    auto rows = getRows();
+    ASSERT_EQ(rows.size(), 4);
+    EXPECT_TRUE(rows[3].ends_with("v.exe:CMK_VERSION = \"0.1.0\""));
 }
 
 TEST_F(AgentPluginsTest, FileMix) {

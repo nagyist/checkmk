@@ -8,22 +8,26 @@ for test and development."""
 import random
 from collections.abc import Collection
 
-from cmk.utils.type_defs import HostName
+from cmk.utils.hostaddress import HostName
 
-import cmk.gui.forms as forms
+from cmk.gui import forms
 from cmk.gui.breadcrumb import Breadcrumb
 from cmk.gui.htmllib.html import html
 from cmk.gui.http import request
 from cmk.gui.i18n import _
 from cmk.gui.page_menu import make_simple_form_page_menu, PageMenu
-from cmk.gui.plugins.wato.utils import flash, mode_registry, mode_url, redirect, WatoMode
 from cmk.gui.type_defs import ActionResult, PermissionName
+from cmk.gui.utils.flashed_messages import flash
 from cmk.gui.utils.transaction_manager import transactions
 from cmk.gui.wato.pages.folders import ModeFolder
-from cmk.gui.watolib.hosts_and_folders import Folder
+from cmk.gui.watolib.hosts_and_folders import folder_from_request
+from cmk.gui.watolib.mode import mode_url, ModeRegistry, redirect, WatoMode
 
 
-@mode_registry.register
+def register(mode_registry: ModeRegistry) -> None:
+    mode_registry.register(ModeRandomHosts)
+
+
 class ModeRandomHosts(WatoMode):
     @classmethod
     def name(cls) -> str:
@@ -46,33 +50,33 @@ class ModeRandomHosts(WatoMode):
         )
 
     def action(self) -> ActionResult:
+        folder = folder_from_request(request.var("folder"), request.get_ascii_input("host"))
         if not transactions.check_transaction():
-            return redirect(mode_url("folder", folder=Folder.current().path()))
+            return redirect(mode_url("folder", folder=folder.path()))
 
         count = request.get_integer_input_mandatory("count")
         folders = request.get_integer_input_mandatory("folders")
         levels = request.get_integer_input_mandatory("levels")
-        created = self._create_random_hosts(Folder.current(), count, folders, levels)
+        created = self._create_random_hosts(folder, count, folders, levels)
         flash(_("Added %d random hosts.") % created)
-        return redirect(mode_url("folder", folder=Folder.current().path()))
+        return redirect(mode_url("folder", folder=folder.path()))
 
     def page(self) -> None:
-        html.begin_form("random")
-        forms.header(_("Add random hosts"))
-        forms.section(_("Number to create"))
-        html.write_text("%s: " % _("Hosts to create in each folder"))
-        html.text_input("count", default_value="10", cssclass="number")
-        html.set_focus("count")
-        html.br()
-        html.write_text("%s: " % _("Number of folders to create in each level"))
-        html.text_input("folders", default_value="10", cssclass="number")
-        html.br()
-        html.write_text("%s: " % _("Levels of folders to create"))
-        html.text_input("levels", default_value="1", cssclass="number")
+        with html.form_context("random"):
+            forms.header(_("Add random hosts"))
+            forms.section(_("Number to create"))
+            html.write_text_permissive("%s: " % _("Hosts to create in each folder"))
+            html.text_input("count", default_value="10", cssclass="number")
+            html.set_focus("count")
+            html.br()
+            html.write_text_permissive("%s: " % _("Number of folders to create in each level"))
+            html.text_input("folders", default_value="10", cssclass="number")
+            html.br()
+            html.write_text_permissive("%s: " % _("Levels of folders to create"))
+            html.text_input("levels", default_value="1", cssclass="number")
 
-        forms.end()
-        html.hidden_fields()
-        html.end_form()
+            forms.end()
+            html.hidden_fields()
 
     def _create_random_hosts(self, folder, count, folders, levels):
         if levels == 0:

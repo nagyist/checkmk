@@ -15,7 +15,8 @@
 #include "livestatus/ListColumn.h"
 #include "livestatus/Row.h"
 #include "livestatus/User.h"
-#include "livestatus/opids.h"
+
+enum class RelationalOperator;
 class IntFilter;
 class Logger;
 
@@ -39,7 +40,7 @@ template <>
 std::string serialize(const column::attribute_list::AttributeBit &bit);
 }  // namespace column::detail
 
-template <class T, class U>
+template <typename T, typename U>
 class AttributeListColumn : public ListColumn<T, U> {
 public:
     using ListColumn<T, U>::ListColumn;

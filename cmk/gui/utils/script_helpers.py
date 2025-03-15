@@ -8,27 +8,31 @@ The intended use is for scripts such as cmk-update-config or init-redis.
 """
 
 import typing
-import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
-from functools import lru_cache
+from functools import cache
 from typing import Any
 
 from flask import Flask
 from flask.ctx import RequestContext
 from werkzeug.test import create_environ
 
+from cmk.ccc.version import edition
+
+from cmk.utils import paths
+
 from cmk.gui.http import Response
 
 Environments = typing.Literal["production", "testing", "development"]
 
 
-@lru_cache
+@cache
 def session_wsgi_app(debug: bool = False, testing: bool = False) -> Flask:
     # TODO: Temporary hack. Can be removed once #12954 has been ported from 2.0.0
     from cmk.gui.wsgi.app import make_wsgi_app
 
-    return make_wsgi_app(debug=debug, testing=testing)
+    # For now always use the detected edition. At some point make this parameterized
+    return make_wsgi_app(edition(paths.omd_root), debug=debug, testing=testing)
 
 
 def make_request_context(app: Flask, environ: dict[str, Any] | None = None) -> RequestContext:
@@ -47,13 +51,6 @@ def request_context(app: Flask, environ: dict[str, Any] | None = None) -> Iterat
 
 @contextmanager
 def application_and_request_context(environ: dict[str, Any] | None = None) -> Iterator[None]:
-    warnings.warn(
-        "Please either use the `request_context` fixture or the `flask_app` fixture from now "
-        "on. Using `flask_app` you can have access to the test client as well. "
-        "See https://flask.palletsprojects.com/en/latest/testing/ and examples in our tests.",
-        DeprecationWarning,
-    )
-
     app = session_wsgi_app(testing=True)
     with app.app_context(), request_context(app, environ):
         yield

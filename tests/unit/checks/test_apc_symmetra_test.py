@@ -5,15 +5,14 @@
 
 
 import pytest
-from freezegun import freeze_time
+import time_machine
 
-from tests.testlib import Check
+from cmk.agent_based.v2 import State, StringTable
 
-from cmk.base.plugins.agent_based.agent_based_api.v1 import State
-from cmk.base.plugins.agent_based.agent_based_api.v1.type_defs import StringTable
+from .checktestlib import Check
 
 
-@freeze_time("2020-01-13")
+@time_machine.travel("2020-01-13")
 @pytest.mark.parametrize(
     "info, expected_status",
     [

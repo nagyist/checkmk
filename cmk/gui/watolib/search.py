@@ -8,15 +8,18 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
-from contextlib import suppress
 from dataclasses import dataclass
 from itertools import chain
 from typing import Final
 
 import redis
+from redis import ConnectionError as RedisConnectionError
 
-from cmk.utils.exceptions import MKGeneralException
-from cmk.utils.plugin_registry import Registry
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.ccc.plugin_registry import Registry
+from cmk.ccc.version import Edition, edition
+
+from cmk.utils import paths
 from cmk.utils.redis import get_redis_client, redis_enabled, redis_server_reachable
 from cmk.utils.setup_search_index import (
     read_and_remove_update_requests,
@@ -26,16 +29,22 @@ from cmk.utils.setup_search_index import (
 
 from cmk.gui.background_job import (
     BackgroundJob,
-    BackgroundJobAlreadyRunning,
     BackgroundProcessInterface,
     InitialStatusArgs,
-    job_registry,
+    NoArgs,
+    simple_job_target,
 )
 from cmk.gui.ctx_stack import g
 from cmk.gui.exceptions import MKAuthException
-from cmk.gui.hooks import register_builtin
+from cmk.gui.global_config import get_global_config
 from cmk.gui.http import request
-from cmk.gui.i18n import _, get_current_language, get_languages, localize
+from cmk.gui.i18n import (
+    _,
+    get_current_language,
+    get_languages,
+    localize,
+    translate_to_current_language,
+)
 from cmk.gui.logged_in import user
 from cmk.gui.pages import get_page_handler
 from cmk.gui.session import SuperUserContext
@@ -74,18 +83,15 @@ class ABCMatchItemGenerator(ABC):
         return hash(self.name)
 
     @abstractmethod
-    def generate_match_items(self) -> MatchItems:
-        ...
+    def generate_match_items(self) -> MatchItems: ...
 
     @staticmethod
     @abstractmethod
-    def is_affected_by_change(change_action_name: str) -> bool:
-        ...
+    def is_affected_by_change(change_action_name: str) -> bool: ...
 
     @property
     @abstractmethod
-    def is_localization_dependent(self) -> bool:
-        ...
+    def is_localization_dependent(self) -> bool: ...
 
 
 class MatchItemGeneratorRegistry(Registry[ABCMatchItemGenerator]):
@@ -308,6 +314,7 @@ class PermissionsHandler:
             "event_console": user.may("mkeventd.edit") or user.may("wato.seeall"),
             "event_console_settings": user.may("mkeventd.config") or user.may("wato.seeall"),
             "logfile_pattern_analyzer": user.may("wato.pattern_editor") or user.may("wato.seeall"),
+            "notification_parameter": user.may("wato.notifications") or user.may("wato.seeall"),
         }
 
     @staticmethod
@@ -318,8 +325,16 @@ class PermissionsHandler:
     def may_see_category(self, category: str) -> bool:
         return user.may("wato.use") and self._category_permissions.get(category, True)
 
+    @staticmethod
+    def _permission_global_setting(url: str) -> bool:
+        if edition(paths.omd_root) is not Edition.CSE:
+            return True
+        _, query_vars = file_name_and_query_vars_from_url(url)
+        return get_global_config().global_settings.is_activated(query_vars["varname"][0])
+
     def permissions_for_items(self) -> Mapping[str, Callable[[str], bool]]:
         return {
+            "global_settings": self._permission_global_setting,
             "rules": self._permissions_rule,
             "hosts": lambda url: (
                 any(user.may(perm) for perm in ("wato.all_folders", "wato.see_all_folders"))
@@ -391,13 +406,17 @@ class IndexSearcher:
 
     def _launch_index_building_in_background_job(self) -> None:
         build_job = SearchIndexBackgroundJob()
-        with suppress(BackgroundJobAlreadyRunning):
-            build_job.start(
-                lambda job_interface: _index_building_in_background_job(
-                    job_interface,
-                    self._redis_client,
-                )
-            )
+        build_job.start(
+            simple_job_target(_index_building_in_background_job),
+            # We deliberately do not provide an estimated duration here, since that involves I/O.
+            # We need to be as fast as possible here, since this is done at the end of HTTP
+            # requests.
+            InitialStatusArgs(
+                title=_("Search index"),
+                stoppable=False,
+                user=str(user.id) if user.id else None,
+            ),
+        )
 
     def _search_redis_categories(
         self,
@@ -425,14 +444,13 @@ class IndexSearcher:
                     IndexBuilder.add_to_prefix(prefix_category, idx_matched_item)
                 )
 
-                # This call to i18n._ with a non-constant string is ok. Here, we translate the
-                # topics of our search results. For localization-dependent search results, such as
-                # rulesets, they are already localized anyway. However, for localization-independent
-                # results, such as hosts, they are not. For example, "Hosts" in French is "Hôtes".
-                # Without this call to i18n._, found hosts would be displayed under the topic
-                # "Hosts" instead of "Hôtes" in the setup search.
-                # pylint: disable=translation-of-non-string
-                results[_(match_item_dict["topic"])].append(
+                # We translate the topics of our search results. For localization-dependent search
+                # results, such as rulesets, they are already localized anyway. However, for
+                # localization-independent results, such as hosts, they are not. For example,
+                # "Hosts" in French is "Hôtes". Without this call to translate_to_current_language,
+                # found hosts would be displayed under the topic "Hosts" instead of "Hôtes" in the
+                # setup search.
+                results[translate_to_current_language(match_item_dict["topic"])].append(
                     _SearchResultWithPermissionsCheck(
                         SearchResult(
                             match_item_dict["title"],
@@ -486,6 +504,7 @@ class IndexSearcher:
             _("Event Console rule packs"),
             _("Event Console rules"),
             _("Event Console settings"),
+            _("Notification parameter"),
             # _("Users"),
             _("Enforced services"),
             _("Global settings"),
@@ -496,7 +515,7 @@ class IndexSearcher:
 
     @staticmethod
     def _filter_results_by_user_permissions(
-        results_by_topic: Iterable[tuple[str, Iterable[_SearchResultWithPermissionsCheck]]]
+        results_by_topic: Iterable[tuple[str, Iterable[_SearchResultWithPermissionsCheck]]],
     ) -> SearchResultsByTopic:
         yield from (
             (
@@ -518,44 +537,55 @@ class _SearchResultWithPermissionsCheck:
 
 
 def _index_building_in_background_job(
-    job_interface: BackgroundProcessInterface,
-    redis_client: redis.Redis[str],
+    job_interface: BackgroundProcessInterface, args: NoArgs
 ) -> None:
+    with job_interface.gui_context(), get_redis_client() as redis_client:
+        _build_index(job_interface, redis_client)
+
+
+def _build_index(job_interface: BackgroundProcessInterface, redis_client: redis.Redis[str]) -> None:
     job_interface.send_progress_update(_("Building of search index started"))
     IndexBuilder(match_item_generator_registry, redis_client).build_full_index()
     job_interface.send_result_message(_("Search index successfully built"))
 
 
-def _launch_requests_processing_background() -> None:
+def launch_requests_processing_background() -> None:
     if not updates_requested() or not redis_enabled():
         return
     job = SearchIndexBackgroundJob()
-    with suppress(BackgroundJobAlreadyRunning):
-        job.start(
-            lambda job_interface: _process_update_requests_background(
-                job_interface,
-                get_redis_client(),
-            )
-        )
-
-
-register_builtin("request-start", _launch_requests_processing_background)
+    # Don't report any error from job.start() to not spam the logs
+    job.start(
+        simple_job_target(_process_update_requests_background),
+        # We deliberately do not provide an estimated duration here, since that involves I/O.
+        # We need to be as fast as possible here, since this is done at the end of HTTP
+        # requests.
+        InitialStatusArgs(
+            title=_("Search index"),
+            stoppable=False,
+            user=str(user.id) if user.id else None,
+        ),
+    )
 
 
 def _process_update_requests_background(
-    job_interface: BackgroundProcessInterface,
-    redis_client: redis.Redis[str],
+    job_interface: BackgroundProcessInterface, args: NoArgs
 ) -> None:
-    if not redis_server_reachable(redis_client):
-        job_interface.send_progress_update(_("Redis is not reachable, terminating"))
-        return
+    with job_interface.gui_context(), get_redis_client() as redis_client:
+        if not redis_server_reachable(redis_client):
+            job_interface.send_progress_update(_("Redis is not reachable, terminating"))
+            return
 
-    while updates_requested():
-        _process_update_requests(
-            read_and_remove_update_requests(),
-            job_interface,
-            redis_client,
-        )
+        try:
+            while updates_requested():
+                _process_update_requests(
+                    read_and_remove_update_requests(),
+                    job_interface,
+                    redis_client,
+                )
+        except RedisConnectionError as e:
+            # This can happen when Redis or the whole site is stopped while the background job is
+            # running. Report an error in the background job result but don't create a crash report.
+            job_interface.send_exception(_("An connection error occurred: %s") % e)
 
 
 def _process_update_requests(
@@ -564,12 +594,12 @@ def _process_update_requests(
     redis_client: redis.Redis[str],
 ) -> None:
     if requests["rebuild"]:
-        _index_building_in_background_job(job_interface, redis_client)
+        _build_index(job_interface, redis_client)
         return
 
     if not IndexBuilder.index_is_built(redis_client):
         job_interface.send_progress_update(_("Search index not found, re-building from scratch"))
-        _index_building_in_background_job(job_interface, redis_client)
+        _build_index(job_interface, redis_client)
         return
 
     job_interface.send_progress_update(_("Updating of search index started"))
@@ -579,7 +609,6 @@ def _process_update_requests(
     job_interface.send_result_message(_("Search index successfully updated"))
 
 
-@job_registry.register
 class SearchIndexBackgroundJob(BackgroundJob):
     job_prefix = "search_index"
 
@@ -588,13 +617,4 @@ class SearchIndexBackgroundJob(BackgroundJob):
         return _("Search index")
 
     def __init__(self) -> None:
-        super().__init__(
-            self.job_prefix,
-            # We deliberately do not provide an estimated duration here, since that involves I/O.
-            # We need to be as fast as possible here, since this is done at the end of HTTP
-            # requests.
-            InitialStatusArgs(
-                title=_("Search index"),
-                stoppable=False,
-            ),
-        )
+        super().__init__(self.job_prefix)

@@ -8,29 +8,35 @@
 from __future__ import annotations
 
 import functools
+import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from itertools import chain
 from typing import Any
+from urllib.parse import quote_plus
 
 import livestatus
+from livestatus import SiteId
+
+from cmk.ccc.site import omd_site
 
 from cmk.utils.cpu_tracking import CPUTracker, Snapshot
-from cmk.utils.site import omd_site
-from cmk.utils.type_defs import UserId
+from cmk.utils.livestatus_helpers.queries import Query
+from cmk.utils.user import UserId
 
-import cmk.gui.log as log
-import cmk.gui.visuals as visuals
-from cmk.gui.config import active_config
+from cmk.gui import log, visuals
+from cmk.gui.config import active_config, Config
 from cmk.gui.ctx_stack import g
+from cmk.gui.data_source import data_source_registry
 from cmk.gui.display_options import display_options
 from cmk.gui.exceptions import MKMissingDataError, MKUserError
 from cmk.gui.exporter import exporter_registry
 from cmk.gui.htmllib.html import html
-from cmk.gui.http import request
+from cmk.gui.http import Request, request
 from cmk.gui.i18n import _
 from cmk.gui.logged_in import user
-from cmk.gui.page_menu import make_external_link, PageMenuEntry, PageMenuTopic
-from cmk.gui.plugins.visuals.utils import Filter, get_livestatus_filter_headers
+from cmk.gui.page_menu import make_external_link, PageMenuDropdown, PageMenuEntry, PageMenuTopic
+from cmk.gui.painter.v0 import Cell, columns_of_cells
+from cmk.gui.painter_options import PainterOptions
 from cmk.gui.type_defs import (
     ColumnName,
     PainterParameters,
@@ -43,19 +49,24 @@ from cmk.gui.type_defs import (
 from cmk.gui.utils.urls import makeuri_contextless
 from cmk.gui.view import View
 from cmk.gui.view_renderer import ABCViewRenderer, GUIViewRenderer
-from cmk.gui.views.data_source import data_source_registry
+from cmk.gui.visuals import (
+    filters_allowed_for_infos,
+    get_livestatus_filter_headers,
+    get_only_sites_from_context,
+)
+from cmk.gui.visuals.filter import Filter
 
 from . import availability
-from .painter.v0.base import Cell, columns_of_cells
-from .painter_options import PainterOptions
 from .row_post_processing import post_process_rows
-from .sorter import SorterEntry
+from .sorter import SorterEntry, SorterProtocol
 from .store import get_all_views, get_permitted_views
 
 
-def page_show_view() -> None:
+def page_show_view(
+    page_menu_dropdowns_callback: Callable[[View, Rows, list[PageMenuDropdown]], None],
+) -> None:
     """Central entry point for the initial HTML page rendering of a view"""
-    with CPUTracker() as page_view_tracker:
+    with CPUTracker(log.logger.debug) as page_view_tracker:
         view_name = request.get_ascii_input_mandatory("view_name", "")
         view_spec = visuals.get_permissioned_visual(
             view_name,
@@ -72,7 +83,7 @@ def page_show_view() -> None:
         view = View(view_name, view_spec, context)
         view.row_limit = get_limit()
 
-        view.only_sites = visuals.get_only_sites_from_context(context)
+        view.only_sites = get_only_sites_from_context(context)
 
         view.user_sorters = get_user_sorters(view.spec["sorters"], view.row_cells)
         view.want_checkboxes = get_want_checkboxes()
@@ -88,7 +99,13 @@ def page_show_view() -> None:
         painter_options = PainterOptions.get_instance()
         painter_options.load(view.name)
         painter_options.update_from_url(view.name, view.painter_options)
-        process_view(GUIViewRenderer(view, show_buttons=True))
+        process_view(
+            GUIViewRenderer(
+                view,
+                show_buttons=True,
+                page_menu_dropdowns_callback=page_menu_dropdowns_callback,
+            )
+        )
 
     _may_create_slow_view_log_entry(page_view_tracker, view)
 
@@ -166,7 +183,7 @@ def process_view(view_renderer: ABCViewRenderer) -> None:
 
 
 def _process_regular_view(view_renderer: ABCViewRenderer) -> None:
-    all_active_filters = _get_all_active_filters(view_renderer.view)
+    all_active_filters = get_all_active_filters(view_renderer.view)
     with livestatus.intercept_queries() as queries:
         unfiltered_amount_of_rows, rows = _get_view_rows(
             view_renderer.view,
@@ -183,11 +200,7 @@ def _process_regular_view(view_renderer: ABCViewRenderer) -> None:
     _show_view(view_renderer, unfiltered_amount_of_rows, rows)
 
 
-def _add_rest_api_menu_entries(view_renderer, queries: list[str]):  # type: ignore[no-untyped-def]
-    from cmk.utils.livestatus_helpers.queries import Query
-
-    from cmk.gui.plugins.openapi.utils import create_url
-
+def _add_rest_api_menu_entries(view_renderer: ABCViewRenderer, queries: list[str]) -> None:
     entries: list[PageMenuEntry] = []
     for text_query in set(queries):
         if "\nStats:" in text_query:
@@ -197,7 +210,7 @@ def _add_rest_api_menu_entries(view_renderer, queries: list[str]):  # type: igno
         except ValueError:
             continue
         try:
-            url = create_url(omd_site(), query)
+            url = _create_url(omd_site(), query)
         except ValueError:
             continue
         table = query.table.__tablename__
@@ -217,9 +230,49 @@ def _add_rest_api_menu_entries(view_renderer, queries: list[str]):  # type: igno
     )
 
 
+def _create_url(site: SiteId, query: Query) -> str:
+    """Create a REST-API query URL.
+
+    Examples:
+
+        >>> _create_url('heute',
+        ...            Query.from_string("GET hosts\\nColumns: name\\nFilter: name = heute"))
+        '/heute/check_mk/api/1.0/domain-types/host/collections/all?query=%7B%22op%22%3A+%22%3D%22%2C+%22left%22%3A+%22hosts.name%22%2C+%22right%22%3A+%22heute%22%7D'
+
+    Args:
+        site:
+            A valid site-name.
+
+        query:
+            The Query() instance which the endpoint shall create again.
+
+    Returns:
+        The URL.
+
+    Raises:
+        A ValueError when no URL could be created.
+
+    """
+    table = query.table.__tablename__
+    try:
+        domain_type = {
+            "hosts": "host",
+            "services": "service",
+        }[table]
+    except KeyError:
+        raise ValueError(f"Could not find a domain-type for table {table}.")
+    url = f"/{site}/check_mk/api/1.0/domain-types/{domain_type}/collections/all"
+    query_dict = query.dict_repr()
+    if query_dict:
+        query_string_value = quote_plus(json.dumps(query_dict))
+        url += f"?query={query_string_value}"
+
+    return url
+
+
 def _process_availability_view(view_renderer: ABCViewRenderer) -> None:
     view = view_renderer.view
-    all_active_filters = _get_all_active_filters(view)
+    all_active_filters = get_all_active_filters(view)
 
     # Fork to availability view. We just need the filter headers, since we do not query the normal
     # hosts and service table, but "statehist". This is *not* true for BI availability, though (see
@@ -244,7 +297,7 @@ def _process_availability_view(view_renderer: ABCViewRenderer) -> None:
             aggr_rows=rows,
         )
 
-    with CPUTracker() as view_render_tracker:
+    with CPUTracker(log.logger.debug) as view_render_tracker:
         show_view_func()
     view.process_tracking.duration_view_render = view_render_tracker.duration
 
@@ -253,7 +306,7 @@ def _process_availability_view(view_renderer: ABCViewRenderer) -> None:
 def get_row_count(view: View) -> int:
     """Returns the number of rows shown by a view"""
 
-    all_active_filters = _get_all_active_filters(view)
+    all_active_filters = get_all_active_filters(view)
     # Check that all needed information for configured single contexts are available
     if view.missing_single_infos:
         raise MKUserError(
@@ -272,7 +325,7 @@ def get_row_count(view: View) -> int:
 def _get_view_rows(
     view: View, all_active_filters: list[Filter], only_count: bool = False
 ) -> tuple[int, Rows]:
-    with CPUTracker() as fetch_rows_tracker:
+    with CPUTracker(log.logger.debug) as fetch_rows_tracker:
         # Fetch data. Some views show data only after pressing [Search]
         if (
             only_count
@@ -289,7 +342,7 @@ def _get_view_rows(
     # Sorting - use view sorters and URL supplied sorters
     _sort_data(rows, view.sorters)
 
-    with CPUTracker() as filter_rows_tracker:
+    with CPUTracker(log.logger.debug) as filter_rows_tracker:
         # Apply non-Livestatus filters
         for filter_ in all_active_filters:
             try:
@@ -363,16 +416,16 @@ def _show_view(view_renderer: ABCViewRenderer, unfiltered_amount_of_rows: int, r
 
     # Until now no single byte of HTML code has been output.
     # Now let's render the view
-    with CPUTracker() as view_render_tracker:
+    with CPUTracker(log.logger.debug) as view_render_tracker:
         view_renderer.render(
             rows, show_checkboxes, num_columns, show_filters, unfiltered_amount_of_rows
         )
     view.process_tracking.duration_view_render = view_render_tracker.duration
 
 
-def _get_all_active_filters(view: View) -> list[Filter]:
+def get_all_active_filters(view: View) -> list[Filter]:
     # Always allow the users to specify all allowed filters using the URL
-    use_filters = list(visuals.filters_allowed_for_infos(view.datasource.infos).values())
+    use_filters = list(filters_allowed_for_infos(view.datasource.infos).values())
 
     # See process_view() for more information about this hack
     if _is_ec_unrelated_host_view(view.spec):
@@ -583,10 +636,12 @@ def _sort_data(data: Rows, sorters: list[SorterEntry]) -> None:
 
     # Handle case where join columns are not present for all rows
     def safe_compare(
-        compfunc: Callable[[Row, Row, Mapping[str, Any] | None], int],
+        compfunc: SorterProtocol,
         row1: Row,
         row2: Row,
         parameters: Mapping[str, Any] | None,
+        config: Config,
+        req: Request,
     ) -> int:
         if row1 is None and row2 is None:
             return 0
@@ -597,7 +652,9 @@ def _sort_data(data: Rows, sorters: list[SorterEntry]) -> None:
         return compfunc(
             row1,
             row2,
-            parameters,
+            parameters=parameters,
+            config=config,
+            request=req,
         )
 
     def multisort(e1: Row, e2: Row) -> int:
@@ -610,9 +667,17 @@ def _sort_data(data: Rows, sorters: list[SorterEntry]) -> None:
                     e1["JOIN"].get(entry.join_key),
                     e2["JOIN"].get(entry.join_key),
                     entry.parameters,
+                    active_config,
+                    request,
                 )
             else:
-                c = neg * entry.sorter.cmp(e1, e2, entry.parameters)
+                c = neg * entry.sorter.cmp(
+                    e1,
+                    e2,
+                    parameters=entry.parameters,
+                    config=active_config,
+                    request=request,
+                )
 
             if c != 0:
                 return c

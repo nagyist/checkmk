@@ -12,9 +12,9 @@ import pytest
 from pytest import MonkeyPatch
 
 # No stub file
-from tests.testlib.base import Scenario
+from tests.testlib.unit.base_configuration_scenario import Scenario
 
-from cmk.utils.type_defs import HostName
+from cmk.utils.hostaddress import HostName
 
 
 @pytest.mark.parametrize(
@@ -111,6 +111,7 @@ def test_mgmt_config_ruleset(
         [
             {
                 "condition": {},
+                "id": "00",
                 "options": {},
                 "value": (protocol, ruleset_credentials),
             },
@@ -157,11 +158,13 @@ def test_mgmt_config_ruleset_order(
             {
                 "condition": {},
                 "options": {},
+                "id": "01",
                 "value": ("snmp", "RULESET1"),
             },
             {
                 "condition": {},
                 "options": {},
+                "id": "02",
                 "value": ("snmp", "RULESET2"),
             },
         ],
@@ -206,6 +209,7 @@ def test_mgmt_config_ruleset_overidden_by_explicit_setting(
         [
             {
                 "condition": {},
+                "id": "01",
                 "options": {},
                 "value": (protocol, ruleset_credentials),
             },

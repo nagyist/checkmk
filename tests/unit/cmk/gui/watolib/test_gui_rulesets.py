@@ -4,31 +4,36 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 from collections.abc import Callable, Mapping
-
-# pylint: disable=redefined-outer-name
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import pytest
 from pytest import FixtureRequest
 
-from tests.unit.cmk.gui.conftest import SetConfig
+from tests.unit.cmk.web_test_app import SetConfig
 
-import cmk.utils.rulesets.ruleset_matcher as ruleset_matcher
-from cmk.utils import version
-from cmk.utils.exceptions import MKGeneralException
+from cmk.ccc import version
+from cmk.ccc.exceptions import MKGeneralException
+
+from cmk.utils import paths
+from cmk.utils.global_ident_type import PROGRAM_ID_QUICK_SETUP
+from cmk.utils.redis import disable_redis
+from cmk.utils.rulesets import ruleset_matcher
+from cmk.utils.rulesets.definition import RuleGroup
 from cmk.utils.rulesets.ruleset_matcher import RuleOptionsSpec, RulesetName, RuleSpec
-from cmk.utils.type_defs.user_id import UserId
+from cmk.utils.tags import TagGroupID, TagID
+from cmk.utils.user import UserId
 
 import cmk.gui.utils
-
-# Triggers plugin loading of plugins.wato which registers all the plugins
-import cmk.gui.wato
-import cmk.gui.watolib.hosts_and_folders as hosts_and_folders
-import cmk.gui.watolib.rulesets as rulesets
 from cmk.gui.config import active_config
 from cmk.gui.plugins.wato.check_parameters.local import _parameter_valuespec_local
 from cmk.gui.plugins.wato.check_parameters.ps import _valuespec_inventory_processes_rules
-from cmk.gui.watolib.rulesets import RuleOptions, RuleValue
+from cmk.gui.utils.rule_specs import legacy_converter
+from cmk.gui.watolib import rulesets
+from cmk.gui.watolib.configuration_bundle_store import BundleId
+from cmk.gui.watolib.configuration_bundles import create_config_bundle, CreateBundleEntities
+from cmk.gui.watolib.hosts_and_folders import Folder, folder_tree
+from cmk.gui.watolib.rulesets import Rule, RuleOptions, Ruleset, RuleValue
 
 
 def _ruleset(ruleset_name: RulesetName) -> rulesets.Ruleset:
@@ -39,7 +44,7 @@ GEN_ID_COUNT = {"c": 0}
 
 
 @pytest.fixture(autouse=True)
-def fixture_gen_id(monkeypatch):
+def fixture_gen_id(monkeypatch: pytest.MonkeyPatch, request_context: None) -> None:
     GEN_ID_COUNT["c"] = 0
 
     def _gen_id():
@@ -62,7 +67,7 @@ def fixture_gen_id(monkeypatch):
         ("only_hosts", True, True),
         # non-binary service ruleset
         (
-            "checkgroup_parameters:local",
+            RuleGroup.CheckgroupParameters("local"),
             _parameter_valuespec_local().default_value(),
             False,
         ),
@@ -71,10 +76,10 @@ def fixture_gen_id(monkeypatch):
     ],
 )
 def test_rule_from_ruleset_defaults(
-    request_context: None, ruleset_name: str, default_value: RuleValue, is_binary: bool
+    ruleset_name: str, default_value: RuleValue, is_binary: bool
 ) -> None:
     ruleset = _ruleset(ruleset_name)
-    rule = rulesets.Rule.from_ruleset_defaults(hosts_and_folders.Folder.root_folder(), ruleset)
+    rule = rulesets.Rule.from_ruleset_defaults(folder_tree().root_folder(), ruleset)
     assert isinstance(rule.conditions, rulesets.RuleConditions)
     assert rule.rule_options == RuleOptions(
         disabled=False,
@@ -87,73 +92,22 @@ def test_rule_from_ruleset_defaults(
     assert rule.ruleset.rulespec.is_binary_ruleset == is_binary
 
 
-def test_rule_from_config_unhandled_format(
-    request_context,
-):
+def test_rule_from_config_unhandled_format():
     ruleset = _ruleset("inventory_processes_rules")
 
     with pytest.raises(MKGeneralException, match="Invalid rule"):
         rulesets.Rule.from_config(
-            hosts_and_folders.Folder.root_folder(),
+            folder_tree().root_folder(),
             ruleset,
             [],
         )
 
     with pytest.raises(MKGeneralException, match="Invalid rule"):
         rulesets.Rule.from_config(
-            hosts_and_folders.Folder.root_folder(),
+            folder_tree().root_folder(),
             ruleset,
             (None,),
         )
-
-
-@pytest.mark.parametrize(
-    "ruleset_name,rule_spec",
-    [
-        # non-binary host ruleset
-        (
-            "inventory_processes_rules",
-            ("VAL", ["HOSTLIST"]),
-        ),
-        (
-            "inventory_processes_rules",
-            ("VAL", ["tag", "specs"], ["HOSTLIST"]),
-        ),
-        # binary host ruleset
-        (
-            "only_hosts",
-            (["HOSTLIST"],),
-        ),
-        (
-            "only_hosts",
-            (
-                rulesets.NEGATE,
-                ["HOSTLIST"],
-            ),
-        ),
-        # non-binary service ruleset
-        (
-            "checkgroup_parameters:local",
-            ("VAL", ["HOSTLIST"], ["SVC", "LIST"]),
-        ),
-        # binary service ruleset
-        (
-            "clustered_services",
-            (["HOSTLIST"], ["SVC", "LIST"]),
-        ),
-        (
-            "clustered_services",
-            (rulesets.NEGATE, ["HOSTLIST"], ["SVC", "LIST"]),
-        ),
-    ],
-)
-def test_rule_from_config_tuple(ruleset_name, rule_spec):
-    ruleset = rulesets.Ruleset(
-        ruleset_name, ruleset_matcher.get_tag_to_group_map(active_config.tags)
-    )
-    error = "Found old style tuple ruleset"
-    with pytest.raises(MKGeneralException, match=error):
-        ruleset.replace_folder_config(hosts_and_folders.Folder.root_folder(), [rule_spec])
 
 
 @pytest.mark.parametrize(
@@ -310,7 +264,7 @@ def test_rule_from_config_tuple(ruleset_name, rule_spec):
         ),
         # non-binary service ruleset
         (
-            "checkgroup_parameters:local",
+            RuleGroup.CheckgroupParameters("local"),
             {
                 "id": "1",
                 "value": "VAL",
@@ -387,7 +341,6 @@ def test_rule_from_config_tuple(ruleset_name, rule_spec):
     ],
 )
 def test_rule_from_config_dict(
-    request_context: None,
     ruleset_name: str,
     rule_spec: RuleSpec,
     expected_attributes: Mapping[str, object],
@@ -398,7 +351,7 @@ def test_rule_from_config_dict(
         rule_spec["options"] = rule_options
 
     rule = rulesets.Rule.from_config(
-        hosts_and_folders.Folder.root_folder(),
+        folder_tree().root_folder(),
         _ruleset(ruleset_name),
         rule_spec,
     )
@@ -461,7 +414,6 @@ checkgroup_parameters['local'] = [
     ],
 )
 def test_ruleset_to_config(
-    request_context: None,
     monkeypatch: pytest.MonkeyPatch,
     wato_use_git: bool,
     expected_result: str,
@@ -469,10 +421,11 @@ def test_ruleset_to_config(
 ) -> None:
     with set_config(wato_use_git=wato_use_git):
         ruleset = rulesets.Ruleset(
-            "checkgroup_parameters:local", ruleset_matcher.get_tag_to_group_map(active_config.tags)
+            RuleGroup.CheckgroupParameters("local"),
+            ruleset_matcher.get_tag_to_group_map(active_config.tags),
         )
         ruleset.replace_folder_config(
-            hosts_and_folders.Folder.root_folder(),
+            folder_tree().root_folder(),
             [
                 {
                     "id": "1",
@@ -492,7 +445,7 @@ def test_ruleset_to_config(
                 },
             ],
         )
-        assert ruleset.to_config(hosts_and_folders.Folder.root_folder()) == expected_result
+        assert ruleset.to_config(folder_tree().root_folder()) == expected_result
 
 
 @pytest.mark.parametrize(
@@ -529,11 +482,12 @@ def test_ruleset_to_config_sub_folder(
 ) -> None:
     with set_config(wato_use_git=wato_use_git):
         ruleset = rulesets.Ruleset(
-            "checkgroup_parameters:local", ruleset_matcher.get_tag_to_group_map(active_config.tags)
+            RuleGroup.CheckgroupParameters("local"),
+            ruleset_matcher.get_tag_to_group_map(active_config.tags),
         )
 
-        hosts_and_folders.Folder.create_missing_folders("abc")
-        folder = hosts_and_folders.Folder.folder("abc")
+        folder_tree().create_missing_folders("abc")
+        folder = folder_tree().folder("abc")
 
         ruleset.replace_folder_config(
             folder,
@@ -559,9 +513,9 @@ def test_ruleset_to_config_sub_folder(
         assert ruleset.to_config(folder) == expected_result
 
 
-def test_rule_clone(request_context: None) -> None:
+def test_rule_clone() -> None:
     rule = rulesets.Rule.from_config(
-        hosts_and_folders.Folder.root_folder(),
+        folder_tree().root_folder(),
         _ruleset("clustered_services"),
         {
             "id": "10",
@@ -584,6 +538,183 @@ def test_rule_clone(request_context: None) -> None:
     assert rule.folder == cloned_rule.folder
     assert rule.ruleset == cloned_rule.ruleset
     assert rule.id != cloned_rule.id
+
+
+def test_rule_clone_locked() -> None:
+    rule = rulesets.Rule.from_config(
+        folder_tree().root_folder(),
+        _ruleset("clustered_services"),
+        {
+            "id": "10",
+            "value": True,
+            "condition": {
+                "host_name": ["HOSTLIST"],
+                "service_description": [{"$regex": "SVC"}, {"$regex": "LIST"}],
+            },
+            "locked_by": {
+                "site_id": "heute",
+                "program_id": PROGRAM_ID_QUICK_SETUP,
+                "instance_id": "...",
+            },
+        },
+    )
+    assert rule.locked_by is not None
+
+    cloned_rule = rule.clone(preserve_id=True)
+    assert rule.locked_by == cloned_rule.locked_by
+
+    cloned_rule = rule.clone(preserve_id=False)
+    assert cloned_rule.locked_by is None
+
+
+def _setup_rules(rule_a_locked: bool, rule_b_locked: bool) -> tuple[Ruleset, Folder, Rule]:
+    ruleset = _ruleset(RuleGroup.CheckgroupParameters("local"))
+    bundle_id = BundleId("bundle_id")
+    program_id = PROGRAM_ID_QUICK_SETUP
+    create_config_bundle(
+        bundle_id=bundle_id,
+        bundle={
+            "title": "bundle_title",
+            "comment": "bundle_comment",
+            "group": "bundle_group",
+            "program_id": program_id,
+        },
+        entities=CreateBundleEntities(),
+    )
+
+    folder = folder_tree().root_folder()
+    ruleset.append_rule(
+        folder,
+        Rule.from_config(
+            folder,
+            ruleset,
+            {
+                "id": "1",
+                "value": "VAL",
+                "condition": {
+                    "host_name": ["HOSTLIST"],
+                    "service_description": [{"$regex": "SVC"}, {"$regex": "LIST"}],
+                },
+                "locked_by": (
+                    {
+                        "site_id": "heute",
+                        "program_id": program_id,
+                        "instance_id": bundle_id,
+                    }
+                    if rule_a_locked
+                    else None
+                ),
+            },
+        ),
+    )
+    rule = Rule.from_config(
+        folder,
+        ruleset,
+        {
+            "id": "2",
+            "value": "VAL2",
+            "condition": {
+                "host_name": ["HOSTLIST"],
+                "service_description": [{"$regex": "SVC"}, {"$regex": "LIST"}],
+            },
+            "locked_by": (
+                {
+                    "site_id": "heute",
+                    "program_id": program_id,
+                    "instance_id": bundle_id,
+                }
+                if rule_b_locked
+                else None
+            ),
+        },
+    )
+    return ruleset, folder, rule
+
+
+@pytest.mark.parametrize(
+    "rule_a_locked, rule_b_locked, expected_index",
+    [
+        (False, False, 0),
+        (True, False, 1),
+        (False, True, 0),
+        (True, True, 0),
+    ],
+)
+def test_ruleset_get_index_for_move(
+    rule_a_locked: bool, rule_b_locked: bool, expected_index: int
+) -> None:
+    ruleset, folder, rule = _setup_rules(rule_a_locked, rule_b_locked)
+    ruleset.append_rule(folder, rule)
+    assert ruleset.get_index_for_move(folder, rule, 0) == expected_index
+
+
+@pytest.mark.parametrize(
+    "rule_a_locked, rule_b_locked, expected_index",
+    [
+        (False, False, 0),
+        (True, False, 1),
+        (False, True, 0),
+        (True, True, 0),
+    ],
+)
+def test_ruleset_ordering_prepend(
+    rule_a_locked: bool, rule_b_locked: bool, expected_index: int
+) -> None:
+    ruleset, folder, rule = _setup_rules(rule_a_locked, rule_b_locked)
+    ruleset.prepend_rule(folder, rule)
+    assert ruleset.get_folder_rules(folder)[expected_index] == rule
+
+
+@pytest.mark.parametrize(
+    "rule_a_locked, rule_b_locked, expected_index",
+    [
+        (False, False, 1),
+        (True, False, 1),
+        (False, True, 0),
+        (True, True, 1),
+    ],
+)
+def test_ruleset_ordering_append(
+    rule_a_locked: bool, rule_b_locked: bool, expected_index: int
+) -> None:
+    ruleset, folder, rule = _setup_rules(rule_a_locked, rule_b_locked)
+    ruleset.append_rule(folder, rule)
+    assert ruleset.get_folder_rules(folder)[expected_index] == rule
+
+
+@pytest.mark.parametrize(
+    "rule_a_locked, rule_b_locked, expected_index",
+    [
+        (False, False, 0),
+        (True, False, 1),
+        (False, True, 0),
+        (True, True, 0),
+    ],
+)
+def test_ruleset_ordering_move_to(
+    rule_a_locked: bool, rule_b_locked: bool, expected_index: int
+) -> None:
+    ruleset, folder, rule = _setup_rules(rule_a_locked, rule_b_locked)
+    ruleset.append_rule(folder, rule)
+    ruleset.move_rule_to(rule, 0)
+    assert ruleset.get_folder_rules(folder)[expected_index] == rule
+
+
+@pytest.mark.parametrize(
+    "rule_a_locked, rule_b_locked, expected_index",
+    [
+        (False, False, 1),
+        (True, False, 1),
+        (False, True, 0),
+        (True, True, 1),
+    ],
+)
+def test_ruleset_ordering_insert_after(
+    rule_a_locked: bool, rule_b_locked: bool, expected_index: int
+) -> None:
+    ruleset, folder, rule = _setup_rules(rule_a_locked, rule_b_locked)
+    ruleset.insert_rule_after(rule, ruleset.get_folder_rules(folder)[0])
+    assert ruleset.get_folder_rules(folder)[expected_index] == rule
 
 
 @pytest.mark.parametrize(
@@ -648,8 +779,8 @@ def test_matches_search_with_rules(
     folder_name: str,
     expected_result: bool,
 ) -> None:
-    hosts_and_folders.Folder.create_missing_folders(folder_name)
-    folder = hosts_and_folders.Folder.folder(folder_name)
+    folder_tree().create_missing_folders(folder_name)
+    folder = folder_tree().folder(folder_name)
     ruleset = _ruleset("host_contactgroups")
     rule = rulesets.Rule.from_config(folder, ruleset, rule_config)
     ruleset.append_rule(folder, rule)
@@ -669,7 +800,7 @@ class _RuleHelper:
     @staticmethod
     def _make_rule(ruleset: str, value: dict) -> rulesets.Rule:
         return rulesets.Rule.from_config(
-            hosts_and_folders.Folder.root_folder(),
+            folder_tree().root_folder(),
             _ruleset(ruleset),
             {"id": "1", "value": value, "condition": {"host_name": ["HOSTLIST"]}},
         )
@@ -677,10 +808,10 @@ class _RuleHelper:
     @staticmethod
     def gcp_rule() -> rulesets.Rule:
         return _RuleHelper._make_rule(
-            "special_agents:gcp",
+            RuleGroup.SpecialAgents("gcp"),
             {
                 "project": "old_value",
-                "credentials": ("password", "hunter2"),
+                "credentials": ("explicit_password", "uuid", "hunter2"),
                 "services": ["gcs", "gce"],
             },
         )
@@ -688,18 +819,20 @@ class _RuleHelper:
     @staticmethod
     def ssh_rule() -> rulesets.Rule:
         return _RuleHelper._make_rule(
-            "agent_config:lnx_remote_alert_handlers",
+            RuleGroup.AgentConfig("lnx_remote_alert_handlers"),
             {"handlers": {}, "runas": "old_value", "sshkey": ("private_key", "public_key")},
         )
 
 
 @pytest.fixture(
     params=[
-        _RuleHelper(_RuleHelper.gcp_rule, "credentials", ("password", "geheim"), "project"),
+        _RuleHelper(
+            _RuleHelper.gcp_rule, "credentials", ("explicit_password", "uuid", "geheim"), "project"
+        ),
         pytest.param(
             _RuleHelper(_RuleHelper.ssh_rule, "sshkey", ("new_priv", "public_key"), "runas"),
             marks=pytest.mark.skipif(
-                version.is_raw_edition(),
+                version.edition(paths.omd_root) is version.Edition.CRE,
                 reason="lnx_remote_alert_handlers is not available in raw edition",
             ),
         ),
@@ -709,44 +842,99 @@ def rule_helper(request: FixtureRequest) -> _RuleHelper:
     return request.param
 
 
-def test_to_log_masks_secrets(request_context: None) -> None:
+def test_to_log_masks_secrets() -> None:
     log = str(_RuleHelper.gcp_rule().to_log())
     assert "'password'" in log, "password tuple is present"
     assert "hunter2" not in log, "password is masked"
 
 
-def test_diff_rules_new_rule(request_context: None, rule_helper: _RuleHelper) -> None:
+def test_diff_rules_new_rule(rule_helper: _RuleHelper) -> None:
     new = rule_helper.rule()
     diff = new.ruleset.diff_rules(None, new)
     assert rule_helper.secret_attr in diff, "Attribute is added in new rule"
     assert "******" in diff, "Attribute is masked"
 
 
-def test_diff_to_no_changes(request_context: None, rule_helper: _RuleHelper) -> None:
+def test_diff_to_no_changes(rule_helper: _RuleHelper) -> None:
     rule = rule_helper.rule()
-    assert rule.diff_to(rule) == "Nothing was changed."
+    # An uuid is created every time a rule is created/edited, so mock it here for the comparison.
+    # The actual password should stay the same
+    with patch.object(legacy_converter, "ad_hoc_password_id", return_value="test-uuid"):
+        assert rule.diff_to(rule) == "Nothing was changed."
 
 
-def test_diff_to_secret_changed(request_context: None, rule_helper: _RuleHelper) -> None:
+def test_diff_to_secret_changed(rule_helper: _RuleHelper) -> None:
     old, new = rule_helper.rule(), rule_helper.rule()
     new.value[rule_helper.secret_attr] = rule_helper.new_secret
     assert old.diff_to(new) == "Redacted secrets changed."
 
 
-def test_diff_to_secret_unchanged(request_context: None, rule_helper: _RuleHelper) -> None:
+def test_diff_to_secret_unchanged(rule_helper: _RuleHelper) -> None:
     old, new = rule_helper.rule(), rule_helper.rule()
     new.value[rule_helper.other_attr] = "new_value"
-    diff = old.diff_to(new)
+    # An uuid is created every time a rule is created/edited, so mock it here for the comparison.
+    # The actual password should stay the same
+    with patch.object(legacy_converter, "ad_hoc_password_id", return_value="test-uuid"):
+        diff = old.diff_to(new)
     assert "Redacted secrets changed." not in diff
     assert 'changed from "old_value" to "new_value".' in diff
 
 
-def test_diff_to_secret_and_other_attribute_changed(
-    request_context: None, rule_helper: _RuleHelper
-) -> None:
+def test_diff_to_secret_and_other_attribute_changed(rule_helper: _RuleHelper) -> None:
     old, new = rule_helper.rule(), rule_helper.rule()
     new.value[rule_helper.secret_attr] = rule_helper.new_secret
     new.value[rule_helper.other_attr] = "new_value"
     diff = old.diff_to(new)
     assert "Redacted secrets changed." in diff
     assert 'changed from "old_value" to "new_value".' in diff
+
+
+def test_rules_grouped_by_folder() -> None:
+    """Test sort order of rules"""
+    tree = folder_tree()
+    expected_folder_order: list[str] = [
+        "folder2/folder2/folder2",
+        "folder2/folder2/folder1",
+        "folder2/folder2",
+        "folder2/folder1/folder2",
+        "folder2/folder1/folder1",
+        "folder2/folder1",
+        "folder2",
+        "folder1/folder2/folder2",
+        "folder1/folder2/folder1",
+        "folder1/folder2",
+        "folder1/folder1/folder2",
+        "folder1/folder1/folder1",
+        "folder1/folder1",
+        "folder1",
+        "folder4",
+        "",
+    ]
+
+    root: Folder = tree.root_folder()
+    ruleset: Ruleset = Ruleset("only_hosts", {TagID("TAG1"): TagGroupID("TG1")})
+    rules: list[tuple[Folder, int, Rule]] = [(root, 0, Rule.from_ruleset_defaults(root, ruleset))]
+
+    for nr in range(1, 3):
+        folder = Folder.new(tree=tree, name="folder%d" % nr, parent_folder=root)
+        rules.append((folder, 0, Rule.from_ruleset_defaults(folder, ruleset)))
+        for x in range(1, 3):
+            subfolder = Folder.new(tree=tree, name="folder%d" % x, parent_folder=folder)
+            rules.append((subfolder, 0, Rule.from_ruleset_defaults(folder, ruleset)))
+            for y in range(1, 3):
+                sub_subfolder = Folder.new(tree=tree, name="folder%d" % y, parent_folder=subfolder)
+                rules.append((sub_subfolder, 0, Rule.from_ruleset_defaults(folder, ruleset)))
+
+    # Also test renamed folder
+    folder4 = Folder.new(tree=tree, name="folder4", parent_folder=root)
+    folder4._title = "abc"
+    rules.append((folder4, 0, Rule.from_ruleset_defaults(folder4, ruleset)))
+
+    sorted_rules = sorted(
+        rules, key=lambda x: (x[0].path().split("/"), len(rules) - x[1]), reverse=True
+    )
+    with disable_redis():
+        assert (
+            list(rule[0].path() for rule in rulesets.rules_grouped_by_folder(sorted_rules, root))
+            == expected_folder_order
+        )

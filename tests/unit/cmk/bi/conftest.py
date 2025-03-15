@@ -4,9 +4,10 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 from collections.abc import Iterator
-from typing import Any
 
 import pytest
+
+from tests.unit.cmk.bi.bi_mocks import MockBIAggregationPack
 
 from livestatus import LivestatusOutputFormat, LivestatusResponse, SiteId
 
@@ -17,20 +18,6 @@ from cmk.bi.packs import BIAggregationPacks
 from cmk.bi.rule import BIRule
 from cmk.bi.rule_interface import bi_rule_id_registry
 from cmk.bi.searcher import BISearcher
-
-from .bi_test_data import sample_config
-
-
-class MockBIAggregationPack(BIAggregationPacks):
-    def __init__(self, config: dict[Any, Any]) -> None:
-        super().__init__("")
-        self._load_config(config)
-
-    def load_config(self) -> None:
-        pass
-
-    def save_config(self) -> None:
-        pass
 
 
 def mock_query_callback(
@@ -52,6 +39,8 @@ def _bi_searcher() -> Iterator[BISearcher]:
 
 @pytest.fixture(scope="function")
 def bi_searcher_with_sample_config(bi_searcher: BISearcher) -> Iterator[BISearcher]:
+    from .bi_test_data import sample_config
+
     structure_fetcher = BIStructureFetcher(DUMMY_SITES_CALLBACK)
     structure_fetcher.add_site_data(SiteId("heute"), sample_config.bi_structure_states)
     bi_searcher.set_hosts(structure_fetcher.hosts)
@@ -85,4 +74,6 @@ def dummy_bi_rule() -> Iterator[BIRule]:
 
 @pytest.fixture(scope="function")
 def bi_packs_sample_config() -> Iterator[BIAggregationPacks]:
+    from .bi_test_data import sample_config
+
     yield MockBIAggregationPack(sample_config.bi_packs_config)
